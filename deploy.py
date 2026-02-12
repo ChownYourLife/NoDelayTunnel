@@ -346,8 +346,8 @@ def print_banner():
     os.system("clear" if os.name == "posix" else "cls")
     print(f"{Colors.CYAN}{Colors.BOLD}")
     print("╔══════════════════════════════════════════════════════╗")
-    print("║        ✨ NoDelay Tunnel Made By Hosi ✨             ║")
-    print("║          📢 Channel: @LoungeOfH                      ║")
+    print("║        ✨ NoDelay Tunnel Made By Hosi ✨            ║")
+    print("║        📢 Channel: @NodelayTunnel                    ║")
     print("╚══════════════════════════════════════════════════════╝")
     print(f"{Colors.ENDC}")
 
