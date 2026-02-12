@@ -650,12 +650,32 @@ def prompt_reality_public_key():
         print_error("Invalid public key. Expected exactly 64 hex characters.")
 
 
-def prompt_server_mappings():
+def split_host_port(value, fallback_port):
+    raw = str(value or "").strip()
+    m = re.search(r"^(.*):(\d+)$", raw)
+    if not m:
+        return "", int(fallback_port)
+    host = m.group(1).strip()
+    try:
+        port = int(m.group(2))
+    except ValueError:
+        port = int(fallback_port)
+    return host, port
+
+
+def prompt_server_mappings(existing=None):
     print_header("🔀 Configure Tunnel Mappings")
     print_info(
         "At least one mapping is required. You only enter ports; bind/target IPs are auto-filled."
     )
     mappings = []
+    if isinstance(existing, list):
+        mappings = deep_copy(existing)
+    if mappings:
+        keep_existing = input_default("Keep current mappings and skip editing? (Y/n)", "y").strip().lower()
+        if keep_existing in {"y", "yes"}:
+            return mappings
+        mappings = []
     index = 1
 
     while True:
@@ -712,9 +732,13 @@ def prompt_server_mappings():
     return mappings
 
 
-def prompt_client_tls_settings(server_addr):
-    sni = input_default("Server Name (SNI)", server_addr).strip()
-    skip_verify_raw = input_default("Insecure Skip Verify (true/false)", "true")
+def prompt_client_tls_settings(server_addr, default_sni="", default_skip_verify=True):
+    sni_default = default_sni or server_addr
+    sni = input_default("Server Name (SNI)", sni_default).strip()
+    skip_verify_raw = input_default(
+        "Insecure Skip Verify (true/false)",
+        "true" if default_skip_verify else "false",
+    )
     skip_verify = parse_bool(skip_verify_raw, default=True)
     return sni, skip_verify
 
@@ -727,7 +751,7 @@ def prompt_license_id():
         print_error("License ID is required.")
 
 
-def menu_protocol(role, server_addr=""):
+def menu_protocol(role, server_addr="", defaults=None):
     print_header("📜 Select Protocol")
     options = [
         ("1", "🌐 TCP"),
@@ -743,8 +767,23 @@ def menu_protocol(role, server_addr=""):
     for key, name in options:
         print(f"{Colors.GREEN}[{key}]{Colors.ENDC} {name}")
 
+    type_to_choice = {
+        "tcp": "1",
+        "tls": "2",
+        "ws": "3",
+        "wss": "4",
+        "kcp": "5",
+        "quic": "6",
+        "httpsmimicry": "7",
+        "httpmimicry": "8",
+        "reality": "9",
+    }
+    default_choice = "1"
+    if isinstance(defaults, dict):
+        default_choice = type_to_choice.get(str(defaults.get("type", "")).strip().lower(), "1")
+
     while True:
-        choice = input(f"\n{Colors.BOLD}Enter choice [1-9]: {Colors.ENDC}").strip()
+        choice = input_default(f"\n{Colors.BOLD}Enter choice [1-9]{Colors.ENDC}", default_choice).strip()
         if choice in {str(i) for i in range(1, 10)}:
             break
         print_error("Invalid choice. Pick a number between 1 and 9.")
@@ -766,14 +805,20 @@ def menu_protocol(role, server_addr=""):
         "reality_key_generated": False,
     }
 
+    if isinstance(defaults, dict):
+        for k, v in defaults.items():
+            config[k] = v
+
     if role == "server":
         config["psk"] = input_default(
-            "PSK (shared secret, leave empty to disable)", generate_uuid()
+            "PSK (shared secret, leave empty to disable)",
+            config.get("psk") or generate_uuid(),
         )
     else:
         while True:
-            config["psk"] = input(
-                "PSK (must match server, leave empty if disabled on server): "
+            config["psk"] = input_default(
+                "PSK (must match server, leave empty if disabled on server)",
+                config.get("psk", ""),
             ).strip()
             if config["psk"]:
                 break
@@ -785,90 +830,140 @@ def menu_protocol(role, server_addr=""):
 
     if choice == "1":
         config["type"] = "tcp"
-        config["port"] = input_default("Port", 8080)
+        config["port"] = input_default("Port", config.get("port", 8080))
 
     elif choice == "2":
         config["type"] = "tls"
-        config["port"] = input_default("Port", 443)
+        config["port"] = input_default("Port", config.get("port", 443))
         if role == "server":
-            config["cert"], config["key"] = ask_cert_options()
+            keep_current = input_default("Keep current certificate files? (Y/n)", "y").strip().lower()
+            if keep_current in {"y", "yes"} and config.get("cert") and config.get("key"):
+                pass
+            else:
+                config["cert"], config["key"] = ask_cert_options()
         else:
             config["sni"], config["insecure_skip_verify"] = prompt_client_tls_settings(
-                server_addr
+                server_addr or config.get("server_addr", ""),
+                default_sni=config.get("sni", ""),
+                default_skip_verify=bool(config.get("insecure_skip_verify", True)),
             )
 
     elif choice == "3":
         config["type"] = "ws"
-        config["port"] = input_default("Port", 80)
-        config["path"] = normalize_path(input_default("Path", "/ws"), "/ws")
+        config["port"] = input_default("Port", config.get("port", 80))
+        config["path"] = normalize_path(input_default("Path", config.get("path", "/ws")), "/ws")
 
     elif choice == "4":
         config["type"] = "wss"
-        config["port"] = input_default("Port", 443)
-        config["path"] = normalize_path(input_default("Path", "/ws"), "/ws")
+        config["port"] = input_default("Port", config.get("port", 443))
+        config["path"] = normalize_path(input_default("Path", config.get("path", "/ws")), "/ws")
         if role == "server":
-            config["cert"], config["key"] = ask_cert_options()
+            keep_current = input_default("Keep current certificate files? (Y/n)", "y").strip().lower()
+            if keep_current in {"y", "yes"} and config.get("cert") and config.get("key"):
+                pass
+            else:
+                config["cert"], config["key"] = ask_cert_options()
         else:
             config["sni"], config["insecure_skip_verify"] = prompt_client_tls_settings(
-                server_addr
+                server_addr or config.get("server_addr", ""),
+                default_sni=config.get("sni", ""),
+                default_skip_verify=bool(config.get("insecure_skip_verify", True)),
             )
 
     elif choice == "5":
         config["type"] = "kcp"
-        config["port"] = input_default("Port", 4000)
+        config["port"] = input_default("Port", config.get("port", 4000))
 
     elif choice == "6":
         config["type"] = "quic"
-        config["port"] = input_default("Port", 443)
+        config["port"] = input_default("Port", config.get("port", 443))
         if role == "server":
-            config["cert"], config["key"] = ask_cert_options()
+            keep_current = input_default("Keep current certificate files? (Y/n)", "y").strip().lower()
+            if keep_current in {"y", "yes"} and config.get("cert") and config.get("key"):
+                pass
+            else:
+                config["cert"], config["key"] = ask_cert_options()
         else:
             config["sni"], config["insecure_skip_verify"] = prompt_client_tls_settings(
-                server_addr
+                server_addr or config.get("server_addr", ""),
+                default_sni=config.get("sni", ""),
+                default_skip_verify=bool(config.get("insecure_skip_verify", True)),
             )
 
     elif choice == "7":
         config["type"] = "httpsmimicry"
-        config["port"] = input_default("Port", 443)
+        config["port"] = input_default("Port", config.get("port", 443))
         config["path"] = normalize_path(
-            input_default("Mimic Path", "/api/v1/upload"), "/api/v1/upload"
+            input_default("Mimic Path", config.get("path", "/api/v1/upload")), "/api/v1/upload"
         )
         if role == "server":
-            config["cert"], config["key"] = ask_cert_options()
+            keep_current = input_default("Keep current certificate files? (Y/n)", "y").strip().lower()
+            if keep_current in {"y", "yes"} and config.get("cert") and config.get("key"):
+                pass
+            else:
+                config["cert"], config["key"] = ask_cert_options()
         else:
             config["sni"], config["insecure_skip_verify"] = prompt_client_tls_settings(
-                server_addr
+                server_addr or config.get("server_addr", ""),
+                default_sni=config.get("sni", ""),
+                default_skip_verify=bool(config.get("insecure_skip_verify", True)),
             )
 
     elif choice == "8":
         config["type"] = "httpmimicry"
-        config["port"] = input_default("Port", 80)
+        config["port"] = input_default("Port", config.get("port", 80))
         config["path"] = normalize_path(
-            input_default("Mimic Path", "/api/v1/upload"), "/api/v1/upload"
+            input_default("Mimic Path", config.get("path", "/api/v1/upload")), "/api/v1/upload"
         )
         config["sni"] = ""
         config["insecure_skip_verify"] = False
 
     elif choice == "9":
         config["type"] = "reality"
-        config["port"] = input_default("Port", 443)
-        config["server_names"] = prompt_server_names()
-        config["short_id"] = prompt_short_id()
+        config["port"] = input_default("Port", config.get("port", 443))
+        existing_names = config.get("server_names", [])
+        config["server_names"] = parse_csv(
+            input_default(
+                "Server Names (comma separated)",
+                ",".join(existing_names) if existing_names else "www.microsoft.com,microsoft.com",
+            )
+        )
+        config["short_id"] = input_default(
+            "Short ID (hex, min 8 chars)",
+            config.get("short_id") or random_hex(8),
+        ).lower()
         if role == "server":
             config["dest"] = input_default(
-                "Dest (real target site:port)", "www.microsoft.com:443"
+                "Dest (real target site:port)", config.get("dest", "www.microsoft.com:443")
             )
-            (
-                config["private_key"],
-                config["public_key"],
-                config["reality_key_generated"],
-            ) = prompt_reality_private_key()
+            key = input_default(
+                "Private Key (x25519, 64 hex chars) [leave empty to auto-generate]",
+                config.get("private_key", ""),
+            ).strip().lower()
+            if key:
+                config["private_key"] = key
+                derived = derive_reality_public_key(key)
+                if derived:
+                    config["public_key"] = derived
+            else:
+                (
+                    config["private_key"],
+                    config["public_key"],
+                    config["reality_key_generated"],
+                ) = prompt_reality_private_key()
         else:
-            (
-                config["public_key"],
-                config["generated_private_key"],
-                config["reality_key_generated"],
-            ) = prompt_reality_public_key()
+            key = input_default(
+                "Server Public Key (x25519, 64 hex chars) [leave empty to auto-generate pair]",
+                config.get("public_key", ""),
+            ).strip().lower()
+            if key:
+                config["public_key"] = key
+            else:
+                (
+                    config["public_key"],
+                    config["generated_private_key"],
+                    config["reality_key_generated"],
+                ) = prompt_reality_public_key()
 
     return config
 
@@ -947,6 +1042,270 @@ def yaml_scalar(value):
     return json.dumps("" if value is None else str(value))
 
 
+def parse_yaml_scalar(raw):
+    value = (raw or "").strip()
+    if value == "":
+        return ""
+    if value in {"true", "false"}:
+        return value == "true"
+    if re.fullmatch(r"-?\d+", value):
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    if re.fullmatch(r"-?\d+\.\d+", value):
+        try:
+            return float(value)
+        except ValueError:
+            pass
+    if (
+        (value.startswith('"') and value.endswith('"'))
+        or (value.startswith("[") and value.endswith("]"))
+        or value in {"null", "[]", "{}"}
+    ):
+        try:
+            return json.loads(value)
+        except Exception:
+            pass
+    return value
+
+
+def parse_simple_yaml(text):
+    lines = text.splitlines()
+    root = {}
+    stack = [(-1, root)]
+
+    def strip_inline_comment(raw_line):
+        in_quotes = False
+        escaped = False
+        out = []
+        for ch in raw_line:
+            if escaped:
+                out.append(ch)
+                escaped = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+                continue
+            if ch == '"':
+                in_quotes = not in_quotes
+                out.append(ch)
+                continue
+            if ch == "#" and not in_quotes:
+                break
+            out.append(ch)
+        return "".join(out).rstrip()
+
+    def next_nonempty(idx):
+        for j in range(idx + 1, len(lines)):
+            nxt = strip_inline_comment(lines[j]).strip()
+            if not nxt or nxt.startswith("#"):
+                continue
+            return strip_inline_comment(lines[j])
+        return None
+
+    for i, raw in enumerate(lines):
+        raw = strip_inline_comment(raw)
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        content = raw.strip()
+
+        while len(stack) > 1 and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+
+        if content.startswith("- "):
+            if not isinstance(parent, list):
+                continue
+            item_content = content[2:].strip()
+            if ":" in item_content:
+                key, _, val = item_content.partition(":")
+                key = key.strip()
+                val = val.strip()
+                item = {}
+                if val == "":
+                    item[key] = {}
+                else:
+                    item[key] = parse_yaml_scalar(val)
+                parent.append(item)
+                stack.append((indent, item))
+                if val == "":
+                    stack.append((indent + 1, item[key]))
+            else:
+                parent.append(parse_yaml_scalar(item_content))
+            continue
+
+        key, sep, val = content.partition(":")
+        if sep == "":
+            continue
+        key = key.strip()
+        val = val.strip()
+        if not isinstance(parent, dict):
+            continue
+
+        if val == "":
+            nxt = next_nonempty(i)
+            if nxt is not None:
+                nxt_indent = len(nxt) - len(nxt.lstrip(" "))
+                nxt_content = nxt.strip()
+                if nxt_indent > indent and nxt_content.startswith("- "):
+                    node = []
+                else:
+                    node = {}
+            else:
+                node = {}
+            parent[key] = node
+            stack.append((indent, node))
+        else:
+            parent[key] = parse_yaml_scalar(val)
+
+    return root
+
+
+def parse_port_from_address(address, default_port):
+    raw = str(address or "").strip()
+    m = re.search(r":(\d+)$", raw)
+    if not m:
+        return int(default_port)
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return int(default_port)
+
+
+def parse_host_from_address(address, default_host):
+    raw = str(address or "").strip()
+    m = re.search(r"^(.*):\d+$", raw)
+    if not m:
+        return default_host
+    host = m.group(1).strip()
+    if host in {"", "0.0.0.0"}:
+        return default_host
+    return host
+
+
+def deep_copy(value):
+    return json.loads(json.dumps(value))
+
+
+def load_instance_runtime_settings(role, instance):
+    config_path = os.path.join(CONFIG_DIR, build_config_filename(role, instance))
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config not found: {config_path}")
+
+    with open(config_path, "r") as f:
+        parsed = parse_simple_yaml(f.read())
+
+    mode_expected = "server" if role == "server" else "client"
+    mode = str(parsed.get("mode", "")).strip().lower()
+    if mode and mode != mode_expected:
+        raise ValueError(
+            f"Config mode mismatch: expected '{mode_expected}' but got '{mode}'"
+        )
+
+    profile = str(parsed.get("profile", "balanced"))
+    security = parsed.get("security", {}) if isinstance(parsed.get("security"), dict) else {}
+    psk = str(security.get("psk", ""))
+    license_id = str(parsed.get("license", ""))
+
+    if role == "server":
+        listen = (
+            parsed.get("server", {}).get("listen", {})
+            if isinstance(parsed.get("server"), dict)
+            else {}
+        )
+        tls_cfg = listen.get("tls", {}) if isinstance(listen.get("tls"), dict) else {}
+        reality = parsed.get("reality", {}) if isinstance(parsed.get("reality"), dict) else {}
+        protocol_cfg = {
+            "type": str(listen.get("type", "tcp")),
+            "port": parse_port_from_address(listen.get("address", ":8443"), 8443),
+            "path": str(listen.get("path", "/tunnel")),
+            "cert": str(tls_cfg.get("cert_file", "")),
+            "key": str(tls_cfg.get("key_file", "")),
+            "psk": psk,
+            "dest": str(reality.get("dest", "www.microsoft.com:443")),
+            "server_names": reality.get("server_names", []),
+            "short_id": str(reality.get("short_id", "")),
+            "private_key": str(reality.get("private_key", "")),
+            "public_key": "",
+            "generated_private_key": "",
+            "reality_key_generated": False,
+            "license": license_id,
+            "profile": profile,
+        }
+        mappings = (
+            parsed.get("server", {}).get("mappings", [])
+            if isinstance(parsed.get("server"), dict)
+            else []
+        )
+        if not isinstance(mappings, list):
+            mappings = []
+        cleaned_mappings = []
+        for idx, m in enumerate(mappings, start=1):
+            if not isinstance(m, dict):
+                continue
+            cleaned_mappings.append(
+                {
+                    "name": str(m.get("name", f"mapping-{idx}")),
+                    "mode": str(m.get("mode", "reverse")),
+                    "protocol": str(m.get("protocol", "tcp")),
+                    "bind": str(m.get("bind", "0.0.0.0:2200")),
+                    "target": str(m.get("target", "127.0.0.1:22")),
+                }
+            )
+        protocol_cfg["mappings"] = cleaned_mappings
+    else:
+        client = parsed.get("client", {}) if isinstance(parsed.get("client"), dict) else {}
+        server_ep = client.get("server", {}) if isinstance(client.get("server"), dict) else {}
+        tls_cfg = server_ep.get("tls", {}) if isinstance(server_ep.get("tls"), dict) else {}
+        reality = parsed.get("reality", {}) if isinstance(parsed.get("reality"), dict) else {}
+        addr = str(server_ep.get("address", "127.0.0.1:8443"))
+        protocol_cfg = {
+            "type": str(server_ep.get("type", "tcp")),
+            "port": parse_port_from_address(addr, 8443),
+            "server_addr": parse_host_from_address(addr, "127.0.0.1"),
+            "path": str(server_ep.get("path", "/tunnel")),
+            "cert": "",
+            "key": "",
+            "psk": psk,
+            "sni": str(tls_cfg.get("server_name", "")),
+            "insecure_skip_verify": bool(tls_cfg.get("insecure_skip_verify", False)),
+            "dest": "",
+            "server_names": reality.get("server_names", []),
+            "short_id": str(reality.get("short_id", "")),
+            "private_key": "",
+            "public_key": str(reality.get("public_key", "")),
+            "generated_private_key": "",
+            "reality_key_generated": False,
+            "license": license_id,
+            "profile": profile,
+        }
+
+    tuning = deep_copy(base_tuning(role))
+    for section in ["smux", "tcp", "udp", "kcp", "quic", "reconnect"]:
+        incoming = parsed.get(section, {})
+        if not isinstance(incoming, dict):
+            continue
+        for k, v in incoming.items():
+            tuning[section][k] = v
+
+    obfuscation_default = select_obfuscation_profile_by_key("speed")
+    incoming_obf = parsed.get("obfuscation", {})
+    if isinstance(incoming_obf, dict):
+        for k in obfuscation_default.keys():
+            if k in incoming_obf:
+                obfuscation_default[k] = incoming_obf[k]
+
+    return {
+        "config_path": config_path,
+        "protocol_config": protocol_cfg,
+        "tuning": tuning,
+        "obfuscation_cfg": obfuscation_default,
+    }
+
+
 def prompt_int(prompt, default):
     while True:
         value = input_default(prompt, default)
@@ -1000,12 +1359,16 @@ def prompt_instance_name(role):
         return instance
 
 
-def select_config_profile():
+def select_config_profile(default_profile="balanced"):
     print_header("🎛️ Config Profile Preset")
     for index, profile in enumerate(PROFILE_PRESETS, start=1):
-        print(f"{index}. {profile}")
+        suffix = " (current)" if profile == default_profile else ""
+        print(f"{index}. {profile}{suffix}")
     while True:
-        choice = input(f"Select profile [1-{len(PROFILE_PRESETS)}]: ").strip()
+        default_index = 1
+        if default_profile in PROFILE_PRESETS:
+            default_index = PROFILE_PRESETS.index(default_profile) + 1
+        choice = input_default(f"Select profile [1-{len(PROFILE_PRESETS)}]", default_index).strip()
         if choice.isdigit():
             idx = int(choice)
             if 1 <= idx <= len(PROFILE_PRESETS):
@@ -1026,40 +1389,90 @@ def select_deployment_mode():
         print_error("Invalid choice.")
 
 
-def select_obfuscation_profile():
+def select_obfuscation_profile_by_key(key):
+    for preset in OBFUSCATION_PRESETS:
+        if preset["key"] == key:
+            return {
+                "enabled": preset["enabled"],
+                "min_padding": preset["min_padding"],
+                "max_padding": preset["max_padding"],
+                "min_delay_ms": preset["min_delay_ms"],
+                "max_delay_ms": preset["max_delay_ms"],
+                "burst_chance": preset["burst_chance"],
+                # Legacy fields for backward compatibility with old binaries.
+                "max_timing_ms": preset["max_delay_ms"],
+                "min_chunk": 0,
+                "max_chunk": 0,
+                "burst_enabled": False,
+                "burst_interval": "5s",
+                "burst_count": 0,
+            }
+    return {
+        "enabled": False,
+        "min_padding": 8,
+        "max_padding": 64,
+        "min_delay_ms": 0,
+        "max_delay_ms": 0,
+        "burst_chance": 0,
+        "max_timing_ms": 0,
+        "min_chunk": 0,
+        "max_chunk": 0,
+        "burst_enabled": False,
+        "burst_interval": "5s",
+        "burst_count": 0,
+    }
+
+
+def match_obfuscation_preset_key(current):
+    if not isinstance(current, dict):
+        return "speed"
+    target = {
+        "enabled": bool(current.get("enabled", False)),
+        "min_padding": int(current.get("min_padding", 8)),
+        "max_padding": int(current.get("max_padding", 64)),
+        "min_delay_ms": int(current.get("min_delay_ms", 0)),
+        "max_delay_ms": int(current.get("max_delay_ms", 0)),
+        "burst_chance": int(current.get("burst_chance", 0)),
+    }
+    for preset in OBFUSCATION_PRESETS:
+        if (
+            target["enabled"] == preset["enabled"]
+            and target["min_padding"] == preset["min_padding"]
+            and target["max_padding"] == preset["max_padding"]
+            and target["min_delay_ms"] == preset["min_delay_ms"]
+            and target["max_delay_ms"] == preset["max_delay_ms"]
+            and target["burst_chance"] == preset["burst_chance"]
+        ):
+            return preset["key"]
+    return "speed"
+
+
+def select_obfuscation_profile(default_key="speed"):
     print_header("🕶️ Obfuscation Profile")
+    default_index = 1
+    for idx, preset in enumerate(OBFUSCATION_PRESETS, start=1):
+        if preset["key"] == default_key:
+            default_index = idx
+            break
     for index, preset in enumerate(OBFUSCATION_PRESETS, start=1):
+        current_suffix = " (current)" if index == default_index else ""
         if not preset["enabled"]:
             suffix = " (Recommended for speed)" if preset["key"] == "speed" else ""
-            print(f"{index}. {preset['label']:<16} | enabled=false{suffix}")
+            print(f"{index}. {preset['label']:<16} | enabled=false{suffix}{current_suffix}")
             continue
         print(
             f"{index}. {preset['label']:<16} | enabled=true  "
             f"padding={preset['min_padding']}-{preset['max_padding']}  "
             f"delay={preset['min_delay_ms']}-{preset['max_delay_ms']}ms  "
-            f"burst_chance={preset['burst_chance']}%"
+            f"burst_chance={preset['burst_chance']}%{current_suffix}"
         )
     while True:
-        choice = input(f"Select profile [1-{len(OBFUSCATION_PRESETS)}]: ").strip()
+        choice = input_default(f"Select profile [1-{len(OBFUSCATION_PRESETS)}]", default_index).strip()
         if choice.isdigit():
             idx = int(choice)
             if 1 <= idx <= len(OBFUSCATION_PRESETS):
                 selected = OBFUSCATION_PRESETS[idx - 1]
-                return {
-                    "enabled": selected["enabled"],
-                    "min_padding": selected["min_padding"],
-                    "max_padding": selected["max_padding"],
-                    "min_delay_ms": selected["min_delay_ms"],
-                    "max_delay_ms": selected["max_delay_ms"],
-                    "burst_chance": selected["burst_chance"],
-                    # Legacy fields for backward compatibility with old binaries.
-                    "max_timing_ms": selected["max_delay_ms"],
-                    "min_chunk": 0,
-                    "max_chunk": 0,
-                    "burst_enabled": False,
-                    "burst_interval": "5s",
-                    "burst_count": 0,
-                }
+                return select_obfuscation_profile_by_key(selected["key"])
         print_error("Invalid choice.")
 
 
@@ -1696,6 +2109,124 @@ def remove_service_instance(service_name):
         print_info(f"Removed config: {config_path}")
 
 
+def configure_tuning_from_existing(tuning):
+    updated = deep_copy(tuning)
+    print_header("⚙️ Edit Tuning")
+    for section in ["smux", "tcp", "udp", "kcp", "quic", "reconnect"]:
+        edit = input_default(f"Edit {section} settings? (y/N)", "n").strip().lower()
+        if edit not in {"y", "yes"}:
+            continue
+        print(f"\n{Colors.CYAN}{section.upper()} settings{Colors.ENDC}")
+        for key, default in updated[section].items():
+            updated[section][key] = prompt_typed_value(f"{section}.{key}", default)
+    return updated
+
+
+def edit_service_instance(service_name):
+    role, instance = parse_service_role_instance(service_name)
+    if role not in {"server", "client"}:
+        print_error(f"Unsupported instance: {service_name}.service")
+        return
+
+    try:
+        loaded = load_instance_runtime_settings(role, instance)
+    except Exception as exc:
+        print_error(f"Failed to load current config: {exc}")
+        return
+
+    protocol_cfg = loaded["protocol_config"]
+    tuning = loaded["tuning"]
+    obfuscation_cfg = loaded["obfuscation_cfg"]
+    config_path = loaded["config_path"]
+
+    while True:
+        print_header(f"✏️ Edit Tunnel: {service_name}.service")
+        print(f"Role:       {role} ({role_display(role)})")
+        print(f"Instance:   {instance}")
+        print(f"Config:     {config_path}")
+        print(f"Protocol:   {protocol_cfg.get('type')}:{protocol_cfg.get('port')}")
+        print(f"Profile:    {protocol_cfg.get('profile', 'balanced')}")
+        print(f"Obfuscation:{'enabled' if obfuscation_cfg.get('enabled') else 'disabled'}")
+        if role == "server":
+            print(f"Mappings:   {len(protocol_cfg.get('mappings', []))}")
+        else:
+            print(f"Server:     {protocol_cfg.get('server_addr')}:{protocol_cfg.get('port')}")
+        print("")
+        print("1. Edit protocol / listen port / transport settings")
+        print("2. Edit profile preset")
+        print("3. Edit obfuscation preset")
+        if role == "server":
+            print("4. Edit port mappings")
+            print("5. Edit advanced tuning")
+            print("6. Edit license ID")
+            print("7. Save changes and restart service")
+            print("0. Cancel")
+        else:
+            print("4. Edit advanced tuning")
+            print("5. Edit license ID")
+            print("6. Save changes and restart service")
+            print("0. Cancel")
+
+        choice = input("Select option: ").strip()
+
+        if choice == "1":
+            if role == "client":
+                protocol_cfg["server_addr"] = input_default(
+                    "Server Address (IP/Domain)",
+                    protocol_cfg.get("server_addr", "127.0.0.1"),
+                ).strip()
+            protocol_cfg = menu_protocol(
+                role,
+                server_addr=protocol_cfg.get("server_addr", ""),
+                defaults=protocol_cfg,
+            )
+            if role == "server" and "mappings" in loaded["protocol_config"]:
+                protocol_cfg["mappings"] = protocol_cfg.get(
+                    "mappings", loaded["protocol_config"].get("mappings", [])
+                )
+            protocol_cfg["profile"] = protocol_cfg.get("profile", loaded["protocol_config"].get("profile", "balanced"))
+            protocol_cfg["license"] = protocol_cfg.get("license", loaded["protocol_config"].get("license", ""))
+        elif choice == "2":
+            protocol_cfg["profile"] = select_config_profile(
+                default_profile=protocol_cfg.get("profile", "balanced")
+            )
+        elif choice == "3":
+            default_obf_key = match_obfuscation_preset_key(obfuscation_cfg)
+            obfuscation_cfg = select_obfuscation_profile(default_key=default_obf_key)
+        elif choice == "4" and role == "server":
+            protocol_cfg["mappings"] = prompt_server_mappings(
+                existing=protocol_cfg.get("mappings", [])
+            )
+        elif (choice == "5" and role == "server") or (choice == "4" and role == "client"):
+            tuning = configure_tuning_from_existing(tuning)
+        elif (choice == "6" and role == "server") or (choice == "5" and role == "client"):
+            protocol_cfg["license"] = prompt_license_id()
+        elif (choice == "7" and role == "server") or (choice == "6" and role == "client"):
+            config_file = build_config_filename(role, instance)
+            if role == "server":
+                generate_config(protocol_cfg, tuning, obfuscation_cfg, config_file)
+            else:
+                generate_client_config(protocol_cfg, tuning, obfuscation_cfg, config_file)
+            run_command("systemctl daemon-reload", check=False)
+            unit = f"{service_name}.service"
+            if run_command(f"systemctl restart {shlex.quote(unit)}", check=False):
+                active_rc, _, _ = run_command_output(
+                    f"systemctl is-active {shlex.quote(unit)}"
+                )
+                if active_rc == 0:
+                    print_success(f"✅ Saved and restarted {unit}")
+                else:
+                    print_error(f"❌ Config saved, but {unit} is not active after restart.")
+            else:
+                print_error(f"❌ Config saved, but failed to restart {unit}")
+            return
+        elif choice == "0":
+            print_info("Edit cancelled.")
+            return
+        else:
+            print_error("Invalid choice.")
+
+
 def multi_tunnel_menu():
     while True:
         print_header("🧩 Multi Tunnel Management")
@@ -1703,6 +2234,7 @@ def multi_tunnel_menu():
         print(f"Installed tunnel services: {len(services)}")
         print("1. List tunnel instances")
         print("2. Remove one instance")
+        print("3. Edit one instance")
         print("0. Back")
         choice = input("Select option: ").strip()
 
@@ -1740,6 +2272,24 @@ def multi_tunnel_menu():
             confirm = input_default(f"Remove {target}.service and its config? (y/N)", "n").strip().lower()
             if confirm in {"y", "yes"}:
                 remove_service_instance(target)
+            input("\nPress Enter to continue...")
+        elif choice == "3":
+            role_services = [s for s in services if parse_service_role_instance(s)[0] in {"server", "client"}]
+            if not role_services:
+                print_error("No editable server/client instances found.")
+                input("\nPress Enter to continue...")
+                continue
+            print(f"\n{Colors.CYAN}Editable instances:{Colors.ENDC}")
+            for index, service in enumerate(role_services, start=1):
+                role, instance = parse_service_role_instance(service)
+                print(f"{index}. {service}.service ({role_display(role)}:{instance})")
+            raw = input(f"Select instance [1-{len(role_services)}]: ").strip()
+            if not raw.isdigit() or not (1 <= int(raw) <= len(role_services)):
+                print_error("Invalid choice.")
+                input("\nPress Enter to continue...")
+                continue
+            target = role_services[int(raw) - 1]
+            edit_service_instance(target)
             input("\nPress Enter to continue...")
         elif choice == "0":
             return
