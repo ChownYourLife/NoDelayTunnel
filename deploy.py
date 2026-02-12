@@ -363,22 +363,14 @@ def ensure_binary():
 def download_binary():
     print_header("🔽 Downloading NoDelay Binary")
     release = get_latest_release()
-    if not release:
-        print_error("❌ Could not find latest release.")
-        return False
+    if release and release.get("tag_name"):
+        print_info(f"Latest version: {release['tag_name']}")
 
-    tag_name = release["tag_name"]
-    print_info(f"Latest version: {tag_name}")
-
-    download_url = None
-    for asset in release["assets"]:
-        if "linux" in asset["name"].lower() and "amd64" in asset["name"].lower():
-            download_url = asset["browser_download_url"]
-            break
-
-    if not download_url:
-        print_error("❌ No compatible binary (linux-amd64) found.")
-        return False
+    # Always download the latest release binary by fixed asset name.
+    # No compatibility/architecture filtering is applied by design.
+    download_url = (
+        f"https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest/download/{BINARY_NAME}"
+    )
 
     print_info(f"Downloading: {download_url}")
     try:
