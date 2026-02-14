@@ -751,11 +751,22 @@ def split_host_port(value, fallback_port):
     return host, port
 
 
-def prompt_server_mappings(existing=None):
+def prompt_server_mappings(
+    existing=None,
+    fixed_mode=None,
+    bind_side_label="This node",
+    target_side_label="Remote node",
+):
     print_header("🔀 Configure Tunnel Mappings")
-    print_info(
-        "At least one mapping is required. You only enter ports; bind/target IPs are auto-filled."
-    )
+    if fixed_mode in {"reverse", "direct"}:
+        print_info(
+            f"Mapping mode is fixed to '{fixed_mode}' by tunnel type. "
+            f"Bind side: {bind_side_label} | Target side: {target_side_label}"
+        )
+    else:
+        print_info(
+            "At least one mapping is required. You only enter ports; bind/target IPs are auto-filled."
+        )
     mappings = []
     if isinstance(existing, list):
         mappings = deep_copy(existing)
@@ -770,11 +781,15 @@ def prompt_server_mappings(existing=None):
         print(f"\n{Colors.CYAN}Mapping #{index}{Colors.ENDC}")
         name = input_default("Name", f"mapping-{index}")
 
-        while True:
-            mode = input_default("Mode (reverse/direct)", "reverse").strip().lower()
-            if mode in {"reverse", "direct"}:
-                break
-            print_error("Mode must be 'reverse' or 'direct'.")
+        if fixed_mode in {"reverse", "direct"}:
+            mode = fixed_mode
+            print_info(f"Mode: {mode} (locked)")
+        else:
+            while True:
+                mode = input_default("Mode (reverse/direct)", "reverse").strip().lower()
+                if mode in {"reverse", "direct"}:
+                    break
+                print_error("Mode must be 'reverse' or 'direct'.")
 
         while True:
             protocol = input_default("Protocol (tcp/udp)", "tcp").strip().lower()
@@ -1297,6 +1312,7 @@ def load_instance_runtime_settings(role, instance):
         )
 
     profile = str(parsed.get("profile", "balanced"))
+    tunnel_mode = str(parsed.get("tunnel_mode", "reverse")).strip().lower() or "reverse"
     security = parsed.get("security", {}) if isinstance(parsed.get("security"), dict) else {}
     psk = str(security.get("psk", ""))
     license_id = str(parsed.get("license", ""))
@@ -1311,6 +1327,7 @@ def load_instance_runtime_settings(role, instance):
         reality = parsed.get("reality", {}) if isinstance(parsed.get("reality"), dict) else {}
         protocol_cfg = {
             "type": str(listen.get("type", "tcp")),
+            "tunnel_mode": tunnel_mode,
             "port": parse_port_from_address(listen.get("address", ":8443"), 8443),
             "path": str(listen.get("path", "/tunnel")),
             "cert": str(tls_cfg.get("cert_file", "")),
@@ -1355,6 +1372,7 @@ def load_instance_runtime_settings(role, instance):
         addr = str(server_ep.get("address", "127.0.0.1:8443"))
         protocol_cfg = {
             "type": str(server_ep.get("type", "tcp")),
+            "tunnel_mode": tunnel_mode,
             "port": parse_port_from_address(addr, 8443),
             "server_addr": parse_host_from_address(addr, "127.0.0.1"),
             "path": str(server_ep.get("path", "/tunnel")),
@@ -1373,6 +1391,23 @@ def load_instance_runtime_settings(role, instance):
             "license": license_id,
             "profile": profile,
         }
+        mappings = client.get("mappings", [])
+        if not isinstance(mappings, list):
+            mappings = []
+        cleaned_mappings = []
+        for idx, m in enumerate(mappings, start=1):
+            if not isinstance(m, dict):
+                continue
+            cleaned_mappings.append(
+                {
+                    "name": str(m.get("name", f"mapping-{idx}")),
+                    "mode": str(m.get("mode", "direct")),
+                    "protocol": str(m.get("protocol", "tcp")),
+                    "bind": str(m.get("bind", "0.0.0.0:2200")),
+                    "target": str(m.get("target", "127.0.0.1:22")),
+                }
+            )
+        protocol_cfg["mappings"] = cleaned_mappings
 
     tuning = deep_copy(base_tuning(role))
     for section in ["smux", "tcp", "udp", "kcp", "quic", "reconnect"]:
@@ -1794,6 +1829,7 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
     reality_private_key = protocol_config.get("private_key", "") if reality_enabled else ""
     lines = [
         "mode: server",
+        f"tunnel_mode: {yaml_scalar(protocol_config.get('tunnel_mode', 'reverse'))}",
         f"profile: {yaml_scalar(protocol_config.get('profile', 'balanced'))}",
         "",
         "server:",
@@ -1806,9 +1842,16 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
         f"      key_file: {yaml_scalar(protocol_config.get('key', ''))}",
         '      ca_file: ""',
         "      require_client_cert: false",
-        "  mappings:",
     ]
-    lines.extend(render_mappings_lines(protocol_config.get("mappings", [])))
+    if str(protocol_config.get("tunnel_mode", "reverse")).strip().lower() == "direct":
+        lines.append("  mappings: []")
+    else:
+        mappings = protocol_config.get("mappings", [])
+        if mappings:
+            lines.append("  mappings:")
+            lines.extend(render_mappings_lines(mappings))
+        else:
+            lines.append("  mappings: []")
     lines.extend(
         [
             "",
@@ -1932,6 +1975,7 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
     reality_public_key = protocol_config.get("public_key", "") if reality_enabled else ""
     lines = [
         "mode: client",
+        f"tunnel_mode: {yaml_scalar(protocol_config.get('tunnel_mode', 'reverse'))}",
         f"profile: {yaml_scalar(protocol_config.get('profile', 'balanced'))}",
         "",
         "client:",
@@ -1947,6 +1991,18 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         '      ca_file: ""',
         f"      server_name: {yaml_scalar(tls_server_name)}",
         f"      insecure_skip_verify: {yaml_scalar(tls_insecure_skip_verify)}",
+    ]
+    if str(protocol_config.get("tunnel_mode", "reverse")).strip().lower() == "direct":
+        mappings = protocol_config.get("mappings", [])
+        if mappings:
+            lines.append("  mappings:")
+            lines.extend(render_mappings_lines(mappings))
+        else:
+            lines.append("  mappings: []")
+    else:
+        lines.append("  mappings: []")
+    lines.extend(
+        [
         "",
         "smux:",
         f"  version: {yaml_scalar(tuning['smux']['version'])}",
@@ -2017,6 +2073,7 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         f"  burst_chance: {yaml_scalar(obfuscation_cfg['burst_chance'])}",
         "",
         ]
+    )
     lines.extend(render_http_mimicry_lines(protocol_config, http_path))
     lines.extend(
         [
@@ -2280,11 +2337,16 @@ def edit_service_instance(service_name):
     config_path = loaded["config_path"]
 
     while True:
+        client_direct_mode = (
+            role == "client"
+            and str(protocol_cfg.get("tunnel_mode", "reverse")).strip().lower() == "direct"
+        )
         menu_lines = [
             f"Role:        {role} ({role_display(role)})",
             f"Instance:    {instance}",
             f"Config:      {config_path}",
             f"Protocol:    {protocol_cfg.get('type')}:{protocol_cfg.get('port')}",
+            f"TunnelMode:  {protocol_cfg.get('tunnel_mode', 'reverse')}",
             f"Profile:     {protocol_cfg.get('profile', 'balanced')}",
             f"Obfuscation: {'enabled' if obfuscation_cfg.get('enabled') else 'disabled'}",
         ]
@@ -2294,11 +2356,23 @@ def edit_service_instance(service_name):
             menu_lines.append(
                 f"Server:      {protocol_cfg.get('server_addr')}:{protocol_cfg.get('port')}"
             )
+            if client_direct_mode:
+                menu_lines.append(f"Mappings:    {len(protocol_cfg.get('mappings', []))}")
         menu_lines.append("")
         menu_lines.append("1. Edit protocol / listen port / transport settings")
         menu_lines.append("2. Edit profile preset")
         menu_lines.append("3. Edit obfuscation preset")
         if role == "server":
+            menu_lines.extend(
+                [
+                    "4. Edit port mappings",
+                    "5. Edit advanced tuning",
+                    "6. Edit license ID",
+                    "7. Save changes and restart service",
+                    "0. Cancel",
+                ]
+            )
+        elif client_direct_mode:
             menu_lines.extend(
                 [
                     "4. Edit port mappings",
@@ -2332,7 +2406,12 @@ def edit_service_instance(service_name):
                 server_addr=protocol_cfg.get("server_addr", ""),
                 defaults=protocol_cfg,
             )
+            protocol_cfg["tunnel_mode"] = loaded["protocol_config"].get("tunnel_mode", "reverse")
             if role == "server" and "mappings" in loaded["protocol_config"]:
+                protocol_cfg["mappings"] = protocol_cfg.get(
+                    "mappings", loaded["protocol_config"].get("mappings", [])
+                )
+            if role == "client" and "mappings" in loaded["protocol_config"]:
                 protocol_cfg["mappings"] = protocol_cfg.get(
                     "mappings", loaded["protocol_config"].get("mappings", [])
                 )
@@ -2349,11 +2428,18 @@ def edit_service_instance(service_name):
             protocol_cfg["mappings"] = prompt_server_mappings(
                 existing=protocol_cfg.get("mappings", [])
             )
-        elif (choice == "5" and role == "server") or (choice == "4" and role == "client"):
+        elif choice == "4" and client_direct_mode:
+            protocol_cfg["mappings"] = prompt_server_mappings(
+                existing=protocol_cfg.get("mappings", []),
+                fixed_mode="direct",
+                bind_side_label="Client side",
+                target_side_label="Server side",
+            )
+        elif (choice == "5" and role == "server") or (choice == "5" and client_direct_mode) or (choice == "4" and role == "client" and not client_direct_mode):
             tuning = configure_tuning_from_existing(tuning)
-        elif (choice == "6" and role == "server") or (choice == "5" and role == "client"):
+        elif (choice == "6" and role == "server") or (choice == "6" and client_direct_mode) or (choice == "5" and role == "client" and not client_direct_mode):
             protocol_cfg["license"] = prompt_license_id()
-        elif (choice == "7" and role == "server") or (choice == "6" and role == "client"):
+        elif (choice == "7" and role == "server") or (choice == "7" and client_direct_mode) or (choice == "6" and role == "client" and not client_direct_mode):
             config_file = build_config_filename(role, instance)
             if role == "server":
                 generate_config(protocol_cfg, tuning, obfuscation_cfg, config_file)
@@ -2476,18 +2562,41 @@ def uninstall_everything():
     print_success("🗑️  Uninstalled services and configs (binary kept).")
 
 
-def install_server_flow(server_location_label="Iran", tunnel_label="Reverse Tunnel"):
-    print_info(
-        f"Tunnel type: {tunnel_label} | this node role: server ({server_location_label})"
+def install_server_flow(
+    server_location_label="Iran",
+    tunnel_label="Reverse Tunnel",
+    tunnel_mode="reverse",
+    collect_mappings=True,
+    mapping_mode=None,
+    bind_side_label="This node",
+    target_side_label="Remote node",
+):
+    print_header(f"🖥️ Server Configuration ({server_location_label})")
+    print_menu(
+        "Setup Context",
+        [
+            f"Tunnel Type: {tunnel_label}",
+            f"This Node Role: server ({server_location_label})",
+        ],
+        color=Colors.CYAN,
+        min_width=52,
     )
     instance = prompt_instance_name("server")
     cfg = menu_protocol("server")
+    cfg["tunnel_mode"] = tunnel_mode
     cfg["license"] = prompt_license_id()
     cfg["profile"] = select_config_profile()
     deployment_mode = select_deployment_mode()
     tuning = configure_tuning("server", deployment_mode)
     obfuscation_cfg = select_obfuscation_profile()
-    cfg["mappings"] = prompt_server_mappings()
+    if collect_mappings:
+        cfg["mappings"] = prompt_server_mappings(
+            fixed_mode=mapping_mode,
+            bind_side_label=bind_side_label,
+            target_side_label=target_side_label,
+        )
+    else:
+        cfg["mappings"] = []
     config_file = build_config_filename("server", instance)
     config_path = generate_config(cfg, tuning, obfuscation_cfg, config_file)
     create_service("server", instance)
@@ -2511,20 +2620,43 @@ def install_server_flow(server_location_label="Iran", tunnel_label="Reverse Tunn
             print(f"Public:   {Colors.BOLD}{cfg['public_key']}{Colors.ENDC}")
 
 
-def install_client_flow(client_location_label="Kharej", tunnel_label="Reverse Tunnel"):
+def install_client_flow(
+    client_location_label="Kharej",
+    tunnel_label="Reverse Tunnel",
+    tunnel_mode="reverse",
+    collect_mappings=False,
+    mapping_mode=None,
+    bind_side_label="This node",
+    target_side_label="Remote node",
+):
     print_header(f"💻 Client Configuration ({client_location_label})")
-    print_info(
-        f"Tunnel type: {tunnel_label} | this node role: client ({client_location_label})"
+    print_menu(
+        "Setup Context",
+        [
+            f"Tunnel Type: {tunnel_label}",
+            f"This Node Role: client ({client_location_label})",
+        ],
+        color=Colors.CYAN,
+        min_width=52,
     )
     instance = prompt_instance_name("client")
     server_addr = input_required("Server Address (IP/Domain)")
     cfg = menu_protocol("client", server_addr=server_addr)
+    cfg["tunnel_mode"] = tunnel_mode
     cfg["license"] = ""
     cfg["profile"] = select_config_profile()
     deployment_mode = select_deployment_mode()
     tuning = configure_tuning("client", deployment_mode)
     obfuscation_cfg = select_obfuscation_profile()
     cfg["server_addr"] = server_addr
+    if collect_mappings:
+        cfg["mappings"] = prompt_server_mappings(
+            fixed_mode=mapping_mode,
+            bind_side_label=bind_side_label,
+            target_side_label=target_side_label,
+        )
+    else:
+        cfg["mappings"] = []
     config_file = build_config_filename("client", instance)
     config_path = generate_client_config(cfg, tuning, obfuscation_cfg, config_file)
     create_service("client", instance)
@@ -2552,11 +2684,15 @@ def install_tunnel_flow(tunnel_type):
             "label": "Direct Tunnel",
             "client_location": "Iran",
             "server_location": "Kharej",
+            "bind_logical_side": "client",
+            "mapping_mode": "direct",
         },
         "reverse": {
             "label": "Reverse Tunnel",
             "client_location": "Kharej",
             "server_location": "Iran",
+            "bind_logical_side": "server",
+            "mapping_mode": "reverse",
         },
     }
     profile = tunnel_profiles.get(tunnel_type)
@@ -2564,35 +2700,68 @@ def install_tunnel_flow(tunnel_type):
         print_error(f"Unknown tunnel type: {tunnel_type}")
         return
 
+    print_header(f"🧭 {profile['label']} Setup")
     print_menu(
-        f"🧭 {profile['label']} Setup",
+        "Select Node Role",
         [
-            f"1. Setup this node as Server ({profile['server_location']})",
-            f"2. Setup this node as Client ({profile['client_location']})",
+            f"1. This node = Server ({profile['server_location']})",
+            f"2. This node = Client ({profile['client_location']})",
             "0. Cancel",
         ],
         color=Colors.CYAN,
-        min_width=62,
+        min_width=56,
     )
 
     while True:
         node_choice = input("Select role for this machine [1/2/0]: ").strip()
-        if node_choice == "1":
-            install_server_flow(
-                server_location_label=profile["server_location"],
-                tunnel_label=profile["label"],
-            )
-            return
-        if node_choice == "2":
-            install_client_flow(
-                client_location_label=profile["client_location"],
-                tunnel_label=profile["label"],
-            )
-            return
         if node_choice == "0":
             print_info("Tunnel setup cancelled.")
             return
-        print_error("Invalid choice.")
+        if node_choice not in {"1", "2"}:
+            print_error("Invalid choice.")
+            continue
+
+        logical_role = "server" if node_choice == "1" else "client"
+        location = (
+            profile["server_location"]
+            if logical_role == "server"
+            else profile["client_location"]
+        )
+        bind_side_label = (
+            f"Client side ({profile['client_location']})"
+            if profile["bind_logical_side"] == "client"
+            else f"Server side ({profile['server_location']})"
+        )
+        target_side_label = (
+            f"Server side ({profile['server_location']})"
+            if profile["bind_logical_side"] == "client"
+            else f"Client side ({profile['client_location']})"
+        )
+
+        if logical_role == "server":
+            collect_mappings = profile["bind_logical_side"] == "server"
+            install_server_flow(
+                server_location_label=location,
+                tunnel_label=f"{profile['label']} ({bind_side_label} -> {target_side_label})",
+                tunnel_mode=tunnel_type,
+                collect_mappings=collect_mappings,
+                mapping_mode=profile["mapping_mode"],
+                bind_side_label=bind_side_label,
+                target_side_label=target_side_label,
+            )
+            return
+
+        collect_mappings = profile["bind_logical_side"] == "client"
+        install_client_flow(
+            client_location_label=location,
+            tunnel_label=f"{profile['label']} ({bind_side_label} -> {target_side_label})",
+            tunnel_mode=tunnel_type,
+            collect_mappings=collect_mappings,
+            mapping_mode=profile["mapping_mode"],
+            bind_side_label=bind_side_label,
+            target_side_label=target_side_label,
+        )
+        return
 
 
 def main_menu():
@@ -2601,8 +2770,8 @@ def main_menu():
         print_menu(
             "Main Menu",
             [
-                f"{Colors.GREEN}[1]{Colors.ENDC} 🟢 Create Direct Tunnel (client: Iran, server: Kharej)",
-                f"{Colors.GREEN}[2]{Colors.ENDC} 🔁 Create Reverse Tunnel (client: Kharej, server: Iran)",
+                f"{Colors.GREEN}[1]{Colors.ENDC} 🟢 Direct Tunnel Setup (IR -> KH)",
+                f"{Colors.GREEN}[2]{Colors.ENDC} 🔁 Reverse Tunnel Setup (KH -> IR)",
                 f"{Colors.CYAN}[3]{Colors.ENDC} 🔄 Update Binary",
                 f"{Colors.CYAN}[4]{Colors.ENDC} 🗑️  Uninstall",
                 f"{Colors.CYAN}[5]{Colors.ENDC} 📊 Monitor / Logs / Service Control",
