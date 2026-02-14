@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import urllib.request
 import uuid
 
@@ -57,8 +58,55 @@ class Colors:
     UNDERLINE = "\033[4m"
 
 
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _char_display_width(ch):
+    # Ignore zero-width / formatting code points and combining marks.
+    if ch in {"\u200c", "\u200d", "\ufe0e", "\ufe0f"}:
+        return 0
+    if unicodedata.combining(ch):
+        return 0
+    if unicodedata.category(ch) in {"Cf", "Mn", "Me"}:
+        return 0
+    if unicodedata.east_asian_width(ch) in {"F", "W"}:
+        return 2
+    return 1
+
+
+def visible_len(text):
+    clean = ANSI_ESCAPE_PATTERN.sub("", str(text))
+    return sum(_char_display_width(ch) for ch in clean)
+
+
+def pad_visible(text, width):
+    raw = str(text)
+    return raw + (" " * max(0, width - visible_len(raw)))
+
+
+def print_3d_panel(title, lines=None, color=Colors.CYAN, min_width=52):
+    panel_lines = [f"{Colors.BOLD}{title}{Colors.ENDC}"]
+    panel_lines.extend(str(line) for line in (lines or []))
+    inner_width = max(min_width, max(visible_len(line) for line in panel_lines))
+    horizontal = "━" * (inner_width + 2)
+
+    print("")
+    print(f"{color}┏{horizontal}┓{Colors.ENDC}")
+    for line in panel_lines:
+        print(
+            f"{color}┃{Colors.ENDC} {pad_visible(line, inner_width)} "
+            f"{color}┃{Colors.ENDC}{Colors.BLUE}▓{Colors.ENDC}"
+        )
+    print(f"{color}┗{horizontal}┛{Colors.ENDC}{Colors.BLUE}▓{Colors.ENDC}")
+    print(f"{Colors.BLUE} {'▓' * (inner_width + 3)}{Colors.ENDC}")
+
+
+def print_menu(title, lines, color=Colors.CYAN, min_width=52):
+    print_3d_panel(title, lines=lines, color=color, min_width=min_width)
+
+
 def print_header(text):
-    print(f"\n{Colors.HEADER}{Colors.BOLD}=== {text} ==={Colors.ENDC}")
+    print_3d_panel(text, color=Colors.HEADER, min_width=34)
 
 
 def print_success(text):
@@ -200,11 +248,12 @@ def choose_services(allow_all=False, action_label="service"):
         print_error("No tunnel services are installed.")
         return []
 
-    print(f"\n{Colors.CYAN}{action_label.title()} target:{Colors.ENDC}")
+    menu_lines = []
     for index, service in enumerate(services, start=1):
-        print(f"{index}. {service}.service")
+        menu_lines.append(f"{index}. {service}.service")
     if allow_all and len(services) > 1:
-        print(f"{len(services) + 1}. all")
+        menu_lines.append(f"{len(services) + 1}. all")
+    print_menu(f"{action_label.title()} Target", menu_lines, color=Colors.CYAN, min_width=42)
 
     prompt = f"Select {action_label} [1-{len(services) + (1 if allow_all and len(services) > 1 else 0)}]: "
     while True:
@@ -344,12 +393,15 @@ def get_latest_release():
 
 def print_banner():
     os.system("clear" if os.name == "posix" else "cls")
-    print(f"{Colors.CYAN}{Colors.BOLD}")
-    print("╔══════════════════════════════════════════════════════╗")
-    print("║        ✨ NoDelay Tunnel Made By Hosi ✨            ║")
-    print("║        📢 Channel: @NodelayTunnel                    ║")
-    print("╚══════════════════════════════════════════════════════╝")
-    print(f"{Colors.ENDC}")
+    print_3d_panel(
+        "✨ NoDelay Tunnel Made By Hosi ✨",
+        [
+            "📢 Channel: @NodelayTunnel",
+            "🔧 Fast, stable, stealth-focused deployment",
+        ],
+        color=Colors.CYAN,
+        min_width=56,
+    )
 
 
 def ensure_binary():
@@ -460,9 +512,15 @@ def generate_self_signed_cert(common_name="www.example.com"):
 
 
 def ask_cert_options():
-    print(f"\n{Colors.CYAN}Certificate Options:{Colors.ENDC}")
-    print("1. Use existing certificate path")
-    print("2. Generate self-signed certificate (Auto)")
+    print_menu(
+        "Certificate Options",
+        [
+            "1. Use existing certificate path",
+            "2. Generate self-signed certificate (Auto)",
+        ],
+        color=Colors.CYAN,
+        min_width=46,
+    )
     choice = input("Select option [1/2]: ").strip()
     if choice == "2":
         domain = input_default("Enter domain for certificate", "www.bing.com")
@@ -752,7 +810,6 @@ def prompt_license_id():
 
 
 def menu_protocol(role, server_addr="", defaults=None):
-    print_header("📜 Select Protocol")
     options = [
         ("1", "🌐 TCP"),
         ("2", "🔒 TLS"),
@@ -764,8 +821,12 @@ def menu_protocol(role, server_addr="", defaults=None):
         ("8", "📄 HTTP Mimicry"),
         ("9", "🌌 REALITY"),
     ]
-    for key, name in options:
-        print(f"{Colors.GREEN}[{key}]{Colors.ENDC} {name}")
+    print_menu(
+        "📜 Select Protocol",
+        [f"{Colors.GREEN}[{key}]{Colors.ENDC} {name}" for key, name in options],
+        color=Colors.CYAN,
+        min_width=44,
+    )
 
     type_to_choice = {
         "tcp": "1",
@@ -1360,10 +1421,11 @@ def prompt_instance_name(role):
 
 
 def select_config_profile(default_profile="balanced"):
-    print_header("🎛️ Config Profile Preset")
+    menu_lines = []
     for index, profile in enumerate(PROFILE_PRESETS, start=1):
         suffix = " (current)" if profile == default_profile else ""
-        print(f"{index}. {profile}{suffix}")
+        menu_lines.append(f"{index}. {profile}{suffix}")
+    print_menu("🎛️ Config Profile Preset", menu_lines, color=Colors.CYAN, min_width=44)
     while True:
         default_index = 1
         if default_profile in PROFILE_PRESETS:
@@ -1377,9 +1439,15 @@ def select_config_profile(default_profile="balanced"):
 
 
 def select_deployment_mode():
-    print_header("🚀 Deployment Mode")
-    print("1. Default Optimized (recommended)")
-    print("2. Advanced (customize smux/tcp/udp/kcp/quic/reconnect)")
+    print_menu(
+        "🚀 Deployment Mode",
+        [
+            "1. Default Optimized (recommended)",
+            "2. Advanced (customize smux/tcp/udp/kcp/quic/reconnect)",
+        ],
+        color=Colors.CYAN,
+        min_width=56,
+    )
     while True:
         choice = input("Select mode [1/2]: ").strip()
         if choice == "1":
@@ -1448,24 +1516,27 @@ def match_obfuscation_preset_key(current):
 
 
 def select_obfuscation_profile(default_key="speed"):
-    print_header("🕶️ Obfuscation Profile")
     default_index = 1
     for idx, preset in enumerate(OBFUSCATION_PRESETS, start=1):
         if preset["key"] == default_key:
             default_index = idx
             break
+    menu_lines = []
     for index, preset in enumerate(OBFUSCATION_PRESETS, start=1):
         current_suffix = " (current)" if index == default_index else ""
         if not preset["enabled"]:
             suffix = " (Recommended for speed)" if preset["key"] == "speed" else ""
-            print(f"{index}. {preset['label']:<16} | enabled=false{suffix}{current_suffix}")
+            menu_lines.append(
+                f"{index}. {preset['label']:<16} | enabled=false{suffix}{current_suffix}"
+            )
             continue
-        print(
+        menu_lines.append(
             f"{index}. {preset['label']:<16} | enabled=true  "
             f"padding={preset['min_padding']}-{preset['max_padding']}  "
             f"delay={preset['min_delay_ms']}-{preset['max_delay_ms']}ms  "
             f"burst_chance={preset['burst_chance']}%{current_suffix}"
         )
+    print_menu("🕶️ Obfuscation Profile", menu_lines, color=Colors.CYAN, min_width=68)
     while True:
         choice = input_default(f"Select profile [1-{len(OBFUSCATION_PRESETS)}]", default_index).strip()
         if choice.isdigit():
@@ -2031,14 +2102,20 @@ def show_service_logs(follow=False):
 
 def service_control_menu():
     while True:
-        print_header("📊 Tunnel Monitor & Service Control")
-        print("1. Show tunnel/service status")
-        print("2. Show recent logs")
-        print("3. Follow live logs")
-        print("4. Start service")
-        print("5. Stop service")
-        print("6. Restart service")
-        print("0. Back")
+        print_menu(
+            "📊 Tunnel Monitor & Service Control",
+            [
+                "1. Show tunnel/service status",
+                "2. Show recent logs",
+                "3. Follow live logs",
+                "4. Start service",
+                "5. Stop service",
+                "6. Restart service",
+                "0. Back",
+            ],
+            color=Colors.CYAN,
+            min_width=50,
+        )
 
         choice = input("Select option: ").strip()
         if choice == "1":
@@ -2140,32 +2217,44 @@ def edit_service_instance(service_name):
     config_path = loaded["config_path"]
 
     while True:
-        print_header(f"✏️ Edit Tunnel: {service_name}.service")
-        print(f"Role:       {role} ({role_display(role)})")
-        print(f"Instance:   {instance}")
-        print(f"Config:     {config_path}")
-        print(f"Protocol:   {protocol_cfg.get('type')}:{protocol_cfg.get('port')}")
-        print(f"Profile:    {protocol_cfg.get('profile', 'balanced')}")
-        print(f"Obfuscation:{'enabled' if obfuscation_cfg.get('enabled') else 'disabled'}")
+        menu_lines = [
+            f"Role:        {role} ({role_display(role)})",
+            f"Instance:    {instance}",
+            f"Config:      {config_path}",
+            f"Protocol:    {protocol_cfg.get('type')}:{protocol_cfg.get('port')}",
+            f"Profile:     {protocol_cfg.get('profile', 'balanced')}",
+            f"Obfuscation: {'enabled' if obfuscation_cfg.get('enabled') else 'disabled'}",
+        ]
         if role == "server":
-            print(f"Mappings:   {len(protocol_cfg.get('mappings', []))}")
+            menu_lines.append(f"Mappings:    {len(protocol_cfg.get('mappings', []))}")
         else:
-            print(f"Server:     {protocol_cfg.get('server_addr')}:{protocol_cfg.get('port')}")
-        print("")
-        print("1. Edit protocol / listen port / transport settings")
-        print("2. Edit profile preset")
-        print("3. Edit obfuscation preset")
+            menu_lines.append(
+                f"Server:      {protocol_cfg.get('server_addr')}:{protocol_cfg.get('port')}"
+            )
+        menu_lines.append("")
+        menu_lines.append("1. Edit protocol / listen port / transport settings")
+        menu_lines.append("2. Edit profile preset")
+        menu_lines.append("3. Edit obfuscation preset")
         if role == "server":
-            print("4. Edit port mappings")
-            print("5. Edit advanced tuning")
-            print("6. Edit license ID")
-            print("7. Save changes and restart service")
-            print("0. Cancel")
+            menu_lines.extend(
+                [
+                    "4. Edit port mappings",
+                    "5. Edit advanced tuning",
+                    "6. Edit license ID",
+                    "7. Save changes and restart service",
+                    "0. Cancel",
+                ]
+            )
         else:
-            print("4. Edit advanced tuning")
-            print("5. Edit license ID")
-            print("6. Save changes and restart service")
-            print("0. Cancel")
+            menu_lines.extend(
+                [
+                    "4. Edit advanced tuning",
+                    "5. Edit license ID",
+                    "6. Save changes and restart service",
+                    "0. Cancel",
+                ]
+            )
+        print_menu(f"✏️ Edit Tunnel: {service_name}.service", menu_lines, color=Colors.CYAN, min_width=62)
 
         choice = input("Select option: ").strip()
 
@@ -2229,13 +2318,19 @@ def edit_service_instance(service_name):
 
 def multi_tunnel_menu():
     while True:
-        print_header("🧩 Multi Tunnel Management")
         services = installed_services()
-        print(f"Installed tunnel services: {len(services)}")
-        print("1. List tunnel instances")
-        print("2. Remove one instance")
-        print("3. Edit one instance")
-        print("0. Back")
+        print_menu(
+            "🧩 Multi Tunnel Management",
+            [
+                f"Installed tunnel services: {len(services)}",
+                "1. List tunnel instances",
+                "2. Remove one instance",
+                "3. Edit one instance",
+                "0. Back",
+            ],
+            color=Colors.CYAN,
+            min_width=54,
+        )
         choice = input("Select option: ").strip()
 
         if choice == "1":
@@ -2259,10 +2354,11 @@ def multi_tunnel_menu():
                 print_error("No removable server/client instances found.")
                 input("\nPress Enter to continue...")
                 continue
-            print(f"\n{Colors.CYAN}Removable instances:{Colors.ENDC}")
+            removal_lines = []
             for index, service in enumerate(role_services, start=1):
                 role, instance = parse_service_role_instance(service)
-                print(f"{index}. {service}.service ({role_display(role)}:{instance})")
+                removal_lines.append(f"{index}. {service}.service ({role_display(role)}:{instance})")
+            print_menu("Removable Instances", removal_lines, color=Colors.CYAN, min_width=56)
             raw = input(f"Select instance [1-{len(role_services)}]: ").strip()
             if not raw.isdigit() or not (1 <= int(raw) <= len(role_services)):
                 print_error("Invalid choice.")
@@ -2279,10 +2375,11 @@ def multi_tunnel_menu():
                 print_error("No editable server/client instances found.")
                 input("\nPress Enter to continue...")
                 continue
-            print(f"\n{Colors.CYAN}Editable instances:{Colors.ENDC}")
+            editable_lines = []
             for index, service in enumerate(role_services, start=1):
                 role, instance = parse_service_role_instance(service)
-                print(f"{index}. {service}.service ({role_display(role)}:{instance})")
+                editable_lines.append(f"{index}. {service}.service ({role_display(role)}:{instance})")
+            print_menu("Editable Instances", editable_lines, color=Colors.CYAN, min_width=56)
             raw = input(f"Select instance [1-{len(role_services)}]: ").strip()
             if not raw.isdigit() or not (1 <= int(raw) <= len(role_services)):
                 print_error("Invalid choice.")
@@ -2353,7 +2450,7 @@ def install_client_flow():
     instance = prompt_instance_name("client")
     server_addr = input_required("Server Address (IP/Domain)")
     cfg = menu_protocol("client", server_addr=server_addr)
-    cfg["license"] = prompt_license_id()
+    cfg["license"] = ""
     cfg["profile"] = select_config_profile()
     deployment_mode = select_deployment_mode()
     tuning = configure_tuning("client", deployment_mode)
@@ -2381,13 +2478,20 @@ def install_client_flow():
 def main_menu():
     while True:
         print_banner()
-        print(f"{Colors.GREEN}[1]{Colors.ENDC} 📥 Install Server (Iran)")
-        print(f"{Colors.GREEN}[2]{Colors.ENDC} 💻 Install Client (Kharej)")
-        print(f"{Colors.CYAN}[3]{Colors.ENDC} 🔄 Update Binary")
-        print(f"{Colors.CYAN}[4]{Colors.ENDC} 🗑️  Uninstall")
-        print(f"{Colors.CYAN}[5]{Colors.ENDC} 📊 Monitor / Logs / Service Control")
-        print(f"{Colors.CYAN}[6]{Colors.ENDC} 🧩 Multi Tunnel Management")
-        print(f"{Colors.WARNING}[0]{Colors.ENDC} 🚪 Exit")
+        print_menu(
+            "Main Menu",
+            [
+                f"{Colors.GREEN}[1]{Colors.ENDC} 📥 Install Server (Iran)",
+                f"{Colors.GREEN}[2]{Colors.ENDC} 💻 Install Client (Kharej)",
+                f"{Colors.CYAN}[3]{Colors.ENDC} 🔄 Update Binary",
+                f"{Colors.CYAN}[4]{Colors.ENDC} 🗑️  Uninstall",
+                f"{Colors.CYAN}[5]{Colors.ENDC} 📊 Monitor / Logs / Service Control",
+                f"{Colors.CYAN}[6]{Colors.ENDC} 🧩 Multi Tunnel Management",
+                f"{Colors.WARNING}[0]{Colors.ENDC} 🚪 Exit",
+            ],
+            color=Colors.CYAN,
+            min_width=58,
+        )
 
         choice = input(f"\n{Colors.BOLD}Select option: {Colors.ENDC}").strip()
 
