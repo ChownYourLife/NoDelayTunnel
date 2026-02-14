@@ -8,9 +8,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 import urllib.request
 import uuid
+import builtins
 
 # Configuration
 REPO_OWNER = "ChownYourLife"
@@ -59,6 +61,34 @@ class Colors:
 
 
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
+
+
+try:
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(errors="replace")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+except Exception:
+    pass
+
+
+_ORIGINAL_INPUT = builtins.input
+
+
+def safe_input(prompt=""):
+    try:
+        return _ORIGINAL_INPUT(prompt)
+    except UnicodeDecodeError:
+        if prompt:
+            print(prompt, end="", flush=True)
+        raw = sys.stdin.buffer.readline()
+        if raw == b"":
+            raise EOFError
+        encoding = getattr(sys.stdin, "encoding", None) or "utf-8"
+        return raw.decode(encoding, errors="replace").rstrip("\r\n")
+
+
+builtins.input = safe_input
 
 
 def _char_display_width(ch):
@@ -2050,6 +2080,11 @@ User=root
 ExecStart={exec_start}
 Restart=always
 RestartSec=3
+KillMode=control-group
+TimeoutStopSec=8s
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+SendSIGKILL=yes
 LimitNOFILE=infinity
 
 [Install]
@@ -2064,6 +2099,30 @@ WantedBy=multi-user.target
     print_success(f"✅ Systemd service installed and started: {service_name}.service")
 
 
+def stop_service_fast(service_name, grace_seconds=5.0):
+    unit = f"{service_name}.service"
+    quoted = shlex.quote(unit)
+
+    # For quick shutdown, terminate the whole cgroup and do not block on systemd's full timeout.
+    run_command(f"systemctl kill --signal=SIGTERM --kill-who=all {quoted}", check=False)
+    run_command(f"systemctl stop --no-block {quoted}", check=False)
+
+    deadline = time.time() + grace_seconds
+    while time.time() < deadline:
+        _, active_out, active_err = run_command_output(f"systemctl is-active {quoted}")
+        state = (active_out or active_err or "").strip().lower()
+        if state in {"inactive", "failed", "unknown"}:
+            return True
+        time.sleep(0.25)
+
+    run_command(f"systemctl kill --signal=SIGKILL --kill-who=all {quoted}", check=False)
+    run_command(f"systemctl stop --no-block {quoted}", check=False)
+    time.sleep(0.3)
+    _, active_out, active_err = run_command_output(f"systemctl is-active {quoted}")
+    state = (active_out or active_err or "").strip().lower()
+    return state in {"inactive", "failed", "unknown"}
+
+
 def control_services(action):
     services = choose_services(allow_all=True, action_label=action)
     if not services:
@@ -2075,7 +2134,11 @@ def control_services(action):
     }
     for service in services:
         unit = f"{service}.service"
-        ok = run_command(f"systemctl {action} {shlex.quote(unit)}", check=False)
+        role, _ = parse_service_role_instance(service)
+        if action == "stop" and role == "client":
+            ok = stop_service_fast(service)
+        else:
+            ok = run_command(f"systemctl {action} {shlex.quote(unit)}", check=False)
         if ok and action == "restart":
             active_rc, _, _ = run_command_output(f"systemctl is-active {shlex.quote(unit)}")
             ok = active_rc == 0
@@ -2413,8 +2476,10 @@ def uninstall_everything():
     print_success("🗑️  Uninstalled services and configs (binary kept).")
 
 
-def install_server_flow():
-    print_info("Role mapping: server = Iran Server (inside Iran)")
+def install_server_flow(server_location_label="Iran", tunnel_label="Reverse Tunnel"):
+    print_info(
+        f"Tunnel type: {tunnel_label} | this node role: server ({server_location_label})"
+    )
     instance = prompt_instance_name("server")
     cfg = menu_protocol("server")
     cfg["license"] = prompt_license_id()
@@ -2430,6 +2495,8 @@ def install_server_flow():
 
     print_header("🎉 Server Installation Complete")
     print(f"Instance: {Colors.BOLD}{instance}{Colors.ENDC}")
+    print(f"Tunnel:   {Colors.BOLD}{tunnel_label}{Colors.ENDC}")
+    print(f"Location: {Colors.BOLD}{server_location_label}{Colors.ENDC}")
     print(f"Config:   {Colors.BOLD}{config_path}{Colors.ENDC}")
     print(f"Address:  {Colors.BOLD}:{cfg['port']}{Colors.ENDC}")
     psk_text = cfg["psk"] if cfg["psk"] else "(disabled)"
@@ -2444,9 +2511,11 @@ def install_server_flow():
             print(f"Public:   {Colors.BOLD}{cfg['public_key']}{Colors.ENDC}")
 
 
-def install_client_flow():
-    print_header("💻 Client Configuration (Kharej Server)")
-    print_info("Role mapping: client = Kharej Server (outside Iran)")
+def install_client_flow(client_location_label="Kharej", tunnel_label="Reverse Tunnel"):
+    print_header(f"💻 Client Configuration ({client_location_label})")
+    print_info(
+        f"Tunnel type: {tunnel_label} | this node role: client ({client_location_label})"
+    )
     instance = prompt_instance_name("client")
     server_addr = input_required("Server Address (IP/Domain)")
     cfg = menu_protocol("client", server_addr=server_addr)
@@ -2463,6 +2532,8 @@ def install_client_flow():
 
     print_header("✅ Client Installation Complete")
     print(f"Instance:   {Colors.BOLD}{instance}{Colors.ENDC}")
+    print(f"Tunnel:     {Colors.BOLD}{tunnel_label}{Colors.ENDC}")
+    print(f"Location:   {Colors.BOLD}{client_location_label}{Colors.ENDC}")
     print(f"Config:     {Colors.BOLD}{config_path}{Colors.ENDC}")
     print(f"Run command: {Colors.BOLD}nodelay client -c {config_path}{Colors.ENDC}")
     print(f"Profile:    {Colors.BOLD}{cfg['profile']}{Colors.ENDC}")
@@ -2475,14 +2546,63 @@ def install_client_flow():
             print_info("Use this private key on the server side.")
 
 
+def install_tunnel_flow(tunnel_type):
+    tunnel_profiles = {
+        "direct": {
+            "label": "Direct Tunnel",
+            "client_location": "Iran",
+            "server_location": "Kharej",
+        },
+        "reverse": {
+            "label": "Reverse Tunnel",
+            "client_location": "Kharej",
+            "server_location": "Iran",
+        },
+    }
+    profile = tunnel_profiles.get(tunnel_type)
+    if not profile:
+        print_error(f"Unknown tunnel type: {tunnel_type}")
+        return
+
+    print_menu(
+        f"🧭 {profile['label']} Setup",
+        [
+            f"1. Setup this node as Server ({profile['server_location']})",
+            f"2. Setup this node as Client ({profile['client_location']})",
+            "0. Cancel",
+        ],
+        color=Colors.CYAN,
+        min_width=62,
+    )
+
+    while True:
+        node_choice = input("Select role for this machine [1/2/0]: ").strip()
+        if node_choice == "1":
+            install_server_flow(
+                server_location_label=profile["server_location"],
+                tunnel_label=profile["label"],
+            )
+            return
+        if node_choice == "2":
+            install_client_flow(
+                client_location_label=profile["client_location"],
+                tunnel_label=profile["label"],
+            )
+            return
+        if node_choice == "0":
+            print_info("Tunnel setup cancelled.")
+            return
+        print_error("Invalid choice.")
+
+
 def main_menu():
     while True:
         print_banner()
         print_menu(
             "Main Menu",
             [
-                f"{Colors.GREEN}[1]{Colors.ENDC} 📥 Install Server (Iran)",
-                f"{Colors.GREEN}[2]{Colors.ENDC} 💻 Install Client (Kharej)",
+                f"{Colors.GREEN}[1]{Colors.ENDC} 🟢 Create Direct Tunnel (client: Iran, server: Kharej)",
+                f"{Colors.GREEN}[2]{Colors.ENDC} 🔁 Create Reverse Tunnel (client: Kharej, server: Iran)",
                 f"{Colors.CYAN}[3]{Colors.ENDC} 🔄 Update Binary",
                 f"{Colors.CYAN}[4]{Colors.ENDC} 🗑️  Uninstall",
                 f"{Colors.CYAN}[5]{Colors.ENDC} 📊 Monitor / Logs / Service Control",
@@ -2498,13 +2618,13 @@ def main_menu():
         if choice == "1":
             check_root()
             if ensure_binary():
-                install_server_flow()
+                install_tunnel_flow("direct")
                 input("\nPress Enter to continue...")
 
         elif choice == "2":
             check_root()
             if ensure_binary():
-                install_client_flow()
+                install_tunnel_flow("reverse")
                 input("\nPress Enter to continue...")
 
         elif choice == "3":
