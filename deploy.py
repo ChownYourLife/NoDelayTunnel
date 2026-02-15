@@ -1050,34 +1050,15 @@ def prompt_client_tls_settings(server_addr, default_sni="", default_skip_verify=
     return sni, skip_verify
 
 
-def normalize_mimicry_preset_region(value, default="iran"):
+def normalize_mimicry_preset_region(value, default="mixed"):
     raw = str(value or "").strip().lower()
     if raw in {"iran", "ir", "domestic"}:
         return "iran"
     if raw in {"foreign", "intl", "international", "global", "outside"}:
         return "foreign"
+    if raw in {"mixed", "both", "combined", "all"}:
+        return "mixed"
     return default
-
-
-def prompt_mimicry_preset_region(default_region="iran"):
-    default_region = normalize_mimicry_preset_region(default_region, "iran")
-    print_menu(
-        "🌍 HTTP/HTTPS Mimicry Presets",
-        [
-            "1. Iranian sites",
-            "2. Foreign sites",
-        ],
-        color=Colors.CYAN,
-        min_width=44,
-    )
-    default_choice = "1" if default_region == "iran" else "2"
-    while True:
-        choice = input_default("Select preset group [1/2]", default_choice).strip()
-        if choice == "1":
-            return "iran"
-        if choice == "2":
-            return "foreign"
-        print_error("Invalid choice. Select 1 or 2.")
 
 
 def prompt_license_id():
@@ -1131,7 +1112,7 @@ def menu_protocol(role, server_addr="", defaults=None):
     config = {
         "port": "443",
         "path": "/tunnel",
-        "mimicry_preset_region": "iran",
+        "mimicry_preset_region": "mixed",
         "cert": "",
         "key": "",
         "psk": "",
@@ -1237,9 +1218,7 @@ def menu_protocol(role, server_addr="", defaults=None):
         config["path"] = normalize_path(
             input_default("Mimic Path", config.get("path", "/api/v1/upload")), "/api/v1/upload"
         )
-        config["mimicry_preset_region"] = prompt_mimicry_preset_region(
-            config.get("mimicry_preset_region", "iran")
-        )
+        config["mimicry_preset_region"] = "mixed"
         if role == "server":
             keep_current = input_default("Keep current certificate files? (Y/n)", "y").strip().lower()
             if keep_current in {"y", "yes"} and config.get("cert") and config.get("key"):
@@ -1259,9 +1238,7 @@ def menu_protocol(role, server_addr="", defaults=None):
         config["path"] = normalize_path(
             input_default("Mimic Path", config.get("path", "/api/v1/upload")), "/api/v1/upload"
         )
-        config["mimicry_preset_region"] = prompt_mimicry_preset_region(
-            config.get("mimicry_preset_region", "iran")
-        )
+        config["mimicry_preset_region"] = "mixed"
         config["sni"] = ""
         config["insecure_skip_verify"] = False
 
@@ -1560,10 +1537,7 @@ def load_instance_runtime_settings(role, instance):
     http_mimicry_cfg = (
         parsed.get("http_mimicry", {}) if isinstance(parsed.get("http_mimicry"), dict) else {}
     )
-    mimicry_preset_region = normalize_mimicry_preset_region(
-        http_mimicry_cfg.get("preset_region", "iran"),
-        "iran",
-    )
+    mimicry_preset_region = "mixed"
 
     if role == "server":
         listen = (
@@ -1951,171 +1925,139 @@ def resolve_http_mimicry_path(protocol_config):
     return "/api/v1/upload"
 
 
-def build_http_mimicry_profiles(primary_path, preset_region="iran"):
+def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
     primary_path = normalize_path(primary_path, "/api/v1/upload")
-    preset_region = normalize_mimicry_preset_region(preset_region, "iran")
+    preset_region = normalize_mimicry_preset_region(preset_region, "mixed")
 
-    iran_profiles = {
-        "varzesh3_news": {
+    combined_profiles = {
+        "zoomg_articles": {
             "path": primary_path,
             "browser": "chrome",
-            "fake_host": "www.varzesh3.com",
+            "fake_host": "www.zoomg.ir",
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
                 "X-Requested-With": "XMLHttpRequest",
-                "Referer": "https://www.varzesh3.com/",
+                "Referer": "https://www.zoomg.ir/",
                 "Cache-Control": "max-age=0",
             },
         },
-        "aparat_feed": {
+        "virgool_read": {
             "path": "/",
             "browser": "chrome",
-            "fake_host": "www.aparat.com",
+            "fake_host": "virgool.io",
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
-                "Referer": "https://www.aparat.com/",
+                "Referer": "https://virgool.io/",
                 "Sec-Fetch-Site": "same-origin",
                 "Pragma": "no-cache",
             },
         },
-        "digikala_search": {
-            "path": "/search/",
+        "hamyarwp_blog": {
+            "path": "/blog/",
             "browser": "firefox",
-            "fake_host": "www.digikala.com",
+            "fake_host": "hamyarwp.com",
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
-                "Referer": "https://www.digikala.com/",
+                "Referer": "https://hamyarwp.com/",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Connection": "keep-alive",
             },
         },
-        "divar_city": {
-            "path": "/s/tehran",
+        "rasaneh3_feed": {
+            "path": "/",
             "browser": "chrome",
-            "fake_host": "divar.ir",
+            "fake_host": "www.rasanetv.com",
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
-                "Referer": "https://divar.ir/",
+                "Referer": "https://www.rasanetv.com/",
                 "Sec-Fetch-Site": "same-origin",
                 "Cache-Control": "no-cache",
             },
         },
-        "snapp_home": {
-            "path": "/",
-            "browser": "chrome",
-            "fake_host": "snapp.ir",
-            "cookie_enabled": True,
-            "chunked_encoding": False,
-            "custom_headers": {
-                "Origin": "https://snapp.ir",
-                "Referer": "https://snapp.ir/",
-                "Sec-Fetch-Mode": "navigate",
-            },
-        },
-        "torob_search": {
-            "path": "/search/",
+        "mizbanfa_docs": {
+            "path": "/blog/",
             "browser": "edge",
-            "fake_host": "torob.com",
+            "fake_host": "mizbanfa.net",
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
-                "Referer": "https://torob.com/",
+                "Referer": "https://mizbanfa.net/",
                 "Sec-Fetch-Site": "same-origin",
                 "Pragma": "no-cache",
             },
         },
-    }
-
-    foreign_profiles = {
-        "microsoft_home": {
-            "path": primary_path,
-            "browser": "edge",
-            "fake_host": "www.microsoft.com",
+        "f_droid_packages": {
+            "path": "/packages/",
+            "browser": "firefox",
+            "fake_host": "f-droid.org",
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
-                "Referer": "https://www.microsoft.com/",
-                "Sec-Fetch-Site": "none",
+                "Referer": "https://f-droid.org/",
+                "Sec-Fetch-Site": "same-origin",
                 "Cache-Control": "max-age=0",
             },
         },
-        "cloudflare_docs": {
-            "path": "/",
-            "browser": "chrome",
-            "fake_host": "developers.cloudflare.com",
+        "archwiki_page": {
+            "path": "/title/Main_page",
+            "browser": "edge",
+            "fake_host": "wiki.archlinux.org",
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
-                "Referer": "https://developers.cloudflare.com/",
+                "Referer": "https://wiki.archlinux.org/",
+                "Sec-Fetch-Site": "same-origin",
+                "Pragma": "no-cache",
+            },
+        },
+        "mdn_docs": {
+            "path": "/en-US/docs/Web",
+            "browser": "chrome",
+            "fake_host": "developer.mozilla.org",
+            "cookie_enabled": True,
+            "chunked_encoding": False,
+            "custom_headers": {
+                "Referer": "https://developer.mozilla.org/",
                 "Sec-Fetch-Site": "none",
                 "Pragma": "no-cache",
             },
         },
-        "wikipedia_main": {
-            "path": "/",
+        "linode_docs": {
+            "path": "/docs/",
             "browser": "firefox",
-            "fake_host": "www.wikipedia.org",
+            "fake_host": "www.linode.com",
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
-                "Referer": "https://www.wikipedia.org/",
+                "Referer": "https://www.linode.com/",
                 "Sec-Fetch-Site": "none",
                 "Cache-Control": "max-age=0",
             },
         },
-        "stackoverflow_questions": {
-            "path": "/questions",
+        "gnu_manuals": {
+            "path": "/software/",
             "browser": "chrome",
-            "fake_host": "stackoverflow.com",
+            "fake_host": "www.gnu.org",
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
-                "Referer": "https://stackoverflow.com/",
+                "Referer": "https://www.gnu.org/",
                 "Sec-Fetch-Site": "same-origin",
                 "Connection": "keep-alive",
             },
         },
-        "apple_support": {
-            "path": "/en-us",
-            "browser": "safari",
-            "fake_host": "support.apple.com",
-            "cookie_enabled": True,
-            "chunked_encoding": False,
-            "custom_headers": {
-                "Referer": "https://support.apple.com/",
-                "Sec-Fetch-Site": "none",
-                "Pragma": "no-cache",
-            },
-        },
-        "bing_search": {
-            "path": "/search",
-            "browser": "edge",
-            "fake_host": "www.bing.com",
-            "cookie_enabled": True,
-            "chunked_encoding": False,
-            "custom_headers": {
-                "Referer": "https://www.bing.com/",
-                "Sec-Fetch-Site": "same-origin",
-                "Cache-Control": "max-age=0",
-            },
-        },
     }
 
-    if preset_region == "foreign":
-        return foreign_profiles
-    return iran_profiles
+    return combined_profiles
 
 
 def render_http_mimicry_lines(protocol_config, http_path):
     enabled = protocol_config["type"] in {"httpmimicry", "httpsmimicry"}
-    preset_region = normalize_mimicry_preset_region(
-        protocol_config.get("mimicry_preset_region", "iran"),
-        "iran",
-    )
+    preset_region = "mixed"
     profiles = build_http_mimicry_profiles(http_path, preset_region)
     primary_profile = next(iter(profiles.values()))
     lines = [
