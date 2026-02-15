@@ -3336,6 +3336,7 @@ def main_menu():
                 f"{Colors.CYAN}[4]{Colors.ENDC} 🗑️  Uninstall",
                 f"{Colors.CYAN}[5]{Colors.ENDC} 📊 Monitor / Logs / Service Control",
                 f"{Colors.CYAN}[6]{Colors.ENDC} 🧩 Multi Tunnel Management",
+                f"{Colors.CYAN}[7]{Colors.ENDC} ⚙️ Linux Optimization",
                 f"{Colors.WARNING}[0]{Colors.ENDC} 🚪 Exit",
             ],
             color=Colors.CYAN,
@@ -3374,6 +3375,11 @@ def main_menu():
         elif choice == "6":
             check_root()
             multi_tunnel_menu()
+
+        elif choice == "7":
+            check_root()
+            maybe_apply_linux_network_tuning()
+            input("\nPress Enter to continue...")
 
         elif choice == "0":
             sys.exit(0)
