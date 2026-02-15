@@ -585,6 +585,46 @@ def cert_base_name(identifier):
     return safe or "trusted_cert"
 
 
+def purge_existing_ip_cert_state(acme_sh, identifier, cert_path, key_path):
+    removed_any = False
+
+    # Remove previously installed local certificate/key files.
+    for path in (cert_path, key_path):
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+                removed_any = True
+                print_info(f"Removed existing file: {path}")
+            except OSError as exc:
+                print_error(f"Could not remove existing file {path}: {exc}")
+
+    # Remove existing ACME renewal record if it exists.
+    if run_args_stream([acme_sh, "--remove", "-d", identifier]):
+        removed_any = True
+        print_info(f"Removed existing ACME record for IP: {identifier}")
+
+    # Remove local acme.sh state directories for this identifier.
+    acme_home = os.path.expanduser("~/.acme.sh")
+    if os.path.isdir(acme_home):
+        candidates = (
+            identifier,
+            f"{identifier}_ecc",
+            f"{identifier}_rsa",
+        )
+        for name in candidates:
+            entry = os.path.join(acme_home, name)
+            if os.path.isdir(entry):
+                try:
+                    shutil.rmtree(entry)
+                    removed_any = True
+                    print_info(f"Removed existing ACME state: {entry}")
+                except OSError as exc:
+                    print_error(f"Could not remove ACME state {entry}: {exc}")
+
+    if removed_any:
+        print_info(f"Existing IP certificate state was cleared for {identifier}. Reissuing...")
+
+
 def find_acme_sh():
     candidates = [
         os.path.expanduser("~/.acme.sh/acme.sh"),
@@ -694,6 +734,9 @@ def generate_trusted_cert_acme():
     base = cert_base_name(identifier)
     cert_path = os.path.join(cert_dir, f"trusted-{base}.crt")
     key_path = os.path.join(cert_dir, f"trusted-{base}.key")
+
+    if mode == "2":
+        purge_existing_ip_cert_state(acme_sh, identifier, cert_path, key_path)
 
     stop_services = input_default(
         "Temporarily stop nodelay services for ACME challenge? (Y/n)",
@@ -1119,6 +1162,27 @@ def prompt_mimicry_transport_mode(default="websocket"):
         print_error("Invalid choice. Pick 1 or 2.")
 
 
+def prompt_mimicry_http_scheme(default="httpsmimicry"):
+    normalized_default = str(default or "").strip().lower()
+    default_choice = "1" if normalized_default == "httpsmimicry" else "2"
+    print_menu(
+        "🌐 Mimicry TLS Type",
+        [
+            f"{Colors.GREEN}[1]{Colors.ENDC} HTTPS Mimicry (TLS)",
+            f"{Colors.GREEN}[2]{Colors.ENDC} HTTP Mimicry (No TLS)",
+        ],
+        color=Colors.CYAN,
+        min_width=44,
+    )
+    while True:
+        choice = input_default("Type [1-2]", default_choice).strip()
+        if choice == "1":
+            return "httpsmimicry"
+        if choice == "2":
+            return "httpmimicry"
+        print_error("Invalid choice. Pick 1 or 2.")
+
+
 def prompt_license_id():
     while True:
         value = input("License ID: ").strip()
@@ -1166,6 +1230,12 @@ def menu_protocol(role, server_addr="", defaults=None):
         if choice in {str(i) for i in range(1, 10)}:
             break
         print_error("Invalid choice. Pick a number between 1 and 9.")
+
+    # For client setup, ask explicitly whether mimicry should use HTTP or HTTPS.
+    if role == "client" and choice in {"7", "8"}:
+        current_type = "httpsmimicry" if choice == "7" else "httpmimicry"
+        selected = prompt_mimicry_http_scheme(current_type)
+        choice = "7" if selected == "httpsmimicry" else "8"
 
     config = {
         "port": "443",
@@ -1371,7 +1441,15 @@ def menu_protocol(role, server_addr="", defaults=None):
     return config
 
 
-PROFILE_PRESETS = ["performance", "latency", "balanced", "aggressive", "cpu-efficient", "gaming"]
+PROFILE_PRESETS = [
+    "high-load",
+    "performance",
+    "latency",
+    "balanced",
+    "aggressive",
+    "cpu-efficient",
+    "gaming",
+]
 
 OBFUSCATION_PRESETS = [
     {
