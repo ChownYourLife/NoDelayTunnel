@@ -647,7 +647,7 @@ def generate_trusted_cert_acme():
         "Trusted Certificate (ACME)",
         [
             "1. Domain certificate (Let's Encrypt, HTTP-01 on port 80)",
-            "2. IP certificate (ZeroSSL, TLS-ALPN-01 on port 443)",
+            "2. IP certificate (Let's Encrypt, TLS-ALPN-01 on port 443)",
         ],
         color=Colors.CYAN,
         min_width=74,
@@ -659,6 +659,7 @@ def generate_trusted_cert_acme():
             break
         print_error("Invalid choice. Select 1 or 2.")
 
+    cert_profile = ""
     if mode == "1":
         while True:
             identifier = normalize_domain_name(
@@ -677,8 +678,9 @@ def generate_trusted_cert_acme():
             if identifier:
                 break
             print_error("Invalid IP address.")
-        ca_server = "zerossl"
+        ca_server = "letsencrypt"
         issue_args = ["--issue", "--alpn", "-d", identifier, "--server", ca_server]
+        cert_profile = "shortlived"
 
     email = input_required("ACME account email")
     acme_sh = ensure_acme_sh_installed(email)
@@ -705,9 +707,15 @@ def generate_trusted_cert_acme():
         # Register account if needed (safe to re-run).
         run_args_stream([acme_sh, "--register-account", "-m", email, "--server", ca_server])
 
-        print_info(
-            f"Issuing trusted certificate for {identifier} using ACME ({ca_server})..."
-        )
+        if cert_profile:
+            issue_args.extend(["--cert-profile", cert_profile])
+            print_info(
+                f"Issuing trusted certificate for {identifier} using ACME ({ca_server}, profile={cert_profile})..."
+            )
+        else:
+            print_info(
+                f"Issuing trusted certificate for {identifier} using ACME ({ca_server})..."
+            )
         if not run_args_stream([acme_sh] + issue_args):
             print_error("ACME issue failed. Ensure challenge ports are reachable from the internet.")
             return "", ""
