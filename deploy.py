@@ -1311,7 +1311,7 @@ def prompt_mimicry_transport_mode(default="websocket"):
         print_error("Invalid choice. Pick 1 or 2.")
 
 
-def prompt_client_destination(default_host="127.0.0.1", default_port=443):
+def prompt_client_destination(default_host="1.2.3.4", default_port=9999):
     while True:
         host = input_default("Destination Host (IP/Domain)", default_host).strip()
         if host:
@@ -3250,7 +3250,7 @@ def install_client_flow(
         min_width=52,
     )
     instance = prompt_instance_name("client")
-    server_addr, server_port = prompt_client_destination("127.0.0.1", 443)
+    server_addr, server_port = prompt_client_destination("1.2.3.4", 9999)
     cfg = menu_protocol(
         "client",
         server_addr=server_addr,
