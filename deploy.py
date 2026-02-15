@@ -846,6 +846,36 @@ def prompt_client_tls_settings(server_addr, default_sni="", default_skip_verify=
     return sni, skip_verify
 
 
+def normalize_mimicry_preset_region(value, default="iran"):
+    raw = str(value or "").strip().lower()
+    if raw in {"iran", "ir", "domestic"}:
+        return "iran"
+    if raw in {"foreign", "intl", "international", "global", "outside"}:
+        return "foreign"
+    return default
+
+
+def prompt_mimicry_preset_region(default_region="iran"):
+    default_region = normalize_mimicry_preset_region(default_region, "iran")
+    print_menu(
+        "🌍 HTTP/HTTPS Mimicry Presets",
+        [
+            "1. Iranian sites",
+            "2. Foreign sites",
+        ],
+        color=Colors.CYAN,
+        min_width=44,
+    )
+    default_choice = "1" if default_region == "iran" else "2"
+    while True:
+        choice = input_default("Select preset group [1/2]", default_choice).strip()
+        if choice == "1":
+            return "iran"
+        if choice == "2":
+            return "foreign"
+        print_error("Invalid choice. Select 1 or 2.")
+
+
 def prompt_license_id():
     while True:
         value = input("License ID: ").strip()
@@ -897,6 +927,7 @@ def menu_protocol(role, server_addr="", defaults=None):
     config = {
         "port": "443",
         "path": "/tunnel",
+        "mimicry_preset_region": "iran",
         "cert": "",
         "key": "",
         "psk": "",
@@ -1002,6 +1033,9 @@ def menu_protocol(role, server_addr="", defaults=None):
         config["path"] = normalize_path(
             input_default("Mimic Path", config.get("path", "/api/v1/upload")), "/api/v1/upload"
         )
+        config["mimicry_preset_region"] = prompt_mimicry_preset_region(
+            config.get("mimicry_preset_region", "iran")
+        )
         if role == "server":
             keep_current = input_default("Keep current certificate files? (Y/n)", "y").strip().lower()
             if keep_current in {"y", "yes"} and config.get("cert") and config.get("key"):
@@ -1020,6 +1054,9 @@ def menu_protocol(role, server_addr="", defaults=None):
         config["port"] = input_default("Port", config.get("port", 80))
         config["path"] = normalize_path(
             input_default("Mimic Path", config.get("path", "/api/v1/upload")), "/api/v1/upload"
+        )
+        config["mimicry_preset_region"] = prompt_mimicry_preset_region(
+            config.get("mimicry_preset_region", "iran")
         )
         config["sni"] = ""
         config["insecure_skip_verify"] = False
@@ -1316,6 +1353,13 @@ def load_instance_runtime_settings(role, instance):
     security = parsed.get("security", {}) if isinstance(parsed.get("security"), dict) else {}
     psk = str(security.get("psk", ""))
     license_id = str(parsed.get("license", ""))
+    http_mimicry_cfg = (
+        parsed.get("http_mimicry", {}) if isinstance(parsed.get("http_mimicry"), dict) else {}
+    )
+    mimicry_preset_region = normalize_mimicry_preset_region(
+        http_mimicry_cfg.get("preset_region", "iran"),
+        "iran",
+    )
 
     if role == "server":
         listen = (
@@ -1330,6 +1374,7 @@ def load_instance_runtime_settings(role, instance):
             "tunnel_mode": tunnel_mode,
             "port": parse_port_from_address(listen.get("address", ":8443"), 8443),
             "path": str(listen.get("path", "/tunnel")),
+            "mimicry_preset_region": mimicry_preset_region,
             "cert": str(tls_cfg.get("cert_file", "")),
             "key": str(tls_cfg.get("key_file", "")),
             "psk": psk,
@@ -1376,6 +1421,7 @@ def load_instance_runtime_settings(role, instance):
             "port": parse_port_from_address(addr, 8443),
             "server_addr": parse_host_from_address(addr, "127.0.0.1"),
             "path": str(server_ep.get("path", "/tunnel")),
+            "mimicry_preset_region": mimicry_preset_region,
             "cert": "",
             "key": "",
             "psk": psk,
@@ -1701,9 +1747,11 @@ def resolve_http_mimicry_path(protocol_config):
     return "/api/v1/upload"
 
 
-def build_http_mimicry_profiles(primary_path):
+def build_http_mimicry_profiles(primary_path, preset_region="iran"):
     primary_path = normalize_path(primary_path, "/api/v1/upload")
-    return {
+    preset_region = normalize_mimicry_preset_region(preset_region, "iran")
+
+    iran_profiles = {
         "varzesh3_news": {
             "path": primary_path,
             "browser": "chrome",
@@ -1778,23 +1826,108 @@ def build_http_mimicry_profiles(primary_path):
         },
     }
 
+    foreign_profiles = {
+        "microsoft_home": {
+            "path": primary_path,
+            "browser": "edge",
+            "fake_host": "www.microsoft.com",
+            "cookie_enabled": True,
+            "chunked_encoding": False,
+            "custom_headers": {
+                "Referer": "https://www.microsoft.com/",
+                "Sec-Fetch-Site": "none",
+                "Cache-Control": "max-age=0",
+            },
+        },
+        "cloudflare_docs": {
+            "path": "/",
+            "browser": "chrome",
+            "fake_host": "developers.cloudflare.com",
+            "cookie_enabled": True,
+            "chunked_encoding": False,
+            "custom_headers": {
+                "Referer": "https://developers.cloudflare.com/",
+                "Sec-Fetch-Site": "none",
+                "Pragma": "no-cache",
+            },
+        },
+        "wikipedia_main": {
+            "path": "/",
+            "browser": "firefox",
+            "fake_host": "www.wikipedia.org",
+            "cookie_enabled": True,
+            "chunked_encoding": False,
+            "custom_headers": {
+                "Referer": "https://www.wikipedia.org/",
+                "Sec-Fetch-Site": "none",
+                "Cache-Control": "max-age=0",
+            },
+        },
+        "stackoverflow_questions": {
+            "path": "/questions",
+            "browser": "chrome",
+            "fake_host": "stackoverflow.com",
+            "cookie_enabled": True,
+            "chunked_encoding": False,
+            "custom_headers": {
+                "Referer": "https://stackoverflow.com/",
+                "Sec-Fetch-Site": "same-origin",
+                "Connection": "keep-alive",
+            },
+        },
+        "apple_support": {
+            "path": "/en-us",
+            "browser": "safari",
+            "fake_host": "support.apple.com",
+            "cookie_enabled": True,
+            "chunked_encoding": False,
+            "custom_headers": {
+                "Referer": "https://support.apple.com/",
+                "Sec-Fetch-Site": "none",
+                "Pragma": "no-cache",
+            },
+        },
+        "bing_search": {
+            "path": "/search",
+            "browser": "edge",
+            "fake_host": "www.bing.com",
+            "cookie_enabled": True,
+            "chunked_encoding": False,
+            "custom_headers": {
+                "Referer": "https://www.bing.com/",
+                "Sec-Fetch-Site": "same-origin",
+                "Cache-Control": "max-age=0",
+            },
+        },
+    }
+
+    if preset_region == "foreign":
+        return foreign_profiles
+    return iran_profiles
+
 
 def render_http_mimicry_lines(protocol_config, http_path):
     enabled = protocol_config["type"] in {"httpmimicry", "httpsmimicry"}
-    profiles = build_http_mimicry_profiles(http_path)
+    preset_region = normalize_mimicry_preset_region(
+        protocol_config.get("mimicry_preset_region", "iran"),
+        "iran",
+    )
+    profiles = build_http_mimicry_profiles(http_path, preset_region)
+    primary_profile = next(iter(profiles.values()))
     lines = [
         "http_mimicry:",
         f"  enabled: {yaml_scalar(enabled)}",
+        f"  preset_region: {yaml_scalar(preset_region)}",
         f"  path: {yaml_scalar(http_path)}",
-        '  browser: "chrome"',
-        '  fake_host: "www.varzesh3.com"',
-        "  cookie_enabled: true",
-        "  chunked_encoding: false",
+        f"  browser: {yaml_scalar(primary_profile['browser'])}",
+        f"  fake_host: {yaml_scalar(primary_profile['fake_host'])}",
+        f"  cookie_enabled: {yaml_scalar(primary_profile['cookie_enabled'])}",
+        f"  chunked_encoding: {yaml_scalar(primary_profile['chunked_encoding'])}",
         "  custom_headers:",
-        '    X-Requested-With: "XMLHttpRequest"',
-        '    Referer: "https://www.varzesh3.com/"',
-        "  profiles:",
     ]
+    for hk, hv in primary_profile["custom_headers"].items():
+        lines.append(f"    {hk}: {yaml_scalar(hv)}")
+    lines.append("  profiles:")
     for name, profile in profiles.items():
         lines.append(f"    {name}:")
         lines.append(f"      path: {yaml_scalar(profile['path'])}")
