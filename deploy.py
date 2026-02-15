@@ -330,38 +330,73 @@ def check_root():
         sys.exit(1)
 
 
-def apply_linux_network_tuning():
+def apply_linux_network_tuning(profile_key="balanced"):
     if not sys.platform.startswith("linux"):
         print_info("Skipping network tuning: only supported on Linux.")
         return False
 
-    print_header("🚀 Linux Network Tuning")
-    sysctl_settings = [
-        ("net.core.rmem_max", "8388608"),
-        ("net.core.wmem_max", "8388608"),
-        ("net.core.rmem_default", "131072"),
-        ("net.core.wmem_default", "131072"),
-        ("net.ipv4.tcp_rmem", "4096 65536 8388608"),
-        ("net.ipv4.tcp_wmem", "4096 65536 8388608"),
-        ("net.ipv4.tcp_window_scaling", "1"),
-        ("net.ipv4.tcp_timestamps", "1"),
-        ("net.ipv4.tcp_sack", "1"),
-        ("net.ipv4.tcp_retries2", "6"),
-        ("net.ipv4.tcp_syn_retries", "2"),
-        ("net.core.netdev_max_backlog", "1000"),
-        ("net.core.somaxconn", "512"),
-        ("net.ipv4.tcp_fastopen", "3"),
-        ("net.ipv4.tcp_low_latency", "1"),
-        ("net.ipv4.tcp_slow_start_after_idle", "0"),
-        ("net.ipv4.tcp_no_metrics_save", "1"),
-        ("net.ipv4.tcp_autocorking", "0"),
-        ("net.ipv4.tcp_mtu_probing", "1"),
-        ("net.ipv4.tcp_base_mss", "1024"),
-        ("net.ipv4.tcp_keepalive_time", "120"),
-        ("net.ipv4.tcp_keepalive_intvl", "10"),
-        ("net.ipv4.tcp_keepalive_probes", "3"),
-        ("net.ipv4.tcp_fin_timeout", "15"),
-    ]
+    profile = str(profile_key or "balanced").strip().lower()
+    tuning_profiles = {
+        "balanced": {
+            "title": "🚀 Linux Network Tuning (Balanced)",
+            "sysctl": [
+                # Stable bidirectional throughput under mixed paths (recommended).
+                ("net.core.rmem_max", "16777216"),
+                ("net.core.wmem_max", "16777216"),
+                ("net.core.rmem_default", "262144"),
+                ("net.core.wmem_default", "262144"),
+                ("net.ipv4.tcp_rmem", "4096 131072 16777216"),
+                ("net.ipv4.tcp_wmem", "4096 131072 16777216"),
+                ("net.ipv4.tcp_window_scaling", "1"),
+                ("net.ipv4.tcp_timestamps", "1"),
+                ("net.ipv4.tcp_sack", "1"),
+                ("net.core.netdev_max_backlog", "8192"),
+                ("net.core.somaxconn", "4096"),
+                ("net.ipv4.tcp_fastopen", "1"),
+                ("net.ipv4.tcp_mtu_probing", "1"),
+                ("net.ipv4.tcp_keepalive_time", "120"),
+                ("net.ipv4.tcp_keepalive_intvl", "10"),
+                ("net.ipv4.tcp_keepalive_probes", "3"),
+                ("net.ipv4.tcp_fin_timeout", "20"),
+            ],
+            "congestion_control": "bbr",
+            "qdisc": "fq_codel",
+        },
+        "aggressive": {
+            "title": "🚀 Linux Network Tuning (Aggressive)",
+            "sysctl": [
+                # Higher throughput bias; may reduce stability on some uplinks.
+                ("net.core.rmem_max", "33554432"),
+                ("net.core.wmem_max", "33554432"),
+                ("net.core.rmem_default", "262144"),
+                ("net.core.wmem_default", "262144"),
+                ("net.ipv4.tcp_rmem", "4096 131072 33554432"),
+                ("net.ipv4.tcp_wmem", "4096 131072 33554432"),
+                ("net.ipv4.tcp_window_scaling", "1"),
+                ("net.ipv4.tcp_timestamps", "1"),
+                ("net.ipv4.tcp_sack", "1"),
+                ("net.core.netdev_max_backlog", "16384"),
+                ("net.core.somaxconn", "8192"),
+                ("net.ipv4.tcp_fastopen", "3"),
+                ("net.ipv4.tcp_mtu_probing", "1"),
+                ("net.ipv4.tcp_slow_start_after_idle", "0"),
+                ("net.ipv4.tcp_no_metrics_save", "1"),
+                ("net.ipv4.tcp_autocorking", "0"),
+                ("net.ipv4.tcp_keepalive_time", "90"),
+                ("net.ipv4.tcp_keepalive_intvl", "10"),
+                ("net.ipv4.tcp_keepalive_probes", "3"),
+                ("net.ipv4.tcp_fin_timeout", "15"),
+            ],
+            "congestion_control": "bbr",
+            "qdisc": "fq_codel",
+        },
+    }
+    if profile not in tuning_profiles:
+        profile = "balanced"
+    selected = tuning_profiles[profile]
+
+    print_header(selected["title"])
+    sysctl_settings = selected["sysctl"]
 
     failed = []
     for key, value in sysctl_settings:
@@ -371,17 +406,26 @@ def apply_linux_network_tuning():
 
     bbr_ok = run_command("modprobe tcp_bbr", check=False)
     if bbr_ok:
-        bbr_ok = run_command("sysctl -w net.ipv4.tcp_congestion_control=bbr", check=False)
-    qdisc_ok = run_command("sysctl -w net.core.default_qdisc=fq_codel", check=False)
+        bbr_ok = run_command(
+            f"sysctl -w net.ipv4.tcp_congestion_control={shlex.quote(selected['congestion_control'])}",
+            check=False,
+        )
+    qdisc_ok = run_command(
+        f"sysctl -w net.core.default_qdisc={shlex.quote(selected['qdisc'])}",
+        check=False,
+    )
 
     _, iface, _ = run_command_output("ip -o link show up | awk -F': ' '$2 != \"lo\" {print $2; exit}'")
     iface = iface.strip() or "eth0"
-    tc_ok = run_command(f"tc qdisc replace dev {shlex.quote(iface)} root fq_codel", check=False)
+    tc_ok = run_command(
+        f"tc qdisc replace dev {shlex.quote(iface)} root {shlex.quote(selected['qdisc'])}",
+        check=False,
+    )
 
     conf_lines = ["# NoDelay Tunnel Linux network tuning"]
     conf_lines.extend([f"{k}={v}" for k, v in sysctl_settings])
-    conf_lines.append("net.ipv4.tcp_congestion_control=bbr")
-    conf_lines.append("net.core.default_qdisc=fq_codel")
+    conf_lines.append(f"net.ipv4.tcp_congestion_control={selected['congestion_control']}")
+    conf_lines.append(f"net.core.default_qdisc={selected['qdisc']}")
     conf_path = "/etc/sysctl.d/99-nodelay.conf"
     try:
         with open(conf_path, "w") as handle:
@@ -398,17 +442,66 @@ def apply_linux_network_tuning():
     else:
         print_info("BBR not enabled (kernel/module may not support it).")
     if qdisc_ok and tc_ok:
-        print_success(f"fq_codel configured on {iface}")
+        print_success(f"{selected['qdisc']} configured on {iface}")
     else:
-        print_info("fq_codel could not be fully applied; verify `tc` and interface state.")
+        print_info(
+            f"{selected['qdisc']} could not be fully applied; verify `tc` and interface state."
+        )
+    return True
+
+
+def restore_linux_network_defaults():
+    if not sys.platform.startswith("linux"):
+        print_info("Skipping network defaults restore: only supported on Linux.")
+        return False
+
+    print_header("♻️ Restore Linux Network Defaults")
+    conf_path = "/etc/sysctl.d/99-nodelay.conf"
+    if os.path.exists(conf_path):
+        try:
+            os.remove(conf_path)
+            print_success(f"Removed tuning file: {conf_path}")
+        except OSError as exc:
+            print_error(f"Could not remove {conf_path}: {exc}")
+            return False
+    else:
+        print_info("No persisted NoDelay tuning file found.")
+
+    run_command("sysctl --system", check=False)
+    run_command("sysctl -w net.ipv4.tcp_congestion_control=cubic", check=False)
+    _, iface, _ = run_command_output("ip -o link show up | awk -F': ' '$2 != \"lo\" {print $2; exit}'")
+    iface = iface.strip() or "eth0"
+    run_command(f"tc qdisc del dev {shlex.quote(iface)} root", check=False)
+    print_success("Restored Linux network defaults (best effort).")
     return True
 
 
 def maybe_apply_linux_network_tuning():
-    answer = input_default("Apply Linux network tuning (BBR/fq_codel)? (Y/n)", "y").strip().lower()
-    if answer in {"n", "no"}:
-        return
-    apply_linux_network_tuning()
+    print_menu(
+        "⚙️ Linux Optimization",
+        [
+            "1. Balanced (Recommended)",
+            "2. Aggressive",
+            "3. Restore Linux Defaults",
+            "0. Skip",
+        ],
+        color=Colors.CYAN,
+        min_width=42,
+    )
+    while True:
+        choice = input_default("Select optimization [0-3]", "1").strip()
+        if choice == "0":
+            return
+        if choice == "1":
+            apply_linux_network_tuning("balanced")
+            return
+        if choice == "2":
+            apply_linux_network_tuning("aggressive")
+            return
+        if choice == "3":
+            restore_linux_network_defaults()
+            return
+        print_error("Invalid choice.")
 
 
 def get_latest_release():
@@ -1162,27 +1255,6 @@ def prompt_mimicry_transport_mode(default="websocket"):
         print_error("Invalid choice. Pick 1 or 2.")
 
 
-def prompt_mimicry_http_scheme(default="httpsmimicry"):
-    normalized_default = str(default or "").strip().lower()
-    default_choice = "1" if normalized_default == "httpsmimicry" else "2"
-    print_menu(
-        "🌐 Mimicry TLS Type",
-        [
-            f"{Colors.GREEN}[1]{Colors.ENDC} HTTPS Mimicry (TLS)",
-            f"{Colors.GREEN}[2]{Colors.ENDC} HTTP Mimicry (No TLS)",
-        ],
-        color=Colors.CYAN,
-        min_width=44,
-    )
-    while True:
-        choice = input_default("Type [1-2]", default_choice).strip()
-        if choice == "1":
-            return "httpsmimicry"
-        if choice == "2":
-            return "httpmimicry"
-        print_error("Invalid choice. Pick 1 or 2.")
-
-
 def prompt_client_destination(default_host="127.0.0.1", default_port=443):
     while True:
         host = input_default("Destination Host (IP/Domain)", default_host).strip()
@@ -1244,12 +1316,6 @@ def menu_protocol(role, server_addr="", defaults=None):
         if choice in {str(i) for i in range(1, 10)}:
             break
         print_error("Invalid choice. Pick a number between 1 and 9.")
-
-    # For client setup, ask explicitly whether mimicry should use HTTP or HTTPS.
-    if role == "client" and choice in {"7", "8"}:
-        current_type = "httpsmimicry" if choice == "7" else "httpmimicry"
-        selected = prompt_mimicry_http_scheme(current_type)
-        choice = "7" if selected == "httpsmimicry" else "8"
 
     config = {
         "port": "443",
