@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import ipaddress
 import unicodedata
 import urllib.request
 import uuid
@@ -541,17 +542,212 @@ def generate_self_signed_cert(common_name="www.example.com"):
     return "", ""
 
 
+def run_args_stream(args):
+    try:
+        return subprocess.run(args, check=False).returncode == 0
+    except Exception:
+        return False
+
+
+def normalize_domain_name(value):
+    return str(value or "").strip().lower().rstrip(".")
+
+
+def is_valid_domain_name(value):
+    host = normalize_domain_name(value)
+    if not host or len(host) > 253:
+        return False
+    if re.fullmatch(r"[a-z0-9.-]+", host) is None:
+        return False
+    labels = host.split(".")
+    if len(labels) < 2:
+        return False
+    for label in labels:
+        if not label or len(label) > 63:
+            return False
+        if label.startswith("-") or label.endswith("-"):
+            return False
+    return True
+
+
+def normalize_ip_identifier(value):
+    raw = str(value or "").strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    try:
+        return str(ipaddress.ip_address(raw))
+    except ValueError:
+        return ""
+
+
+def cert_base_name(identifier):
+    safe = re.sub(r"[^a-z0-9._-]+", "_", str(identifier or "").strip().lower())
+    return safe or "trusted_cert"
+
+
+def find_acme_sh():
+    candidates = [
+        os.path.expanduser("~/.acme.sh/acme.sh"),
+        "/root/.acme.sh/acme.sh",
+    ]
+    from_path = shutil.which("acme.sh")
+    if from_path:
+        candidates.append(from_path)
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return ""
+
+
+def ensure_acme_sh_installed(email):
+    acme_sh = find_acme_sh()
+    if acme_sh:
+        return acme_sh
+    if shutil.which("curl") is None:
+        print_error("curl is required to install acme.sh automatically.")
+        return ""
+    print_info("acme.sh not found. Installing acme.sh...")
+    cmd = f"curl -fsSL https://get.acme.sh | sh -s email={shlex.quote(email)}"
+    if not run_command_stream(cmd):
+        print_error("Failed to install acme.sh.")
+        return ""
+    acme_sh = find_acme_sh()
+    if not acme_sh:
+        print_error("acme.sh installation completed but binary was not found.")
+        return ""
+    return acme_sh
+
+
+def stop_active_tunnel_services():
+    stopped = []
+    for service in installed_services():
+        active, _ = service_state(service)
+        if active.strip().lower() != "active":
+            continue
+        quoted = shlex.quote(f"{service}.service")
+        if run_command(f"systemctl stop {quoted}", check=False):
+            stopped.append(service)
+            print_info(f"Stopped {service}.service for ACME challenge.")
+        else:
+            print_error(f"Could not stop {service}.service.")
+    return stopped
+
+
+def start_tunnel_services(services):
+    for service in services:
+        quoted = shlex.quote(f"{service}.service")
+        if run_command(f"systemctl start {quoted}", check=False):
+            print_info(f"Started {service}.service.")
+        else:
+            print_error(f"Could not restart {service}.service.")
+
+
+def generate_trusted_cert_acme():
+    print_menu(
+        "Trusted Certificate (ACME)",
+        [
+            "1. Domain certificate (Let's Encrypt, HTTP-01 on port 80)",
+            "2. IP certificate (ZeroSSL, TLS-ALPN-01 on port 443)",
+        ],
+        color=Colors.CYAN,
+        min_width=74,
+    )
+
+    while True:
+        mode = input_default("Select mode [1/2]", "1").strip()
+        if mode in {"1", "2"}:
+            break
+        print_error("Invalid choice. Select 1 or 2.")
+
+    if mode == "1":
+        while True:
+            identifier = normalize_domain_name(
+                input_default("Domain for certificate (must resolve to this server)", "example.com")
+            )
+            if is_valid_domain_name(identifier):
+                break
+            print_error("Invalid domain format.")
+        ca_server = "letsencrypt"
+        issue_args = ["--issue", "--standalone", "-d", identifier, "--server", ca_server]
+    else:
+        while True:
+            identifier = normalize_ip_identifier(
+                input_default("Public IP for certificate", "")
+            )
+            if identifier:
+                break
+            print_error("Invalid IP address.")
+        ca_server = "zerossl"
+        issue_args = ["--issue", "--alpn", "-d", identifier, "--server", ca_server]
+
+    email = input_required("ACME account email")
+    acme_sh = ensure_acme_sh_installed(email)
+    if not acme_sh:
+        return "", ""
+
+    cert_dir = os.path.join(CONFIG_DIR, "certs")
+    if not os.path.exists(cert_dir):
+        os.makedirs(cert_dir)
+
+    base = cert_base_name(identifier)
+    cert_path = os.path.join(cert_dir, f"trusted-{base}.crt")
+    key_path = os.path.join(cert_dir, f"trusted-{base}.key")
+
+    stop_services = input_default(
+        "Temporarily stop nodelay services for ACME challenge? (Y/n)",
+        "y",
+    ).strip().lower()
+    stopped = []
+    if stop_services in {"", "y", "yes"}:
+        stopped = stop_active_tunnel_services()
+
+    try:
+        # Register account if needed (safe to re-run).
+        run_args_stream([acme_sh, "--register-account", "-m", email, "--server", ca_server])
+
+        print_info(
+            f"Issuing trusted certificate for {identifier} using ACME ({ca_server})..."
+        )
+        if not run_args_stream([acme_sh] + issue_args):
+            print_error("ACME issue failed. Ensure challenge ports are reachable from the internet.")
+            return "", ""
+
+        install_args = [
+            acme_sh,
+            "--install-cert",
+            "-d",
+            identifier,
+            "--key-file",
+            key_path,
+            "--fullchain-file",
+            cert_path,
+        ]
+        if not run_args_stream(install_args):
+            print_error("ACME certificate install failed.")
+            return "", ""
+
+        print_success(f"Trusted certificate generated: {cert_path}")
+        print_success(f"Private key generated      : {key_path}")
+        return cert_path, key_path
+    finally:
+        if stopped:
+            start_tunnel_services(stopped)
+
+
 def ask_cert_options():
     print_menu(
         "Certificate Options",
         [
             "1. Use existing certificate path",
             "2. Generate self-signed certificate (Auto)",
+            "3. Generate trusted certificate (ACME)",
         ],
         color=Colors.CYAN,
-        min_width=46,
+        min_width=54,
     )
-    choice = input("Select option [1/2]: ").strip()
+    choice = input_default("Select option [1/2/3]", "1").strip()
+    if choice == "3":
+        return generate_trusted_cert_acme()
     if choice == "2":
         domain = input_default("Enter domain for certificate", "www.bing.com")
         return generate_self_signed_cert(domain)
