@@ -25,6 +25,10 @@ SERVER_SERVICE_NAME = "nodelay-server"
 CLIENT_SERVICE_NAME = "nodelay-client"
 LEGACY_SERVICE_NAME = "nodelay"
 SYSTEMD_DIR = "/etc/systemd/system"
+NODELAY_SYSCTL_D_PATH = "/etc/sysctl.d/99-nodelay.conf"
+SYSCTL_CONF_PATH = "/etc/sysctl.conf"
+SYSCTL_CONF_BEGIN = "# BEGIN NoDelay Tunnel managed settings"
+SYSCTL_CONF_END = "# END NoDelay Tunnel managed settings"
 
 SERVICE_PROFILES = {
     "server": {
@@ -330,6 +334,47 @@ def check_root():
         sys.exit(1)
 
 
+def set_sysctl_conf_managed_block(setting_lines):
+    existing_lines = []
+    if os.path.exists(SYSCTL_CONF_PATH):
+        try:
+            with open(SYSCTL_CONF_PATH, "r") as handle:
+                existing_lines = handle.read().splitlines()
+        except OSError as exc:
+            print_error(f"Could not read {SYSCTL_CONF_PATH}: {exc}")
+            return False
+
+    cleaned = []
+    in_block = False
+    for line in existing_lines:
+        stripped = line.strip()
+        if stripped == SYSCTL_CONF_BEGIN:
+            in_block = True
+            continue
+        if stripped == SYSCTL_CONF_END:
+            in_block = False
+            continue
+        if not in_block:
+            cleaned.append(line)
+
+    while cleaned and cleaned[-1].strip() == "":
+        cleaned.pop()
+
+    if setting_lines:
+        cleaned.append("")
+        cleaned.append(SYSCTL_CONF_BEGIN)
+        cleaned.extend(setting_lines)
+        cleaned.append(SYSCTL_CONF_END)
+
+    try:
+        with open(SYSCTL_CONF_PATH, "w") as handle:
+            handle.write("\n".join(cleaned) + "\n")
+        return True
+    except OSError as exc:
+        print_error(f"Could not write {SYSCTL_CONF_PATH}: {exc}")
+        return False
+
+
 def apply_linux_network_tuning(profile_key="balanced"):
     if not sys.platform.startswith("linux"):
         print_info("Skipping network tuning: only supported on Linux.")
@@ -365,7 +410,7 @@ def apply_linux_network_tuning(profile_key="balanced"):
         "aggressive": {
             "title": "🚀 Linux Network Tuning (Aggressive)",
             "sysctl": [
-                # Higher throughput bias; may reduce stability on some uplinks.
+                # Higher throughput bias; keep it upload-safe for real-world speed tests.
                 ("net.core.rmem_max", "33554432"),
                 ("net.core.wmem_max", "33554432"),
                 ("net.core.rmem_default", "262144"),
@@ -377,15 +422,13 @@ def apply_linux_network_tuning(profile_key="balanced"):
                 ("net.ipv4.tcp_sack", "1"),
                 ("net.core.netdev_max_backlog", "16384"),
                 ("net.core.somaxconn", "8192"),
-                ("net.ipv4.tcp_fastopen", "3"),
+                # Keep fastopen conservative to avoid middlebox/path quirks.
+                ("net.ipv4.tcp_fastopen", "1"),
                 ("net.ipv4.tcp_mtu_probing", "1"),
-                ("net.ipv4.tcp_slow_start_after_idle", "0"),
-                ("net.ipv4.tcp_no_metrics_save", "1"),
-                ("net.ipv4.tcp_autocorking", "0"),
-                ("net.ipv4.tcp_keepalive_time", "90"),
+                ("net.ipv4.tcp_keepalive_time", "120"),
                 ("net.ipv4.tcp_keepalive_intvl", "10"),
                 ("net.ipv4.tcp_keepalive_probes", "3"),
-                ("net.ipv4.tcp_fin_timeout", "15"),
+                ("net.ipv4.tcp_fin_timeout", "20"),
             ],
             "congestion_control": "bbr",
             "qdisc": "fq_codel",
@@ -422,18 +465,26 @@ def apply_linux_network_tuning(profile_key="balanced"):
         check=False,
     )
 
+    managed_lines = [f"{k}={v}" for k, v in sysctl_settings]
+    managed_lines.append(f"net.ipv4.tcp_congestion_control={selected['congestion_control']}")
+    managed_lines.append(f"net.core.default_qdisc={selected['qdisc']}")
+
     conf_lines = ["# NoDelay Tunnel Linux network tuning"]
-    conf_lines.extend([f"{k}={v}" for k, v in sysctl_settings])
-    conf_lines.append(f"net.ipv4.tcp_congestion_control={selected['congestion_control']}")
-    conf_lines.append(f"net.core.default_qdisc={selected['qdisc']}")
-    conf_path = "/etc/sysctl.d/99-nodelay.conf"
+    conf_lines.extend(managed_lines)
     try:
-        with open(conf_path, "w") as handle:
+        with open(NODELAY_SYSCTL_D_PATH, "w") as handle:
             handle.write("\n".join(conf_lines) + "\n")
-        run_command("sysctl --system", check=False)
-        print_success(f"Persisted sysctl settings to {conf_path}")
+        print_success(f"Persisted sysctl settings to {NODELAY_SYSCTL_D_PATH}")
     except OSError as exc:
-        print_error(f"Could not write {conf_path}: {exc}")
+        print_error(f"Could not write {NODELAY_SYSCTL_D_PATH}: {exc}")
+
+    if set_sysctl_conf_managed_block(managed_lines):
+        print_success(f"Persisted sysctl settings to {SYSCTL_CONF_PATH}")
+    else:
+        print_error(f"Failed to persist sysctl settings to {SYSCTL_CONF_PATH}")
+
+    run_command("sysctl --system", check=False)
+    run_command("sysctl -p", check=False)
 
     if failed:
         print_error(f"Some sysctl keys could not be applied: {', '.join(failed)}")
@@ -456,18 +507,23 @@ def restore_linux_network_defaults():
         return False
 
     print_header("♻️ Restore Linux Network Defaults")
-    conf_path = "/etc/sysctl.d/99-nodelay.conf"
-    if os.path.exists(conf_path):
+    if os.path.exists(NODELAY_SYSCTL_D_PATH):
         try:
-            os.remove(conf_path)
-            print_success(f"Removed tuning file: {conf_path}")
+            os.remove(NODELAY_SYSCTL_D_PATH)
+            print_success(f"Removed tuning file: {NODELAY_SYSCTL_D_PATH}")
         except OSError as exc:
-            print_error(f"Could not remove {conf_path}: {exc}")
+            print_error(f"Could not remove {NODELAY_SYSCTL_D_PATH}: {exc}")
             return False
     else:
         print_info("No persisted NoDelay tuning file found.")
 
+    if set_sysctl_conf_managed_block([]):
+        print_success(f"Removed managed NoDelay block from {SYSCTL_CONF_PATH}")
+    else:
+        print_error(f"Could not update {SYSCTL_CONF_PATH}")
+
     run_command("sysctl --system", check=False)
+    run_command("sysctl -p", check=False)
     run_command("sysctl -w net.ipv4.tcp_congestion_control=cubic", check=False)
     _, iface, _ = run_command_output("ip -o link show up | awk -F': ' '$2 != \"lo\" {print $2; exit}'")
     iface = iface.strip() or "eth0"
@@ -481,7 +537,7 @@ def maybe_apply_linux_network_tuning():
         "⚙️ Linux Optimization",
         [
             "1. Balanced (Recommended)",
-            "2. Aggressive",
+            "2. Aggressive (Experimental)",
             "3. Restore Linux Defaults",
             "0. Skip",
         ],
