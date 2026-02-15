@@ -1183,6 +1183,20 @@ def prompt_mimicry_http_scheme(default="httpsmimicry"):
         print_error("Invalid choice. Pick 1 or 2.")
 
 
+def prompt_client_destination(default_host="127.0.0.1", default_port=443):
+    while True:
+        host = input_default("Destination Host (IP/Domain)", default_host).strip()
+        if host:
+            break
+        print_error("Destination host is required.")
+
+    while True:
+        port = prompt_int("Destination Port", default_port)
+        if 1 <= port <= 65535:
+            return host, port
+        print_error("Destination port must be between 1 and 65535.")
+
+
 def prompt_license_id():
     while True:
         value = input("License ID: ").strip()
@@ -2863,10 +2877,17 @@ def edit_service_instance(service_name):
 
         if choice == "1":
             if role == "client":
-                protocol_cfg["server_addr"] = input_default(
-                    "Server Address (IP/Domain)",
+                current_port = protocol_cfg.get("port", 443)
+                try:
+                    current_port = int(current_port)
+                except (TypeError, ValueError):
+                    current_port = 443
+                destination_host, destination_port = prompt_client_destination(
                     protocol_cfg.get("server_addr", "127.0.0.1"),
-                ).strip()
+                    current_port,
+                )
+                protocol_cfg["server_addr"] = destination_host
+                protocol_cfg["port"] = destination_port
             protocol_cfg = menu_protocol(
                 role,
                 server_addr=protocol_cfg.get("server_addr", ""),
@@ -3107,8 +3128,12 @@ def install_client_flow(
         min_width=52,
     )
     instance = prompt_instance_name("client")
-    server_addr = input_required("Server Address (IP/Domain)")
-    cfg = menu_protocol("client", server_addr=server_addr)
+    server_addr, server_port = prompt_client_destination("127.0.0.1", 443)
+    cfg = menu_protocol(
+        "client",
+        server_addr=server_addr,
+        defaults={"server_addr": server_addr, "port": server_port},
+    )
     cfg["tunnel_mode"] = tunnel_mode
     cfg["license"] = ""
     cfg["profile"] = select_config_profile()
