@@ -1061,6 +1061,64 @@ def normalize_mimicry_preset_region(value, default="mixed"):
     return default
 
 
+def normalize_network_mtu(value, default=0):
+    try:
+        mtu = int(value)
+    except (TypeError, ValueError):
+        return default
+    if mtu <= 0:
+        return 0
+    if mtu < 576:
+        return 576
+    if mtu > 9000:
+        return 9000
+    return mtu
+
+
+def prompt_network_mtu(default=0):
+    normalized_default = normalize_network_mtu(default, 0)
+    while True:
+        mtu = prompt_int(
+            "Path MTU override (0=disabled, set same on both sides; suggested 1200-1400)",
+            normalized_default,
+        )
+        if mtu == 0:
+            return 0
+        if 576 <= mtu <= 9000:
+            return mtu
+        print_error("Path MTU must be 0 or between 576 and 9000.")
+
+
+def normalize_mimicry_transport_mode(value, default="websocket"):
+    raw = str(value or "").strip().lower()
+    if raw in {"", "websocket", "ws", "wss"}:
+        return "websocket"
+    if raw in {"http2", "h2"}:
+        return "http2"
+    return default
+
+
+def prompt_mimicry_transport_mode(default="websocket"):
+    normalized_default = normalize_mimicry_transport_mode(default, "websocket")
+    default_choice = "2" if normalized_default == "http2" else "1"
+    print_menu(
+        "🎛️ Mimicry Transport Mode",
+        [
+            f"{Colors.GREEN}[1]{Colors.ENDC} WebSocket ({Colors.BOLD}ws/wss{Colors.ENDC})",
+            f"{Colors.GREEN}[2]{Colors.ENDC} HTTP/2 stream tunnel",
+        ],
+        color=Colors.CYAN,
+        min_width=44,
+    )
+    while True:
+        choice = input_default("Mode [1-2]", default_choice).strip()
+        if choice == "1":
+            return "websocket"
+        if choice == "2":
+            return "http2"
+        print_error("Invalid choice. Pick 1 or 2.")
+
+
 def prompt_license_id():
     while True:
         value = input("License ID: ").strip()
@@ -1112,7 +1170,10 @@ def menu_protocol(role, server_addr="", defaults=None):
     config = {
         "port": "443",
         "path": "/tunnel",
+        "network_mtu": 0,
         "mimicry_preset_region": "mixed",
+        "mimicry_transport_mode": "websocket",
+        "pool_size": 3,
         "cert": "",
         "key": "",
         "psk": "",
@@ -1149,6 +1210,16 @@ def menu_protocol(role, server_addr="", defaults=None):
             ).strip().lower()
             if confirm_empty in {"y", "yes"}:
                 break
+        try:
+            default_pool_size = int(config.get("pool_size", 3))
+        except (TypeError, ValueError):
+            default_pool_size = 3
+        while True:
+            pool_size = prompt_int("Connection Pool Size", default_pool_size)
+            if pool_size >= 1:
+                config["pool_size"] = pool_size
+                break
+            print_error("Connection Pool Size must be at least 1.")
 
     if choice == "1":
         config["type"] = "tcp"
@@ -1219,6 +1290,9 @@ def menu_protocol(role, server_addr="", defaults=None):
             input_default("Mimic Path", config.get("path", "/api/v1/upload")), "/api/v1/upload"
         )
         config["mimicry_preset_region"] = "mixed"
+        config["mimicry_transport_mode"] = prompt_mimicry_transport_mode(
+            config.get("mimicry_transport_mode", "websocket")
+        )
         if role == "server":
             keep_current = input_default("Keep current certificate files? (Y/n)", "y").strip().lower()
             if keep_current in {"y", "yes"} and config.get("cert") and config.get("key"):
@@ -1239,6 +1313,9 @@ def menu_protocol(role, server_addr="", defaults=None):
             input_default("Mimic Path", config.get("path", "/api/v1/upload")), "/api/v1/upload"
         )
         config["mimicry_preset_region"] = "mixed"
+        config["mimicry_transport_mode"] = prompt_mimicry_transport_mode(
+            config.get("mimicry_transport_mode", "websocket")
+        )
         config["sni"] = ""
         config["insecure_skip_verify"] = False
 
@@ -1288,6 +1365,8 @@ def menu_protocol(role, server_addr="", defaults=None):
                     config["generated_private_key"],
                     config["reality_key_generated"],
                 ) = prompt_reality_public_key()
+
+    config["network_mtu"] = prompt_network_mtu(config.get("network_mtu", 0))
 
     return config
 
@@ -1534,10 +1613,16 @@ def load_instance_runtime_settings(role, instance):
     security = parsed.get("security", {}) if isinstance(parsed.get("security"), dict) else {}
     psk = str(security.get("psk", ""))
     license_id = str(parsed.get("license", ""))
+    network_cfg = parsed.get("network", {}) if isinstance(parsed.get("network"), dict) else {}
+    network_mtu = normalize_network_mtu(network_cfg.get("mtu", 0), 0)
     http_mimicry_cfg = (
         parsed.get("http_mimicry", {}) if isinstance(parsed.get("http_mimicry"), dict) else {}
     )
     mimicry_preset_region = "mixed"
+    mimicry_transport_mode = normalize_mimicry_transport_mode(
+        http_mimicry_cfg.get("transport_mode", "websocket"),
+        "websocket",
+    )
 
     if role == "server":
         listen = (
@@ -1552,7 +1637,9 @@ def load_instance_runtime_settings(role, instance):
             "tunnel_mode": tunnel_mode,
             "port": parse_port_from_address(listen.get("address", ":8443"), 8443),
             "path": str(listen.get("path", "/tunnel")),
+            "network_mtu": network_mtu,
             "mimicry_preset_region": mimicry_preset_region,
+            "mimicry_transport_mode": mimicry_transport_mode,
             "cert": str(tls_cfg.get("cert_file", "")),
             "key": str(tls_cfg.get("key_file", "")),
             "psk": psk,
@@ -1598,8 +1685,11 @@ def load_instance_runtime_settings(role, instance):
             "tunnel_mode": tunnel_mode,
             "port": parse_port_from_address(addr, 8443),
             "server_addr": parse_host_from_address(addr, "127.0.0.1"),
+            "pool_size": int(client.get("pool_size", 3) or 3),
             "path": str(server_ep.get("path", "/tunnel")),
+            "network_mtu": network_mtu,
             "mimicry_preset_region": mimicry_preset_region,
+            "mimicry_transport_mode": mimicry_transport_mode,
             "cert": "",
             "key": "",
             "psk": psk,
@@ -2058,12 +2148,17 @@ def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
 def render_http_mimicry_lines(protocol_config, http_path):
     enabled = protocol_config["type"] in {"httpmimicry", "httpsmimicry"}
     preset_region = "mixed"
+    mimicry_transport_mode = normalize_mimicry_transport_mode(
+        protocol_config.get("mimicry_transport_mode", "websocket"),
+        "websocket",
+    )
     profiles = build_http_mimicry_profiles(http_path, preset_region)
     primary_profile = next(iter(profiles.values()))
     lines = [
         "http_mimicry:",
         f"  enabled: {yaml_scalar(enabled)}",
         f"  preset_region: {yaml_scalar(preset_region)}",
+        f"  transport_mode: {yaml_scalar(mimicry_transport_mode)}",
         f"  path: {yaml_scalar(http_path)}",
         f"  browser: {yaml_scalar(primary_profile['browser'])}",
         f"  fake_host: {yaml_scalar(primary_profile['fake_host'])}",
@@ -2101,6 +2196,7 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
 
     path = normalize_path(protocol_config.get("path", "/tunnel"), "/tunnel")
     http_path = resolve_http_mimicry_path(protocol_config)
+    network_mtu = normalize_network_mtu(protocol_config.get("network_mtu", 0), 0)
     reality_enabled = protocol_config["type"] == "reality"
     reality_dest = protocol_config.get("dest", "www.microsoft.com:443") if reality_enabled else "www.microsoft.com:443"
     reality_server_names = protocol_config.get("server_names", []) if reality_enabled else []
@@ -2175,6 +2271,9 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
             f"  max_idle_timeout: {yaml_scalar(tuning['quic']['max_idle_timeout'])}",
             f"  keepalive_period: {yaml_scalar(tuning['quic']['keepalive_period'])}",
             "",
+            "network:",
+            f"  mtu: {yaml_scalar(network_mtu)}",
+            "",
             "security:",
             '  token: ""',
             f"  psk: {yaml_scalar(protocol_config.get('psk', ''))}",
@@ -2238,6 +2337,7 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
 
     path = normalize_path(protocol_config.get("path", "/tunnel"), "/tunnel")
     http_path = resolve_http_mimicry_path(protocol_config)
+    network_mtu = normalize_network_mtu(protocol_config.get("network_mtu", 0), 0)
     server_addr = protocol_config.get("server_addr", "127.0.0.1")
     address = f"{server_addr}:{protocol_config['port']}"
     url = resolve_ws_url(protocol_config, address, path)
@@ -2252,13 +2352,19 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
     reality_server_names = protocol_config.get("server_names", []) if reality_enabled else []
     reality_short_id = protocol_config.get("short_id", "") if reality_enabled else ""
     reality_public_key = protocol_config.get("public_key", "") if reality_enabled else ""
+    try:
+        pool_size = int(protocol_config.get("pool_size", 3))
+    except (TypeError, ValueError):
+        pool_size = 3
+    if pool_size < 1:
+        pool_size = 1
     lines = [
         "mode: client",
         f"tunnel_mode: {yaml_scalar(protocol_config.get('tunnel_mode', 'reverse'))}",
         f"profile: {yaml_scalar(protocol_config.get('profile', 'balanced'))}",
         "",
         "client:",
-        "  pool_size: 3",
+        f"  pool_size: {yaml_scalar(pool_size)}",
         "  server:",
         f"    type: {yaml_scalar(protocol_config['type'])}",
         f"    address: {yaml_scalar(address)}",
@@ -2323,6 +2429,9 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         f"  handshake_timeout: {yaml_scalar(tuning['quic']['handshake_timeout'])}",
         f"  max_idle_timeout: {yaml_scalar(tuning['quic']['max_idle_timeout'])}",
         f"  keepalive_period: {yaml_scalar(tuning['quic']['keepalive_period'])}",
+        "",
+        "network:",
+        f"  mtu: {yaml_scalar(network_mtu)}",
         "",
         "security:",
         '  token: ""',
@@ -2890,6 +2999,7 @@ def install_server_flow(
     psk_text = cfg["psk"] if cfg["psk"] else "(disabled)"
     print(f"PSK:      {Colors.BOLD}{psk_text}{Colors.ENDC}")
     print(f"Protocol: {Colors.BOLD}{cfg['type']}{Colors.ENDC}")
+    print(f"Path MTU: {Colors.BOLD}{cfg.get('network_mtu', 0)}{Colors.ENDC}")
     print(f"Profile:  {Colors.BOLD}{cfg['profile']}{Colors.ENDC}")
     print(f"Deploy:   {Colors.BOLD}{deployment_mode}{Colors.ENDC}")
     if cfg["type"] == "reality":
@@ -2948,6 +3058,8 @@ def install_client_flow(
     print(f"Config:     {Colors.BOLD}{config_path}{Colors.ENDC}")
     print(f"Run command: {Colors.BOLD}nodelay client -c {config_path}{Colors.ENDC}")
     print(f"Profile:    {Colors.BOLD}{cfg['profile']}{Colors.ENDC}")
+    print(f"Pool Size:  {Colors.BOLD}{cfg.get('pool_size', 3)}{Colors.ENDC}")
+    print(f"Path MTU:   {Colors.BOLD}{cfg.get('network_mtu', 0)}{Colors.ENDC}")
     print(f"Deploy:     {Colors.BOLD}{deployment_mode}{Colors.ENDC}")
     if cfg["type"] == "reality":
         print(f"ShortID:    {Colors.BOLD}{cfg['short_id']}{Colors.ENDC}")
