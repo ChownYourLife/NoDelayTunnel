@@ -471,6 +471,9 @@ def apply_linux_network_tuning(profile_key="balanced"):
                 ("net.ipv4.tcp_keepalive_intvl", "10"),
                 ("net.ipv4.tcp_keepalive_probes", "3"),
                 ("net.ipv4.tcp_fin_timeout", "20"),
+                ("net.ipv6.conf.all.disable_ipv6", "1"),
+                ("net.ipv6.conf.default.disable_ipv6", "1"),
+                ("net.ipv6.conf.lo.disable_ipv6", "1"),
             ],
             "congestion_control": "bbr",
             "qdisc": "fq_codel",
@@ -498,6 +501,9 @@ def apply_linux_network_tuning(profile_key="balanced"):
                 ("net.ipv4.tcp_keepalive_intvl", "10"),
                 ("net.ipv4.tcp_keepalive_probes", "3"),
                 ("net.ipv4.tcp_fin_timeout", "20"),
+                ("net.ipv6.conf.all.disable_ipv6", "1"),
+                ("net.ipv6.conf.default.disable_ipv6", "1"),
+                ("net.ipv6.conf.lo.disable_ipv6", "1"),
             ],
             "congestion_control": "bbr",
             "qdisc": "fq_codel",
@@ -1050,77 +1056,50 @@ def remove_cert_files_if_exist(cert_path, key_path):
             print_error(f"Could not replace existing file {path}: {exc}")
 
 
-def purge_existing_ip_cert_state(acme_sh, identifier, cert_path, key_path):
-    removed_any = False
+def ensure_certbot_installed():
+    certbot_bin = shutil.which("certbot")
+    if certbot_bin:
+        return certbot_bin
 
-    # Remove previously installed local certificate/key files.
-    for path in (cert_path, key_path):
-        if path and os.path.exists(path):
-            try:
-                os.remove(path)
-                removed_any = True
-                print_info(f"Removed existing file: {path}")
-            except OSError as exc:
-                print_error(f"Could not remove existing file {path}: {exc}")
-
-    # Remove existing ACME renewal record if it exists.
-    if run_args_stream([acme_sh, "--remove", "-d", identifier]):
-        removed_any = True
-        print_info(f"Removed existing ACME record for IP: {identifier}")
-
-    # Remove local acme.sh state directories for this identifier.
-    acme_home = os.path.expanduser("~/.acme.sh")
-    if os.path.isdir(acme_home):
-        candidates = (
-            identifier,
-            f"{identifier}_ecc",
-            f"{identifier}_rsa",
-        )
-        for name in candidates:
-            entry = os.path.join(acme_home, name)
-            if os.path.isdir(entry):
-                try:
-                    shutil.rmtree(entry)
-                    removed_any = True
-                    print_info(f"Removed existing ACME state: {entry}")
-                except OSError as exc:
-                    print_error(f"Could not remove ACME state {entry}: {exc}")
-
-    if removed_any:
-        print_info(f"Existing IP certificate state was cleared for {identifier}. Reissuing...")
-
-
-def find_acme_sh():
-    candidates = [
-        os.path.expanduser("~/.acme.sh/acme.sh"),
-        "/root/.acme.sh/acme.sh",
-    ]
-    from_path = shutil.which("acme.sh")
-    if from_path:
-        candidates.append(from_path)
-    for path in candidates:
-        if path and os.path.exists(path):
-            return path
-    return ""
-
-
-def ensure_acme_sh_installed(email):
-    acme_sh = find_acme_sh()
-    if acme_sh:
-        return acme_sh
-    if shutil.which("curl") is None:
-        print_error("curl is required to install acme.sh automatically.")
+    print_info("certbot is not installed. Attempting automatic installation...")
+    installers = []
+    if shutil.which("apt-get"):
+        installers = [
+            "apt-get update",
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y certbot",
+        ]
+    elif shutil.which("dnf"):
+        installers = ["dnf install -y certbot"]
+    elif shutil.which("yum"):
+        installers = ["yum install -y certbot"]
+    elif shutil.which("apk"):
+        installers = ["apk add --no-cache certbot"]
+    elif shutil.which("pacman"):
+        installers = ["pacman -Sy --noconfirm certbot"]
+    elif shutil.which("zypper"):
+        installers = ["zypper --non-interactive install certbot"]
+    elif shutil.which("snap"):
+        installers = [
+            "snap install core",
+            "snap refresh core",
+            "snap install --classic certbot",
+            "ln -sf /snap/bin/certbot /usr/bin/certbot",
+        ]
+    else:
+        print_error("Could not detect package manager. Please install certbot manually.")
         return ""
-    print_info("acme.sh not found. Installing acme.sh...")
-    cmd = f"curl -fsSL https://get.acme.sh | sh -s email={shlex.quote(email)}"
-    if not run_command_stream(cmd):
-        print_error("Failed to install acme.sh.")
+
+    for cmd in installers:
+        if not run_command_stream(cmd):
+            print_error(f"Installation command failed: {cmd}")
+            return ""
+
+    certbot_bin = shutil.which("certbot")
+    if not certbot_bin:
+        print_error("certbot installation finished but binary was not found in PATH.")
         return ""
-    acme_sh = find_acme_sh()
-    if not acme_sh:
-        print_error("acme.sh installation completed but binary was not found.")
-        return ""
-    return acme_sh
+    print_success("certbot installed successfully.")
+    return certbot_bin
 
 
 def stop_active_tunnel_services():
@@ -1147,12 +1126,56 @@ def start_tunnel_services(services):
             print_error(f"Could not restart {service}.service.")
 
 
-def generate_trusted_cert_acme():
+def prompt_certbot_ca_server(default_server="letsencrypt"):
+    ca_options = [
+        ("1", "Let's Encrypt", "letsencrypt", ""),
+        ("2", "ZeroSSL", "zerossl", "https://acme.zerossl.com/v2/DV90"),
+        ("3", "Buypass", "buypass", "https://api.buypass.com/acme/directory"),
+        ("4", "SSL.com (RSA)", "sslcom_rsa", "https://acme.ssl.com/sslcom-dv-rsa"),
+        ("5", "Google Trust Services", "google", "https://dv.acme-v02.api.pki.goog/directory"),
+        ("6", "Custom ACME server", "custom", ""),
+    ]
+    print_menu(
+        "Certificate CA Provider",
+        [
+            f"{key}. {name}" if provider != "custom" else f"{key}. {name}"
+            for key, name, provider, _ in ca_options
+        ],
+        color=Colors.CYAN,
+        min_width=62,
+    )
+
+    default_choice = "1"
+    for key, _, provider, _ in ca_options:
+        if provider == default_server:
+            default_choice = key
+            break
+
+    while True:
+        choice = input_default("Select CA [1-6]", default_choice).strip()
+        selected = next((item for item in ca_options if item[0] == choice), None)
+        if not selected:
+            print_error("Invalid choice. Select 1..6.")
+            continue
+        provider = selected[2]
+        server_url = selected[3]
+        if provider != "custom":
+            return provider, server_url
+        custom = input_required("Custom ACME directory URL")
+        return "custom", custom
+
+
+def certbot_lineage_name(value):
+    raw = cert_base_name(value).replace("_", "-").strip("-")
+    return raw or "trusted-cert"
+
+
+def generate_trusted_cert_certbot():
     print_menu(
         "Trusted Certificate (ACME)",
         [
-            "1. Domain certificate (Let's Encrypt, HTTP-01 on port 80)",
-            "2. IP certificate (Let's Encrypt, TLS-ALPN-01 on port 443)",
+            "1. Domain certificate (HTTP-01 on port 80)",
+            "2. IP certificate (TLS-ALPN-01 on port 443)",
         ],
         color=Colors.CYAN,
         min_width=74,
@@ -1164,7 +1187,7 @@ def generate_trusted_cert_acme():
             break
         print_error("Invalid choice. Select 1 or 2.")
 
-    cert_profile = ""
+    ca_provider, ca_server_url = prompt_certbot_ca_server("letsencrypt")
     if mode == "1":
         while True:
             identifier = normalize_domain_name(
@@ -1173,8 +1196,7 @@ def generate_trusted_cert_acme():
             if is_valid_domain_name(identifier):
                 break
             print_error("Invalid domain format.")
-        ca_server = "letsencrypt"
-        issue_args = ["--issue", "--standalone", "-d", identifier, "--server", ca_server]
+        challenge_mode = "http-01"
     else:
         while True:
             identifier = normalize_ip_identifier(
@@ -1183,13 +1205,11 @@ def generate_trusted_cert_acme():
             if identifier:
                 break
             print_error("Invalid IP address.")
-        ca_server = "letsencrypt"
-        issue_args = ["--issue", "--alpn", "-d", identifier, "--server", ca_server]
-        cert_profile = "shortlived"
+        challenge_mode = "tls-alpn-01"
 
     email = input_required("ACME account email")
-    acme_sh = ensure_acme_sh_installed(email)
-    if not acme_sh:
+    certbot = ensure_certbot_installed()
+    if not certbot:
         return "", ""
 
     cert_dir = os.path.join(CONFIG_DIR, "certs")
@@ -1201,15 +1221,13 @@ def generate_trusted_cert_acme():
         cert_base_name(identifier),
     ).strip()
     base = cert_base_name(cert_name or identifier)
+    lineage_name = certbot_lineage_name(base)
     cert_path = os.path.join(cert_dir, f"trusted-{base}.crt")
     key_path = os.path.join(cert_dir, f"trusted-{base}.key")
     remove_cert_files_if_exist(cert_path, key_path)
 
-    if mode == "2":
-        purge_existing_ip_cert_state(acme_sh, identifier, cert_path, key_path)
-
     stop_services = input_default(
-        "Temporarily stop nodelay services for ACME challenge? (Y/n)",
+        "Temporarily stop nodelay services for certbot challenge? (Y/n)",
         "y",
     ).strip().lower()
     stopped = []
@@ -1217,34 +1235,42 @@ def generate_trusted_cert_acme():
         stopped = stop_active_tunnel_services()
 
     try:
-        # Register account if needed (safe to re-run).
-        run_args_stream([acme_sh, "--register-account", "-m", email, "--server", ca_server])
-
-        if cert_profile:
-            issue_args.extend(["--cert-profile", cert_profile])
-            print_info(
-                f"Issuing trusted certificate for {identifier} using ACME ({ca_server}, profile={cert_profile})..."
-            )
-        else:
-            print_info(
-                f"Issuing trusted certificate for {identifier} using ACME ({ca_server})..."
-            )
-        if not run_args_stream([acme_sh] + issue_args):
-            print_error("ACME issue failed. Ensure challenge ports are reachable from the internet.")
-            return "", ""
-
-        install_args = [
-            acme_sh,
-            "--install-cert",
+        issue_args = [
+            certbot,
+            "certonly",
+            "--non-interactive",
+            "--agree-tos",
+            "--email",
+            email,
+            "--cert-name",
+            lineage_name,
+            "--standalone",
+            "--preferred-challenges",
+            challenge_mode,
             "-d",
             identifier,
-            "--key-file",
-            key_path,
-            "--fullchain-file",
-            cert_path,
         ]
-        if not run_args_stream(install_args):
-            print_error("ACME certificate install failed.")
+        if ca_server_url:
+            issue_args.extend(["--server", ca_server_url])
+
+        print_info(
+            f"Issuing trusted certificate for {identifier} using certbot ({ca_provider})..."
+        )
+        if not run_args_stream(issue_args):
+            print_error("Certificate issuance failed. Ensure challenge ports are reachable from the internet.")
+            return "", ""
+
+        live_dir = os.path.join("/etc/letsencrypt/live", lineage_name)
+        fullchain_src = os.path.join(live_dir, "fullchain.pem")
+        privkey_src = os.path.join(live_dir, "privkey.pem")
+        if not (os.path.exists(fullchain_src) and os.path.exists(privkey_src)):
+            print_error(f"certbot issued certificate but expected files were not found in {live_dir}")
+            return "", ""
+        try:
+            shutil.copy2(fullchain_src, cert_path)
+            shutil.copy2(privkey_src, key_path)
+        except OSError as exc:
+            print_error(f"Failed to copy certbot certificate files: {exc}")
             return "", ""
 
         print_success(f"Trusted certificate generated: {cert_path}")
@@ -1264,7 +1290,7 @@ def ask_cert_options(default_cert="", default_key="", allow_keep=False):
         [
             "1. Use existing certificate path",
             "2. Generate self-signed certificate (Auto)",
-            "3. Generate trusted certificate (ACME)",
+            "3. Generate trusted certificate (Certbot ACME)",
         ]
     )
     print_menu(
@@ -1279,7 +1305,7 @@ def ask_cert_options(default_cert="", default_key="", allow_keep=False):
     if choice == "0" and allow_keep and has_default_pair:
         return default_cert, default_key
     if choice == "3":
-        return generate_trusted_cert_acme()
+        return generate_trusted_cert_certbot()
     if choice == "2":
         domain = input_default("Common Name (CN) for certificate", "www.bing.com").strip()
         cert_name = input_default(
