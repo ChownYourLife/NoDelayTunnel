@@ -11,6 +11,7 @@ import tempfile
 import time
 import ipaddress
 import unicodedata
+import urllib.parse
 import urllib.request
 import uuid
 import builtins
@@ -47,6 +48,10 @@ ROLE_LABELS = {
     "server": "Iran Server",
     "client": "Kharej Server",
 }
+
+DEFAULT_IRAN_PORT = 9999
+DEFAULT_KHAREJ_PORT = 9999
+TUNING_SECTIONS = ["smux", "tcp", "udp", "kcp", "quic", "reconnect"]
 
 # DER prefixes for extracting raw x25519 keys (last 32 bytes are key material)
 X25519_PRIVATE_DER_PREFIX = bytes.fromhex("302e020100300506032b656e04220420")
@@ -1242,6 +1247,257 @@ def prompt_client_tls_settings(server_addr, default_sni="", default_skip_verify=
     return sni, skip_verify
 
 
+TRANSPORT_TYPE_OPTIONS = [
+    ("1", "tcp", "🌐 TCP"),
+    ("2", "tls", "🔒 TLS"),
+    ("3", "ws", "🕸️ WebSocket (WS)"),
+    ("4", "wss", "🛡️ WebSocket Secure (WSS)"),
+    ("5", "kcp", "⚡ KCP"),
+    ("6", "quic", "🚄 QUIC"),
+    ("7", "httpsmimicry", "🎭 HTTPS Mimicry"),
+    ("8", "httpmimicry", "📄 HTTP Mimicry"),
+    ("9", "reality", "🌌 REALITY"),
+]
+TRANSPORT_TYPE_INDEX_TO_NAME = {idx: name for idx, name, _ in TRANSPORT_TYPE_OPTIONS}
+TRANSPORT_TYPE_NAME_TO_INDEX = {name: idx for idx, name, _ in TRANSPORT_TYPE_OPTIONS}
+
+
+def normalize_endpoint_type(value, default="tcp"):
+    raw = str(value or "").strip().lower()
+    if raw in TRANSPORT_TYPE_NAME_TO_INDEX:
+        return raw
+    return default
+
+
+def endpoint_supports_path(transport_type):
+    return normalize_endpoint_type(transport_type) in {"ws", "wss", "httpmimicry", "httpsmimicry"}
+
+
+def endpoint_uses_tls(transport_type):
+    return normalize_endpoint_type(transport_type) in {"tls", "wss", "quic", "httpsmimicry"}
+
+
+def default_path_for_transport(transport_type):
+    transport_type = normalize_endpoint_type(transport_type)
+    if transport_type in {"ws", "wss"}:
+        return "/ws"
+    if transport_type in {"httpmimicry", "httpsmimicry"}:
+        return "/api/v1/upload"
+    return "/tunnel"
+
+
+def normalize_connection_strategy(value, default="parallel"):
+    raw = str(value or "").strip().lower()
+    if raw in {"parallel", "priority"}:
+        return raw
+    return default
+
+
+def prompt_connection_strategy(default="parallel"):
+    normalized_default = normalize_connection_strategy(default, "parallel")
+    default_choice = "2" if normalized_default == "priority" else "1"
+    print_menu(
+        "🔀 Connection Strategy",
+        [
+            f"{Colors.GREEN}[1]{Colors.ENDC} parallel (spread workers, plus failover)",
+            f"{Colors.GREEN}[2]{Colors.ENDC} priority (ordered failover)",
+        ],
+        color=Colors.CYAN,
+        min_width=56,
+    )
+    while True:
+        choice = input_default("Strategy [1-2]", default_choice).strip()
+        if choice == "1":
+            return "parallel"
+        if choice == "2":
+            return "priority"
+        print_error("Invalid choice. Pick 1 or 2.")
+
+
+def prompt_endpoint_type(default="tcp", prompt_label="Transport Type"):
+    normalized_default = normalize_endpoint_type(default, "tcp")
+    default_choice = TRANSPORT_TYPE_NAME_TO_INDEX.get(normalized_default, "1")
+    print_menu(
+        "📡 Transport Endpoint",
+        [f"{Colors.GREEN}[{idx}]{Colors.ENDC} {label}" for idx, _, label in TRANSPORT_TYPE_OPTIONS],
+        color=Colors.CYAN,
+        min_width=46,
+    )
+    while True:
+        choice = input_default(f"{prompt_label} [1-9]", default_choice).strip()
+        if choice in TRANSPORT_TYPE_INDEX_TO_NAME:
+            return TRANSPORT_TYPE_INDEX_TO_NAME[choice]
+        print_error("Invalid choice. Pick a number between 1 and 9.")
+
+
+def normalize_transport_endpoint(
+    endpoint,
+    role,
+    fallback_type="tcp",
+    fallback_address="",
+    fallback_path="/tunnel",
+):
+    ep = endpoint if isinstance(endpoint, dict) else {}
+    ep_type = normalize_endpoint_type(ep.get("type", fallback_type), normalize_endpoint_type(fallback_type))
+    address = str(ep.get("address", fallback_address) or fallback_address).strip()
+    path = normalize_path(ep.get("path", fallback_path), fallback_path)
+    url = str(ep.get("url", "") or "").strip()
+    tls = ep.get("tls", {}) if isinstance(ep.get("tls"), dict) else {}
+    tls_cfg = {
+        "cert_file": str(tls.get("cert_file", "")).strip(),
+        "key_file": str(tls.get("key_file", "")).strip(),
+        "ca_file": str(tls.get("ca_file", "")).strip(),
+        "server_name": str(tls.get("server_name", "")).strip(),
+        "insecure_skip_verify": bool(tls.get("insecure_skip_verify", False)),
+        "require_client_cert": bool(tls.get("require_client_cert", False)),
+    }
+    if role == "server":
+        tls_cfg["server_name"] = ""
+        tls_cfg["insecure_skip_verify"] = False
+    else:
+        tls_cfg["require_client_cert"] = False
+    return {
+        "type": ep_type,
+        "address": address,
+        "url": url,
+        "path": path,
+        "tls": tls_cfg,
+    }
+
+
+def derive_client_address_from_endpoint(endpoint, fallback="127.0.0.1:8443"):
+    ep = endpoint if isinstance(endpoint, dict) else {}
+    address = str(ep.get("address", "")).strip()
+    if address:
+        return address
+    raw_url = str(ep.get("url", "")).strip()
+    if not raw_url:
+        return fallback
+    try:
+        parsed = urllib.parse.urlparse(raw_url)
+    except Exception:
+        return fallback
+    host = (parsed.hostname or "").strip()
+    if not host:
+        return fallback
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme == "wss" else 80
+    return f"{host}:{port}"
+
+
+def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
+    defaults = protocol_config if isinstance(protocol_config, dict) else {}
+    endpoints = deep_copy(existing) if isinstance(existing, list) else []
+
+    if endpoints:
+        keep = input_default("Keep existing additional endpoints? (Y/n)", "y").strip().lower()
+        if keep in {"y", "yes"}:
+            return endpoints
+        endpoints = []
+
+    prompt = "Add additional upstream endpoints? (y/N)" if role == "client" else "Add additional listen endpoints? (y/N)"
+    add_more = input_default(prompt, "n").strip().lower()
+    if add_more not in {"y", "yes"}:
+        return endpoints
+
+    result = []
+    index = 1
+    while True:
+        print(f"\n{Colors.CYAN}Additional endpoint #{index}{Colors.ENDC}")
+        ep_type = prompt_endpoint_type(default=defaults.get("type", "tcp"))
+
+        try:
+            port_default = int(defaults.get("port", 443))
+        except (TypeError, ValueError):
+            port_default = 443
+        if not (1 <= port_default <= 65535):
+            port_default = 443
+
+        if role == "server":
+            host_default = str(defaults.get("listen_host", "")).strip()
+            host = input_default("Listen Host/IP (blank = all interfaces)", host_default).strip()
+            port = prompt_int("Listen Port", port_default)
+            while port < 1 or port > 65535:
+                print_error("Port must be between 1 and 65535.")
+                port = prompt_int("Listen Port", port_default)
+            address = f"{host}:{port}" if host else f":{port}"
+        else:
+            host = input_default(
+                "Destination Host (IP/Domain)",
+                defaults.get("server_addr", "127.0.0.1"),
+            ).strip()
+            while not host:
+                print_error("Destination host is required.")
+                host = input_default(
+                    "Destination Host (IP/Domain)",
+                    defaults.get("server_addr", "127.0.0.1"),
+                ).strip()
+            port = prompt_int("Destination Port", port_default)
+            while port < 1 or port > 65535:
+                print_error("Port must be between 1 and 65535.")
+                port = prompt_int("Destination Port", port_default)
+            address = f"{host}:{port}"
+
+        path_default = default_path_for_transport(ep_type)
+        seed_path = normalize_path(defaults.get("path", path_default), path_default)
+        if endpoint_supports_path(ep_type):
+            path_label = "Mimic Path" if ep_type in {"httpmimicry", "httpsmimicry"} else "Path"
+            path = normalize_path(input_default(path_label, seed_path), path_default)
+        else:
+            path = seed_path
+
+        tls_cfg = {
+            "cert_file": "",
+            "key_file": "",
+            "ca_file": "",
+            "server_name": "",
+            "insecure_skip_verify": False,
+            "require_client_cert": False,
+        }
+        if role == "server":
+            if endpoint_uses_tls(ep_type):
+                tls_cfg["cert_file"] = str(defaults.get("cert", ""))
+                tls_cfg["key_file"] = str(defaults.get("key", ""))
+        else:
+            if endpoint_uses_tls(ep_type):
+                default_sni = str(defaults.get("sni", "") or host)
+                tls_cfg["server_name"] = input_default("SNI for this endpoint", default_sni).strip()
+                skip_verify_default = bool(defaults.get("insecure_skip_verify", False))
+                tls_cfg["insecure_skip_verify"] = parse_bool(
+                    input_default(
+                        "Insecure Skip Verify (true/false)",
+                        "true" if skip_verify_default else "false",
+                    ),
+                    default=skip_verify_default,
+                )
+
+        endpoint = normalize_transport_endpoint(
+            {
+                "type": ep_type,
+                "address": address,
+                "url": "",
+                "path": path,
+                "tls": tls_cfg,
+            },
+            role=role,
+            fallback_type=ep_type,
+            fallback_address=address,
+            fallback_path=path,
+        )
+        if role == "client" and ep_type in {"ws", "wss"}:
+            endpoint["url"] = resolve_ws_url({"type": ep_type}, endpoint["address"], endpoint["path"])
+
+        result.append(endpoint)
+
+        more = input_default("Add another additional endpoint? (y/N)", "n").strip().lower()
+        if more not in {"y", "yes"}:
+            break
+        index += 1
+
+    return result
+
+
 def normalize_mimicry_preset_region(value, default="mixed"):
     raw = str(value or "").strip().lower()
     if raw in {"iran", "ir", "domestic"}:
@@ -1311,7 +1567,7 @@ def prompt_mimicry_transport_mode(default="websocket"):
         print_error("Invalid choice. Pick 1 or 2.")
 
 
-def prompt_client_destination(default_host="1.2.3.4", default_port=9999):
+def prompt_client_destination(default_host="1.2.3.4", default_port=DEFAULT_KHAREJ_PORT):
     while True:
         host = input_default("Destination Host (IP/Domain)", default_host).strip()
         if host:
@@ -1333,18 +1589,8 @@ def prompt_license_id():
         print_error("License ID is required.")
 
 
-def menu_protocol(role, server_addr="", defaults=None):
-    options = [
-        ("1", "🌐 TCP"),
-        ("2", "🔒 TLS"),
-        ("3", "🕸️ WebSocket (WS)"),
-        ("4", "🛡️ WebSocket Secure (WSS)"),
-        ("5", "⚡ KCP"),
-        ("6", "🚄 QUIC"),
-        ("7", "🎭 HTTPS Mimicry"),
-        ("8", "📄 HTTP Mimicry"),
-        ("9", "🌌 REALITY"),
-    ]
+def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
+    options = [(idx, label) for idx, _, label in TRANSPORT_TYPE_OPTIONS]
     print_menu(
         "📜 Select Protocol",
         [f"{Colors.GREEN}[{key}]{Colors.ENDC} {name}" for key, name in options],
@@ -1374,12 +1620,14 @@ def menu_protocol(role, server_addr="", defaults=None):
         print_error("Invalid choice. Pick a number between 1 and 9.")
 
     config = {
-        "port": "443",
+        "port": str(DEFAULT_IRAN_PORT),
         "path": "/tunnel",
         "network_mtu": 0,
         "mimicry_preset_region": "mixed",
         "mimicry_transport_mode": "websocket",
         "pool_size": 3,
+        "connection_strategy": "parallel",
+        "additional_endpoints": [],
         "cert": "",
         "key": "",
         "psk": "",
@@ -1392,11 +1640,18 @@ def menu_protocol(role, server_addr="", defaults=None):
         "public_key": "",
         "generated_private_key": "",
         "reality_key_generated": False,
+        "listen_host": "",
     }
 
     if isinstance(defaults, dict):
         for k, v in defaults.items():
             config[k] = v
+
+    def prompt_or_keep_port(default_port):
+        default_value = config.get("port", default_port)
+        if role == "client" and not prompt_port:
+            return str(default_value)
+        return input_default("Port", default_value)
 
     if role == "server":
         config["psk"] = input_default(
@@ -1426,14 +1681,17 @@ def menu_protocol(role, server_addr="", defaults=None):
                 config["pool_size"] = pool_size
                 break
             print_error("Connection Pool Size must be at least 1.")
+        config["connection_strategy"] = prompt_connection_strategy(
+            config.get("connection_strategy", "parallel")
+        )
 
     if choice == "1":
         config["type"] = "tcp"
-        config["port"] = input_default("Port", config.get("port", 8080))
+        config["port"] = prompt_or_keep_port(8080)
 
     elif choice == "2":
         config["type"] = "tls"
-        config["port"] = input_default("Port", config.get("port", 443))
+        config["port"] = prompt_or_keep_port(443)
         if role == "server":
             keep_current = input_default("Keep current certificate files? (Y/n)", "y").strip().lower()
             if keep_current in {"y", "yes"} and config.get("cert") and config.get("key"):
@@ -1449,12 +1707,12 @@ def menu_protocol(role, server_addr="", defaults=None):
 
     elif choice == "3":
         config["type"] = "ws"
-        config["port"] = input_default("Port", config.get("port", 80))
+        config["port"] = prompt_or_keep_port(80)
         config["path"] = normalize_path(input_default("Path", config.get("path", "/ws")), "/ws")
 
     elif choice == "4":
         config["type"] = "wss"
-        config["port"] = input_default("Port", config.get("port", 443))
+        config["port"] = prompt_or_keep_port(443)
         config["path"] = normalize_path(input_default("Path", config.get("path", "/ws")), "/ws")
         if role == "server":
             keep_current = input_default("Keep current certificate files? (Y/n)", "y").strip().lower()
@@ -1471,11 +1729,11 @@ def menu_protocol(role, server_addr="", defaults=None):
 
     elif choice == "5":
         config["type"] = "kcp"
-        config["port"] = input_default("Port", config.get("port", 4000))
+        config["port"] = prompt_or_keep_port(4000)
 
     elif choice == "6":
         config["type"] = "quic"
-        config["port"] = input_default("Port", config.get("port", 443))
+        config["port"] = prompt_or_keep_port(443)
         if role == "server":
             keep_current = input_default("Keep current certificate files? (Y/n)", "y").strip().lower()
             if keep_current in {"y", "yes"} and config.get("cert") and config.get("key"):
@@ -1491,7 +1749,7 @@ def menu_protocol(role, server_addr="", defaults=None):
 
     elif choice == "7":
         config["type"] = "httpsmimicry"
-        config["port"] = input_default("Port", config.get("port", 443))
+        config["port"] = prompt_or_keep_port(443)
         config["path"] = normalize_path(
             input_default("Mimic Path", config.get("path", "/api/v1/upload")), "/api/v1/upload"
         )
@@ -1514,7 +1772,7 @@ def menu_protocol(role, server_addr="", defaults=None):
 
     elif choice == "8":
         config["type"] = "httpmimicry"
-        config["port"] = input_default("Port", config.get("port", 80))
+        config["port"] = prompt_or_keep_port(80)
         config["path"] = normalize_path(
             input_default("Mimic Path", config.get("path", "/api/v1/upload")), "/api/v1/upload"
         )
@@ -1527,7 +1785,7 @@ def menu_protocol(role, server_addr="", defaults=None):
 
     elif choice == "9":
         config["type"] = "reality"
-        config["port"] = input_default("Port", config.get("port", 443))
+        config["port"] = prompt_or_keep_port(443)
         existing_names = config.get("server_names", [])
         config["server_names"] = parse_csv(
             input_default(
@@ -1572,6 +1830,11 @@ def menu_protocol(role, server_addr="", defaults=None):
                     config["reality_key_generated"],
                 ) = prompt_reality_public_key()
 
+    config["additional_endpoints"] = prompt_additional_transport_endpoints(
+        role,
+        config,
+        existing=config.get("additional_endpoints", []),
+    )
     config["network_mtu"] = prompt_network_mtu(config.get("network_mtu", 0))
 
     return config
@@ -1839,21 +2102,46 @@ def load_instance_runtime_settings(role, instance):
     )
 
     if role == "server":
-        listen = (
-            parsed.get("server", {}).get("listen", {})
-            if isinstance(parsed.get("server"), dict)
-            else {}
+        server_cfg = parsed.get("server", {}) if isinstance(parsed.get("server"), dict) else {}
+        listen = server_cfg.get("listen", {}) if isinstance(server_cfg.get("listen"), dict) else {}
+        listens = server_cfg.get("listens", [])
+        if not isinstance(listens, list):
+            listens = []
+        primary_fallback = normalize_transport_endpoint(
+            listen,
+            role="server",
+            fallback_type="tcp",
+            fallback_address=":8443",
+            fallback_path="/tunnel",
         )
-        tls_cfg = listen.get("tls", {}) if isinstance(listen.get("tls"), dict) else {}
+        normalized_listens = []
+        for ep in listens:
+            if not isinstance(ep, dict):
+                continue
+            normalized_listens.append(
+                normalize_transport_endpoint(
+                    ep,
+                    role="server",
+                    fallback_type=primary_fallback["type"],
+                    fallback_address=primary_fallback["address"],
+                    fallback_path=primary_fallback["path"],
+                )
+            )
+        if not normalized_listens:
+            normalized_listens = [primary_fallback]
+        primary_listen = normalized_listens[0]
+        tls_cfg = primary_listen.get("tls", {})
         reality = parsed.get("reality", {}) if isinstance(parsed.get("reality"), dict) else {}
         protocol_cfg = {
-            "type": str(listen.get("type", "tcp")),
+            "type": str(primary_listen.get("type", "tcp")),
             "tunnel_mode": tunnel_mode,
-            "port": parse_port_from_address(listen.get("address", ":8443"), 8443),
-            "path": str(listen.get("path", "/tunnel")),
+            "port": parse_port_from_address(primary_listen.get("address", ":8443"), 8443),
+            "listen_host": parse_host_from_address(primary_listen.get("address", ":8443"), ""),
+            "path": str(primary_listen.get("path", "/tunnel")),
             "network_mtu": network_mtu,
             "mimicry_preset_region": mimicry_preset_region,
             "mimicry_transport_mode": mimicry_transport_mode,
+            "additional_endpoints": deep_copy(normalized_listens[1:]),
             "cert": str(tls_cfg.get("cert_file", "")),
             "key": str(tls_cfg.get("key_file", "")),
             "psk": psk,
@@ -1868,8 +2156,8 @@ def load_instance_runtime_settings(role, instance):
             "profile": profile,
         }
         mappings = (
-            parsed.get("server", {}).get("mappings", [])
-            if isinstance(parsed.get("server"), dict)
+            server_cfg.get("mappings", [])
+            if isinstance(server_cfg, dict)
             else []
         )
         if not isinstance(mappings, list):
@@ -1891,19 +2179,56 @@ def load_instance_runtime_settings(role, instance):
     else:
         client = parsed.get("client", {}) if isinstance(parsed.get("client"), dict) else {}
         server_ep = client.get("server", {}) if isinstance(client.get("server"), dict) else {}
-        tls_cfg = server_ep.get("tls", {}) if isinstance(server_ep.get("tls"), dict) else {}
+        servers = client.get("servers", [])
+        if not isinstance(servers, list):
+            servers = []
+        primary_fallback = normalize_transport_endpoint(
+            server_ep,
+            role="client",
+            fallback_type="tcp",
+            fallback_address="127.0.0.1:8443",
+            fallback_path="/tunnel",
+        )
+        normalized_servers = []
+        for ep in servers:
+            if not isinstance(ep, dict):
+                continue
+            normalized_servers.append(
+                normalize_transport_endpoint(
+                    ep,
+                    role="client",
+                    fallback_type=primary_fallback["type"],
+                    fallback_address=primary_fallback["address"],
+                    fallback_path=primary_fallback["path"],
+                )
+            )
+        if not normalized_servers:
+            normalized_servers = [primary_fallback]
+        primary_server = normalized_servers[0]
+        primary_addr = derive_client_address_from_endpoint(primary_server, "127.0.0.1:8443")
+        tls_cfg = primary_server.get("tls", {})
         reality = parsed.get("reality", {}) if isinstance(parsed.get("reality"), dict) else {}
-        addr = str(server_ep.get("address", "127.0.0.1:8443"))
+        try:
+            pool_size = int(client.get("pool_size", 3) or 3)
+        except (TypeError, ValueError):
+            pool_size = 3
+        if pool_size < 1:
+            pool_size = 1
         protocol_cfg = {
-            "type": str(server_ep.get("type", "tcp")),
+            "type": str(primary_server.get("type", "tcp")),
             "tunnel_mode": tunnel_mode,
-            "port": parse_port_from_address(addr, 8443),
-            "server_addr": parse_host_from_address(addr, "127.0.0.1"),
-            "pool_size": int(client.get("pool_size", 3) or 3),
-            "path": str(server_ep.get("path", "/tunnel")),
+            "port": parse_port_from_address(primary_addr, 8443),
+            "server_addr": parse_host_from_address(primary_addr, "127.0.0.1"),
+            "pool_size": pool_size,
+            "connection_strategy": normalize_connection_strategy(
+                client.get("connection_strategy", "parallel"),
+                "parallel",
+            ),
+            "path": str(primary_server.get("path", "/tunnel")),
             "network_mtu": network_mtu,
             "mimicry_preset_region": mimicry_preset_region,
             "mimicry_transport_mode": mimicry_transport_mode,
+            "additional_endpoints": deep_copy(normalized_servers[1:]),
             "cert": "",
             "key": "",
             "psk": psk,
@@ -1937,8 +2262,13 @@ def load_instance_runtime_settings(role, instance):
             )
         protocol_cfg["mappings"] = cleaned_mappings
 
+    explicit_tuning = any(
+        section in parsed and isinstance(parsed.get(section), dict)
+        for section in TUNING_SECTIONS
+    )
+
     tuning = deep_copy(base_tuning(role))
-    for section in ["smux", "tcp", "udp", "kcp", "quic", "reconnect"]:
+    for section in TUNING_SECTIONS:
         incoming = parsed.get(section, {})
         if not isinstance(incoming, dict):
             continue
@@ -1956,6 +2286,7 @@ def load_instance_runtime_settings(role, instance):
         "config_path": config_path,
         "protocol_config": protocol_cfg,
         "tuning": tuning,
+        "explicit_tuning": explicit_tuning,
         "obfuscation_cfg": obfuscation_default,
     }
 
@@ -2200,7 +2531,7 @@ def configure_tuning(role, deployment_mode):
         return tuning
 
     print_header("⚙️ Advanced Tuning")
-    for section in ["smux", "tcp", "udp", "kcp", "quic", "reconnect"]:
+    for section in TUNING_SECTIONS:
         edit = input_default(f"Edit {section} settings? (y/N)", "n").strip().lower()
         if edit not in {"y", "yes"}:
             continue
@@ -2404,11 +2735,159 @@ def resolve_ws_url(protocol_config, address, path):
     return ""
 
 
+def build_server_primary_endpoint(protocol_config):
+    endpoint_type = normalize_endpoint_type(protocol_config.get("type", "tcp"), "tcp")
+    path_default = default_path_for_transport(endpoint_type)
+    path = normalize_path(protocol_config.get("path", path_default), path_default)
+    listen_host = str(protocol_config.get("listen_host", "")).strip()
+    if listen_host:
+        address = f"{listen_host}:{protocol_config.get('port', 8443)}"
+    else:
+        address = f":{protocol_config.get('port', 8443)}"
+    return normalize_transport_endpoint(
+        {
+            "type": endpoint_type,
+            "address": address,
+            "url": "",
+            "path": path,
+            "tls": {
+                "cert_file": protocol_config.get("cert", ""),
+                "key_file": protocol_config.get("key", ""),
+                "ca_file": "",
+                "server_name": "",
+                "insecure_skip_verify": False,
+                "require_client_cert": False,
+            },
+        },
+        role="server",
+        fallback_type=endpoint_type,
+        fallback_address=address,
+        fallback_path=path,
+    )
+
+
+def build_client_primary_endpoint(protocol_config):
+    endpoint_type = normalize_endpoint_type(protocol_config.get("type", "tcp"), "tcp")
+    path_default = default_path_for_transport(endpoint_type)
+    path = normalize_path(protocol_config.get("path", path_default), path_default)
+    server_addr = str(protocol_config.get("server_addr", "127.0.0.1")).strip() or "127.0.0.1"
+    address = f"{server_addr}:{protocol_config.get('port', 8443)}"
+    url = ""
+    if endpoint_type in {"ws", "wss"}:
+        url = resolve_ws_url({"type": endpoint_type}, address, path)
+    return normalize_transport_endpoint(
+        {
+            "type": endpoint_type,
+            "address": address,
+            "url": url,
+            "path": path,
+            "tls": {
+                "cert_file": "",
+                "key_file": "",
+                "ca_file": "",
+                "server_name": protocol_config.get("sni", ""),
+                "insecure_skip_verify": bool(protocol_config.get("insecure_skip_verify", False)),
+                "require_client_cert": False,
+            },
+        },
+        role="client",
+        fallback_type=endpoint_type,
+        fallback_address=address,
+        fallback_path=path,
+    )
+
+
+def build_all_endpoints_for_render(role, protocol_config, primary_endpoint):
+    out = [primary_endpoint]
+    extra = protocol_config.get("additional_endpoints", [])
+    if not isinstance(extra, list):
+        return out
+    for ep in extra:
+        if not isinstance(ep, dict):
+            continue
+        normalized = normalize_transport_endpoint(
+            ep,
+            role=role,
+            fallback_type=primary_endpoint["type"],
+            fallback_address=primary_endpoint["address"],
+            fallback_path=primary_endpoint["path"],
+        )
+        if role == "client" and normalized["type"] in {"ws", "wss"} and not normalized["url"]:
+            normalized["url"] = resolve_ws_url(
+                {"type": normalized["type"]},
+                normalized["address"],
+                normalized["path"],
+            )
+        out.append(normalized)
+    return out
+
+
+def render_named_transport_endpoint_lines(
+    indent,
+    key_name,
+    endpoint,
+    include_require_client_cert=False,
+):
+    tls_cfg = endpoint.get("tls", {}) if isinstance(endpoint.get("tls"), dict) else {}
+    lines = [
+        f"{indent}{key_name}:",
+        f"{indent}  type: {yaml_scalar(endpoint.get('type', 'tcp'))}",
+        f"{indent}  address: {yaml_scalar(endpoint.get('address', ''))}",
+        f"{indent}  url: {yaml_scalar(endpoint.get('url', ''))}",
+        f"{indent}  path: {yaml_scalar(endpoint.get('path', '/tunnel'))}",
+        f"{indent}  tls:",
+        f"{indent}    cert_file: {yaml_scalar(tls_cfg.get('cert_file', ''))}",
+        f"{indent}    key_file: {yaml_scalar(tls_cfg.get('key_file', ''))}",
+        f"{indent}    ca_file: {yaml_scalar(tls_cfg.get('ca_file', ''))}",
+        f"{indent}    server_name: {yaml_scalar(tls_cfg.get('server_name', ''))}",
+        f"{indent}    insecure_skip_verify: {yaml_scalar(bool(tls_cfg.get('insecure_skip_verify', False)))}",
+    ]
+    if include_require_client_cert:
+        lines.append(
+            f"{indent}    require_client_cert: {yaml_scalar(bool(tls_cfg.get('require_client_cert', False)))}"
+        )
+    return lines
+
+
+def render_transport_endpoints_list_lines(
+    indent,
+    key_name,
+    endpoints,
+    include_require_client_cert=False,
+):
+    if not endpoints:
+        return [f"{indent}{key_name}: []"]
+    lines = [f"{indent}{key_name}:"]
+    for endpoint in endpoints:
+        tls_cfg = endpoint.get("tls", {}) if isinstance(endpoint.get("tls"), dict) else {}
+        lines.extend(
+            [
+                f"{indent}  - type: {yaml_scalar(endpoint.get('type', 'tcp'))}",
+                f"{indent}    address: {yaml_scalar(endpoint.get('address', ''))}",
+                f"{indent}    url: {yaml_scalar(endpoint.get('url', ''))}",
+                f"{indent}    path: {yaml_scalar(endpoint.get('path', '/tunnel'))}",
+                f"{indent}    tls:",
+                f"{indent}      cert_file: {yaml_scalar(tls_cfg.get('cert_file', ''))}",
+                f"{indent}      key_file: {yaml_scalar(tls_cfg.get('key_file', ''))}",
+                f"{indent}      ca_file: {yaml_scalar(tls_cfg.get('ca_file', ''))}",
+                f"{indent}      server_name: {yaml_scalar(tls_cfg.get('server_name', ''))}",
+                f"{indent}      insecure_skip_verify: {yaml_scalar(bool(tls_cfg.get('insecure_skip_verify', False)))}",
+            ]
+        )
+        if include_require_client_cert:
+            lines.append(
+                f"{indent}      require_client_cert: {yaml_scalar(bool(tls_cfg.get('require_client_cert', False)))}"
+            )
+    return lines
+
+
 def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
     if not os.path.exists(CONFIG_DIR):
         os.makedirs(CONFIG_DIR)
 
-    path = normalize_path(protocol_config.get("path", "/tunnel"), "/tunnel")
+    primary_endpoint = build_server_primary_endpoint(protocol_config)
+    all_listens = build_all_endpoints_for_render("server", protocol_config, primary_endpoint)
+    path = primary_endpoint["path"]
     http_path = resolve_http_mimicry_path(protocol_config)
     network_mtu = normalize_network_mtu(protocol_config.get("network_mtu", 0), 0)
     reality_enabled = protocol_config["type"] == "reality"
@@ -2422,16 +2901,23 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
         f"profile: {yaml_scalar(protocol_config.get('profile', 'balanced'))}",
         "",
         "server:",
-        "  listen:",
-        f"    type: {yaml_scalar(protocol_config['type'])}",
-        f"    address: {yaml_scalar(':' + str(protocol_config['port']))}",
-        f"    path: {yaml_scalar(path)}",
-        "    tls:",
-        f"      cert_file: {yaml_scalar(protocol_config.get('cert', ''))}",
-        f"      key_file: {yaml_scalar(protocol_config.get('key', ''))}",
-        '      ca_file: ""',
-        "      require_client_cert: false",
     ]
+    lines.extend(
+        render_named_transport_endpoint_lines(
+            "  ",
+            "listen",
+            primary_endpoint,
+            include_require_client_cert=True,
+        )
+    )
+    lines.extend(
+        render_transport_endpoints_list_lines(
+            "  ",
+            "listens",
+            all_listens,
+            include_require_client_cert=True,
+        )
+    )
     if str(protocol_config.get("tunnel_mode", "reverse")).strip().lower() == "direct":
         lines.append("  mappings: []")
     else:
@@ -2549,18 +3035,14 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
     if not os.path.exists(CONFIG_DIR):
         os.makedirs(CONFIG_DIR)
 
-    path = normalize_path(protocol_config.get("path", "/tunnel"), "/tunnel")
+    primary_endpoint = build_client_primary_endpoint(protocol_config)
+    all_servers = build_all_endpoints_for_render("client", protocol_config, primary_endpoint)
+    path = primary_endpoint["path"]
     http_path = resolve_http_mimicry_path(protocol_config)
     network_mtu = normalize_network_mtu(protocol_config.get("network_mtu", 0), 0)
-    server_addr = protocol_config.get("server_addr", "127.0.0.1")
-    address = f"{server_addr}:{protocol_config['port']}"
-    url = resolve_ws_url(protocol_config, address, path)
-    tls_enabled = protocol_config["type"] in {"tls", "wss", "quic", "httpsmimicry"}
-    tls_server_name = protocol_config.get("sni", "") if tls_enabled else ""
-    tls_insecure_skip_verify = (
-        bool(protocol_config.get("insecure_skip_verify", False))
-        if tls_enabled
-        else False
+    connection_strategy = normalize_connection_strategy(
+        protocol_config.get("connection_strategy", "parallel"),
+        "parallel",
     )
     reality_enabled = protocol_config["type"] == "reality"
     reality_server_names = protocol_config.get("server_names", []) if reality_enabled else []
@@ -2579,18 +3061,10 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         "",
         "client:",
         f"  pool_size: {yaml_scalar(pool_size)}",
-        "  server:",
-        f"    type: {yaml_scalar(protocol_config['type'])}",
-        f"    address: {yaml_scalar(address)}",
-        f"    url: {yaml_scalar(url)}",
-        f"    path: {yaml_scalar(path)}",
-        "    tls:",
-        '      cert_file: ""',
-        '      key_file: ""',
-        '      ca_file: ""',
-        f"      server_name: {yaml_scalar(tls_server_name)}",
-        f"      insecure_skip_verify: {yaml_scalar(tls_insecure_skip_verify)}",
+        f"  connection_strategy: {yaml_scalar(connection_strategy)}",
     ]
+    lines.extend(render_named_transport_endpoint_lines("  ", "server", primary_endpoint))
+    lines.extend(render_transport_endpoints_list_lines("  ", "servers", all_servers))
     if str(protocol_config.get("tunnel_mode", "reverse")).strip().lower() == "direct":
         mappings = protocol_config.get("mappings", [])
         if mappings:
@@ -2704,18 +3178,56 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
     return "\n".join(lines) + "\n"
 
 
-def generate_config(protocol_config, tuning, obfuscation_cfg, config_filename):
+def strip_top_level_sections(config_text, section_names):
+    if not section_names:
+        return config_text
+
+    lines = config_text.splitlines()
+    out = []
+    skip_section = None
+
+    for line in lines:
+        stripped = line.strip()
+        is_top_level = bool(stripped) and not line.startswith((" ", "\t")) and ":" in stripped
+        if is_top_level:
+            key = stripped.split(":", 1)[0].strip()
+            if skip_section and key not in section_names:
+                skip_section = None
+            if key in section_names:
+                skip_section = key
+                continue
+        if skip_section:
+            continue
+        out.append(line)
+
+    compact = []
+    prev_blank = False
+    for line in out:
+        blank = line.strip() == ""
+        if blank and prev_blank:
+            continue
+        compact.append(line)
+        prev_blank = blank
+
+    return "\n".join(compact).rstrip() + "\n"
+
+
+def generate_config(protocol_config, tuning, obfuscation_cfg, config_filename, explicit_tuning=False):
     config_path = os.path.join(CONFIG_DIR, config_filename)
     final_content = build_server_config_text(protocol_config, tuning, obfuscation_cfg)
+    if not explicit_tuning:
+        final_content = strip_top_level_sections(final_content, set(TUNING_SECTIONS))
     with open(config_path, "w") as f:
         f.write(final_content)
     print_success(f"💾 Configuration generated at {config_path}")
     return config_path
 
 
-def generate_client_config(protocol_config, tuning, obfuscation_cfg, config_filename):
+def generate_client_config(protocol_config, tuning, obfuscation_cfg, config_filename, explicit_tuning=False):
     config_path = os.path.join(CONFIG_DIR, config_filename)
     final_content = build_client_config_text(protocol_config, tuning, obfuscation_cfg)
+    if not explicit_tuning:
+        final_content = strip_top_level_sections(final_content, set(TUNING_SECTIONS))
     with open(config_path, "w") as f:
         f.write(final_content)
     print_success(f"💾 Client Configuration generated at {config_path}")
@@ -2911,7 +3423,7 @@ def remove_service_instance(service_name):
 def configure_tuning_from_existing(tuning):
     updated = deep_copy(tuning)
     print_header("⚙️ Edit Tuning")
-    for section in ["smux", "tcp", "udp", "kcp", "quic", "reconnect"]:
+    for section in TUNING_SECTIONS:
         edit = input_default(f"Edit {section} settings? (y/N)", "n").strip().lower()
         if edit not in {"y", "yes"}:
             continue
@@ -2935,6 +3447,7 @@ def edit_service_instance(service_name):
 
     protocol_cfg = loaded["protocol_config"]
     tuning = loaded["tuning"]
+    explicit_tuning = bool(loaded.get("explicit_tuning", False))
     obfuscation_cfg = loaded["obfuscation_cfg"]
     config_path = loaded["config_path"]
 
@@ -2954,10 +3467,15 @@ def edit_service_instance(service_name):
         ]
         if role == "server":
             menu_lines.append(f"Mappings:    {len(protocol_cfg.get('mappings', []))}")
+            menu_lines.append(f"Extra EPs:   {len(protocol_cfg.get('additional_endpoints', []))}")
         else:
             menu_lines.append(
                 f"Server:      {protocol_cfg.get('server_addr')}:{protocol_cfg.get('port')}"
             )
+            menu_lines.append(
+                f"Strategy:    {protocol_cfg.get('connection_strategy', 'parallel')}"
+            )
+            menu_lines.append(f"Extra EPs:   {len(protocol_cfg.get('additional_endpoints', []))}")
             if client_direct_mode:
                 menu_lines.append(f"Mappings:    {len(protocol_cfg.get('mappings', []))}")
         menu_lines.append("")
@@ -2999,11 +3517,11 @@ def edit_service_instance(service_name):
 
         if choice == "1":
             if role == "client":
-                current_port = protocol_cfg.get("port", 443)
+                current_port = protocol_cfg.get("port", DEFAULT_KHAREJ_PORT)
                 try:
                     current_port = int(current_port)
                 except (TypeError, ValueError):
-                    current_port = 443
+                    current_port = DEFAULT_KHAREJ_PORT
                 destination_host, destination_port = prompt_client_destination(
                     protocol_cfg.get("server_addr", "127.0.0.1"),
                     current_port,
@@ -3014,6 +3532,7 @@ def edit_service_instance(service_name):
                 role,
                 server_addr=protocol_cfg.get("server_addr", ""),
                 defaults=protocol_cfg,
+                prompt_port=(role != "client"),
             )
             protocol_cfg["tunnel_mode"] = loaded["protocol_config"].get("tunnel_mode", "reverse")
             if role == "server" and "mappings" in loaded["protocol_config"]:
@@ -3046,14 +3565,27 @@ def edit_service_instance(service_name):
             )
         elif (choice == "5" and role == "server") or (choice == "5" and client_direct_mode) or (choice == "4" and role == "client" and not client_direct_mode):
             tuning = configure_tuning_from_existing(tuning)
+            explicit_tuning = True
         elif (choice == "6" and role == "server") or (choice == "6" and client_direct_mode) or (choice == "5" and role == "client" and not client_direct_mode):
             protocol_cfg["license"] = prompt_license_id()
         elif (choice == "7" and role == "server") or (choice == "7" and client_direct_mode) or (choice == "6" and role == "client" and not client_direct_mode):
             config_file = build_config_filename(role, instance)
             if role == "server":
-                generate_config(protocol_cfg, tuning, obfuscation_cfg, config_file)
+                generate_config(
+                    protocol_cfg,
+                    tuning,
+                    obfuscation_cfg,
+                    config_file,
+                    explicit_tuning=explicit_tuning,
+                )
             else:
-                generate_client_config(protocol_cfg, tuning, obfuscation_cfg, config_file)
+                generate_client_config(
+                    protocol_cfg,
+                    tuning,
+                    obfuscation_cfg,
+                    config_file,
+                    explicit_tuning=explicit_tuning,
+                )
             run_command("systemctl daemon-reload", check=False)
             unit = f"{service_name}.service"
             if run_command(f"systemctl restart {shlex.quote(unit)}", check=False):
@@ -3191,7 +3723,7 @@ def install_server_flow(
         min_width=52,
     )
     instance = prompt_instance_name("server")
-    cfg = menu_protocol("server")
+    cfg = menu_protocol("server", defaults={"port": DEFAULT_IRAN_PORT})
     cfg["tunnel_mode"] = tunnel_mode
     cfg["license"] = prompt_license_id()
     cfg["profile"] = select_config_profile()
@@ -3207,7 +3739,13 @@ def install_server_flow(
     else:
         cfg["mappings"] = []
     config_file = build_config_filename("server", instance)
-    config_path = generate_config(cfg, tuning, obfuscation_cfg, config_file)
+    config_path = generate_config(
+        cfg,
+        tuning,
+        obfuscation_cfg,
+        config_file,
+        explicit_tuning=(deployment_mode == "advanced"),
+    )
     create_service("server", instance)
     maybe_apply_linux_network_tuning()
 
@@ -3220,6 +3758,7 @@ def install_server_flow(
     psk_text = cfg["psk"] if cfg["psk"] else "(disabled)"
     print(f"PSK:      {Colors.BOLD}{psk_text}{Colors.ENDC}")
     print(f"Protocol: {Colors.BOLD}{cfg['type']}{Colors.ENDC}")
+    print(f"Extra Listens: {Colors.BOLD}{len(cfg.get('additional_endpoints', []))}{Colors.ENDC}")
     print(f"Path MTU: {Colors.BOLD}{cfg.get('network_mtu', 0)}{Colors.ENDC}")
     print(f"Profile:  {Colors.BOLD}{cfg['profile']}{Colors.ENDC}")
     print(f"Deploy:   {Colors.BOLD}{deployment_mode}{Colors.ENDC}")
@@ -3250,11 +3789,12 @@ def install_client_flow(
         min_width=52,
     )
     instance = prompt_instance_name("client")
-    server_addr, server_port = prompt_client_destination("1.2.3.4", 9999)
+    server_addr, server_port = prompt_client_destination("1.2.3.4", DEFAULT_KHAREJ_PORT)
     cfg = menu_protocol(
         "client",
         server_addr=server_addr,
         defaults={"server_addr": server_addr, "port": server_port},
+        prompt_port=False,
     )
     cfg["tunnel_mode"] = tunnel_mode
     cfg["license"] = ""
@@ -3272,7 +3812,13 @@ def install_client_flow(
     else:
         cfg["mappings"] = []
     config_file = build_config_filename("client", instance)
-    config_path = generate_client_config(cfg, tuning, obfuscation_cfg, config_file)
+    config_path = generate_client_config(
+        cfg,
+        tuning,
+        obfuscation_cfg,
+        config_file,
+        explicit_tuning=(deployment_mode == "advanced"),
+    )
     create_service("client", instance)
     maybe_apply_linux_network_tuning()
 
@@ -3284,6 +3830,8 @@ def install_client_flow(
     print(f"Run command: {Colors.BOLD}nodelay client -c {config_path}{Colors.ENDC}")
     print(f"Profile:    {Colors.BOLD}{cfg['profile']}{Colors.ENDC}")
     print(f"Pool Size:  {Colors.BOLD}{cfg.get('pool_size', 3)}{Colors.ENDC}")
+    print(f"Strategy:   {Colors.BOLD}{cfg.get('connection_strategy', 'parallel')}{Colors.ENDC}")
+    print(f"Extra Upstreams: {Colors.BOLD}{len(cfg.get('additional_endpoints', []))}{Colors.ENDC}")
     print(f"Path MTU:   {Colors.BOLD}{cfg.get('network_mtu', 0)}{Colors.ENDC}")
     print(f"Deploy:     {Colors.BOLD}{deployment_mode}{Colors.ENDC}")
     if cfg["type"] == "reality":
