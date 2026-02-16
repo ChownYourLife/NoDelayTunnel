@@ -4,6 +4,11 @@
 
 **High-performance reverse/direct tunneling with multi-transport routing, profile-based tuning, and DPI-evasion options.**
 
+**لطفا در نظر داشته باشید برای استفاده از این تانل نیاز به خرید لایسنس از ربات تلگرام نودیلی دارید**
+
+**[![Telegram](https://img.shields.io/badge/telegram-NoDelayTunnel-blue?logo=telegram)](https://t.me/NoDelayTunnel)**
+
+
 [English Overview](#-english-overview) • [Deploy](#-deploy) • [Config Samples](#-config-samples) • [Benchmarks](#-benchmarks) • [راهنمای فارسی](#-راهنمای-فارسی)
 
 </div>
