@@ -76,6 +76,15 @@ NoDelay can be used as a lightweight forwarding core in front of services such a
 - In `reverse` mode with multiple listens/clients, mappings are served by a shared
   session pool (round-robin over active sessions), not pinned to a specific listen/client.
 
+### Multi-Tunnel Load Spreading (Important)
+
+You can run multiple tunnels simultaneously between the same two servers and distribute traffic across different transports.
+
+- Define multiple endpoints in `server.listens` and `client.servers` (for example `reality` + `httpsmimicry` + `tcp`).
+- Set `client.connection_strategy: parallel` to actively spread sessions/workers across available endpoints.
+- Use `priority` only if you want strict ordered failover instead of active spreading.
+- This is a core capability of NoDelay and one of the main ways to improve resilience under route instability or transport-specific throttling.
+
 ### 4. Security stack
 
 - Token-based authentication (optional).
@@ -982,6 +991,15 @@ systemctl status nodelay-client
 - در حالت `reverse` و با چند listen/کلاینت، mappingها از یک session pool مشترک سرویس
   می‌گیرند (round-robin بین sessionهای فعال) و به listen/کلاینت خاص pin نمی‌شوند.
 
+### 🔥 پخش بار بین چند تانل 🔥
+
+می‌توانید بین همین دو سرور، چند تانل همزمان بالا بیاورید و ترافیک را بین ترنسپورت‌های مختلف پخش کنید.
+
+- چند endpoint در `server.listens` و `client.servers` تعریف کنید (مثلا `reality` + `httpsmimicry` + `tcp`).
+- برای پخش فعال سشن/ورکرها بین endpointها، روی کلاینت `client.connection_strategy: parallel` بگذارید.
+- اگر failover ترتیبی می‌خواهید (و نه پخش همزمان)، از `priority` استفاده کنید.
+- این قابلیت جزو هسته اصلی NoDelay است و برای پایداری بهتر در مسیرهای ناپایدار یا throttling روی یک ترنسپورت خاص، بسیار کلیدی است.
+
 ### 4) لایه امنیت
 
 - احراز هویت مبتنی بر Token (اختیاری)
@@ -1030,8 +1048,8 @@ sudo python3 deploy.py
 
 - داخل `deploy.py` از گزینه `🌐 Direct Connectivity Test (iperf3)` استفاده کنید (یا در مسیر نصب کلاینت، پرامپت Benchmark را تایید کنید).
 - تست را در هر دو جهت بگیرید (آپلود/دانلود) و بعد تصمیم بگیرید:
-  - `>=150-200 Mbps`: کیفیت لینک برای تونل مناسب است.
-  - `<100 Mbps`: جای ایران/خارج را عوض کنید و دوباره تست بگیرید.
+  - اگر آپلود و دانلود بیشتر از `150-200` مگابیت بودند: کیفیت لینک برای تونل مناسب است.
+  - اگر کمتر از `100` مگابیت بودند: جای ایران/خارج را عوض کنید و دوباره تست بگیرید.
 - اگر لینک مستقیم ضعیف باشد، صرفا با tuning تونل معمولا مشکل throughput کامل حل نمی‌شود.
 
 ### `deploy.py` چه کار می‌کند؟
