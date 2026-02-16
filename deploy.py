@@ -52,6 +52,13 @@ ROLE_LABELS = {
 DEFAULT_IRAN_PORT = 9999
 DEFAULT_KHAREJ_PORT = 9999
 TUNING_SECTIONS = ["smux", "tcp", "udp", "kcp", "quic", "reconnect"]
+IPERF_TEST_DEFAULT_PORT = 9777
+IPERF_TEST_DEFAULT_DURATION = 8
+IPERF_TEST_DEFAULT_STREAMS = 8
+IPERF_GOOD_MBPS = 150.0
+IPERF_EXCELLENT_MBPS = 200.0
+IPERF_POOR_MBPS = 100.0
+MSS_CLAMP_DEFAULT = 1300
 
 # DER prefixes for extracting raw x25519 keys (last 32 bytes are key material)
 X25519_PRIVATE_DER_PREFIX = bytes.fromhex("302e020100300506032b656e04220420")
@@ -380,6 +387,61 @@ def set_sysctl_conf_managed_block(setting_lines):
         return False
 
 
+def apply_mss_clamp_rules(mss=MSS_CLAMP_DEFAULT):
+    try:
+        mss = int(mss)
+    except (TypeError, ValueError):
+        mss = MSS_CLAMP_DEFAULT
+    if mss < 1200:
+        mss = 1200
+    if mss > 1460:
+        mss = 1460
+
+    tools = [tool for tool in ("iptables", "ip6tables") if shutil.which(tool)]
+    if not tools:
+        print_info("Skipping MSS clamp: iptables/ip6tables not found.")
+        return False
+
+    rule = f"-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss}"
+    any_ok = False
+    for tool in tools:
+        for chain in ("OUTPUT", "FORWARD"):
+            exists = run_command(f"{tool} -t mangle -C {chain} {rule}", check=False)
+            if exists:
+                any_ok = True
+                continue
+            added = run_command(f"{tool} -t mangle -A {chain} {rule}", check=False)
+            any_ok = any_ok or added
+    if any_ok:
+        print_success(f"Applied MSS clamp rule (TCP SYN MSS={mss}).")
+    else:
+        print_info("MSS clamp rules were not applied (check firewall backend/permissions).")
+    return any_ok
+
+
+def remove_mss_clamp_rules(mss=MSS_CLAMP_DEFAULT):
+    try:
+        mss = int(mss)
+    except (TypeError, ValueError):
+        mss = MSS_CLAMP_DEFAULT
+    if mss < 1200:
+        mss = 1200
+    if mss > 1460:
+        mss = 1460
+
+    tools = [tool for tool in ("iptables", "ip6tables") if shutil.which(tool)]
+    if not tools:
+        return False
+
+    rule = f"-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss}"
+    removed_any = False
+    for tool in tools:
+        for chain in ("OUTPUT", "FORWARD"):
+            while run_command(f"{tool} -t mangle -D {chain} {rule}", check=False):
+                removed_any = True
+    return removed_any
+
+
 def apply_linux_network_tuning(profile_key="balanced"):
     if not sys.platform.startswith("linux"):
         print_info("Skipping network tuning: only supported on Linux.")
@@ -404,6 +466,7 @@ def apply_linux_network_tuning(profile_key="balanced"):
                 ("net.core.somaxconn", "4096"),
                 ("net.ipv4.tcp_fastopen", "1"),
                 ("net.ipv4.tcp_mtu_probing", "1"),
+                ("net.ipv4.tcp_base_mss", "1024"),
                 ("net.ipv4.tcp_keepalive_time", "120"),
                 ("net.ipv4.tcp_keepalive_intvl", "10"),
                 ("net.ipv4.tcp_keepalive_probes", "3"),
@@ -430,6 +493,7 @@ def apply_linux_network_tuning(profile_key="balanced"):
                 # Keep fastopen conservative to avoid middlebox/path quirks.
                 ("net.ipv4.tcp_fastopen", "1"),
                 ("net.ipv4.tcp_mtu_probing", "1"),
+                ("net.ipv4.tcp_base_mss", "1024"),
                 ("net.ipv4.tcp_keepalive_time", "120"),
                 ("net.ipv4.tcp_keepalive_intvl", "10"),
                 ("net.ipv4.tcp_keepalive_probes", "3"),
@@ -469,6 +533,7 @@ def apply_linux_network_tuning(profile_key="balanced"):
         f"tc qdisc replace dev {shlex.quote(iface)} root {shlex.quote(selected['qdisc'])}",
         check=False,
     )
+    mss_ok = apply_mss_clamp_rules(MSS_CLAMP_DEFAULT)
 
     managed_lines = [f"{k}={v}" for k, v in sysctl_settings]
     managed_lines.append(f"net.ipv4.tcp_congestion_control={selected['congestion_control']}")
@@ -503,6 +568,8 @@ def apply_linux_network_tuning(profile_key="balanced"):
         print_info(
             f"{selected['qdisc']} could not be fully applied; verify `tc` and interface state."
         )
+    if not mss_ok:
+        print_info("MSS clamp is not active; fragmented tunnel paths may reduce upload throughput.")
     return True
 
 
@@ -533,6 +600,7 @@ def restore_linux_network_defaults():
     _, iface, _ = run_command_output("ip -o link show up | awk -F': ' '$2 != \"lo\" {print $2; exit}'")
     iface = iface.strip() or "eth0"
     run_command(f"tc qdisc del dev {shlex.quote(iface)} root", check=False)
+    _ = remove_mss_clamp_rules(MSS_CLAMP_DEFAULT)
     print_success("Restored Linux network defaults (best effort).")
     return True
 
@@ -562,6 +630,227 @@ def maybe_apply_linux_network_tuning():
         if choice == "3":
             restore_linux_network_defaults()
             return
+        print_error("Invalid choice.")
+
+
+def ensure_iperf3_installed():
+    if shutil.which("iperf3"):
+        return True
+
+    print_info("iperf3 is not installed. Attempting automatic installation...")
+    installers = []
+    if shutil.which("apt-get"):
+        installers = [
+            "apt-get update",
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3",
+        ]
+    elif shutil.which("dnf"):
+        installers = ["dnf install -y iperf3"]
+    elif shutil.which("yum"):
+        installers = ["yum install -y iperf3"]
+    elif shutil.which("apk"):
+        installers = ["apk add --no-cache iperf3"]
+    elif shutil.which("pacman"):
+        installers = ["pacman -Sy --noconfirm iperf3"]
+    elif shutil.which("zypper"):
+        installers = ["zypper --non-interactive install iperf3"]
+
+    if not installers:
+        print_error("Could not detect package manager. Please install iperf3 manually.")
+        return False
+
+    for cmd in installers:
+        if not run_command_stream(cmd):
+            print_error(f"Installation command failed: {cmd}")
+            return False
+    if not shutil.which("iperf3"):
+        print_error("iperf3 installation finished but binary was not found in PATH.")
+        return False
+    print_success("iperf3 installed successfully.")
+    return True
+
+
+def run_iperf3_json(command_args):
+    try:
+        result = subprocess.run(command_args, check=False, text=True, capture_output=True)
+    except Exception as exc:
+        return None, f"failed to run iperf3: {exc}"
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0:
+        return None, stderr or stdout or "iperf3 exited with non-zero status"
+
+    try:
+        payload = json.loads(stdout)
+    except Exception:
+        snippet = stdout[:220] + ("..." if len(stdout) > 220 else "")
+        return None, f"failed to parse iperf3 json output: {snippet}"
+
+    if isinstance(payload, dict) and payload.get("error"):
+        return None, str(payload.get("error"))
+    return payload, ""
+
+
+def extract_iperf_summary(payload):
+    end = payload.get("end", {}) if isinstance(payload, dict) else {}
+    sent_bps = float(end.get("sum_sent", {}).get("bits_per_second", 0.0) or 0.0)
+    recv_bps = float(end.get("sum_received", {}).get("bits_per_second", 0.0) or 0.0)
+    retr = int(end.get("sum_sent", {}).get("retransmits", 0) or 0)
+    effective_bps = recv_bps if recv_bps > 0 else sent_bps
+    return {
+        "sent_mbps": sent_bps / 1_000_000.0,
+        "recv_mbps": recv_bps / 1_000_000.0,
+        "effective_mbps": effective_bps / 1_000_000.0,
+        "retransmits": retr,
+    }
+
+
+def evaluate_connectivity_quality(uplink_mbps, downlink_mbps):
+    floor = min(uplink_mbps, downlink_mbps)
+    if floor >= IPERF_EXCELLENT_MBPS:
+        return (
+            "excellent",
+            "Direct connectivity quality is excellent. Servers can be tunneled.",
+        )
+    if floor >= IPERF_GOOD_MBPS:
+        return (
+            "good",
+            "Direct connectivity quality is good. Servers can be tunneled.",
+        )
+    if floor < IPERF_POOR_MBPS:
+        return (
+            "poor",
+            "Direct connectivity is weak (<100 Mbps). Swap Iran/Kharej servers and test again.",
+        )
+    return (
+        "moderate",
+        "Direct connectivity is moderate. Tunnel can work, but quality may vary by route and load.",
+    )
+
+
+def run_direct_connectivity_benchmark(target_host, port, duration, streams):
+    if not ensure_iperf3_installed():
+        return None
+
+    print_header("🌐 Direct Connectivity Benchmark (iperf3)")
+    print_info(
+        f"Target={target_host}:{port} | Duration={duration}s | Streams={streams} | Mode=direct (no tunnel)"
+    )
+
+    base_cmd = [
+        "iperf3",
+        "-c",
+        target_host,
+        "-p",
+        str(port),
+        "-t",
+        str(duration),
+        "-P",
+        str(streams),
+        "-J",
+    ]
+
+    print_info("Running downlink test (remote -> local)...")
+    down_payload, down_err = run_iperf3_json(base_cmd + ["-R"])
+    if down_payload is None:
+        print_error(f"Downlink test failed: {down_err}")
+        print_info(
+            "Ensure remote iperf3 server is running: `iperf3 -s -p "
+            f"{port}`"
+        )
+        return None
+
+    print_info("Running uplink test (local -> remote)...")
+    up_payload, up_err = run_iperf3_json(base_cmd)
+    if up_payload is None:
+        print_error(f"Uplink test failed: {up_err}")
+        print_info(
+            "Ensure remote iperf3 server is running: `iperf3 -s -p "
+            f"{port}`"
+        )
+        return None
+
+    down = extract_iperf_summary(down_payload)
+    up = extract_iperf_summary(up_payload)
+    down_mbps = down["effective_mbps"]
+    up_mbps = up["effective_mbps"]
+
+    quality, verdict = evaluate_connectivity_quality(up_mbps, down_mbps)
+    quality_label = {
+        "excellent": f"{Colors.GREEN}excellent{Colors.ENDC}",
+        "good": f"{Colors.GREEN}good{Colors.ENDC}",
+        "moderate": f"{Colors.WARNING}moderate{Colors.ENDC}",
+        "poor": f"{Colors.FAIL}poor{Colors.ENDC}",
+    }.get(quality, quality)
+
+    print_header("📈 Direct Connectivity Result")
+    print(f"Downlink (remote -> local): {Colors.BOLD}{down_mbps:.2f} Mbps{Colors.ENDC}")
+    print(f"Uplink   (local -> remote): {Colors.BOLD}{up_mbps:.2f} Mbps{Colors.ENDC}")
+    print(
+        f"Retransmits (uplink/downlink sender): "
+        f"{Colors.BOLD}{up['retransmits']}/{down['retransmits']}{Colors.ENDC}"
+    )
+    print(f"Quality: {quality_label}")
+    print_info(verdict)
+    return {
+        "downlink_mbps": down_mbps,
+        "uplink_mbps": up_mbps,
+        "quality": quality,
+    }
+
+
+def direct_connectivity_test_menu(default_host=""):
+    while True:
+        print_menu(
+            "🌐 Direct Connectivity Test (iperf3)",
+            [
+                "1. Start iperf3 server mode on this node",
+                "2. Run client benchmark to remote node",
+                "0. Back",
+            ],
+            color=Colors.CYAN,
+            min_width=56,
+        )
+        choice = input("Select option: ").strip()
+        if choice == "0":
+            return
+        if choice == "1":
+            if not ensure_iperf3_installed():
+                input("\nPress Enter to continue...")
+                continue
+            port = prompt_int("Listen Port", IPERF_TEST_DEFAULT_PORT)
+            while port < 1 or port > 65535:
+                print_error("Port must be between 1 and 65535.")
+                port = prompt_int("Listen Port", IPERF_TEST_DEFAULT_PORT)
+            print_info(
+                f"Starting iperf3 server on :{port} (Ctrl+C to stop)..."
+            )
+            try:
+                run_command_stream(f"iperf3 -s -p {int(port)}")
+            except KeyboardInterrupt:
+                pass
+            input("\nPress Enter to continue...")
+            continue
+        if choice == "2":
+            host_seed = default_host or "1.2.3.4"
+            target_host = input_default("Remote server host/IP", host_seed).strip()
+            while not target_host:
+                print_error("Remote host is required.")
+                target_host = input_default("Remote server host/IP", host_seed).strip()
+            port = prompt_int("Remote iperf3 port", IPERF_TEST_DEFAULT_PORT)
+            while port < 1 or port > 65535:
+                print_error("Port must be between 1 and 65535.")
+                port = prompt_int("Remote iperf3 port", IPERF_TEST_DEFAULT_PORT)
+            duration = prompt_int("Test duration (seconds)", IPERF_TEST_DEFAULT_DURATION)
+            if duration < 3:
+                duration = 3
+            streams = prompt_int("Parallel streams", IPERF_TEST_DEFAULT_STREAMS)
+            if streams < 1:
+                streams = 1
+            run_direct_connectivity_benchmark(target_host, int(port), int(duration), int(streams))
+            input("\nPress Enter to continue...")
+            continue
         print_error("Invalid choice.")
 
 
@@ -1069,10 +1358,12 @@ def derive_reality_public_key(private_key_hex):
         return ""
 
 
-def prompt_short_id(default_value=""):
+def prompt_short_id(default_value="", role="server"):
     seed = str(default_value or random_hex(16)).strip().lower()
+    role_name = str(role or "").strip().lower()
+    prompt_label = "Server Short ID (hex, min 16 chars)" if role_name == "client" else "Short ID (hex, min 16 chars)"
     while True:
-        short_id = input_default("Short ID (hex, min 16 chars)", seed).lower()
+        short_id = input_default(prompt_label, seed).lower()
         if is_valid_short_id(short_id):
             return short_id
         print_error("Invalid Short ID. Use even-length hex with at least 16 characters.")
@@ -1634,7 +1925,10 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
             reality_cfg["server_names"] = prompt_server_names(
                 default_values=default_reality_cfg.get("server_names", [])
             )
-            reality_cfg["short_id"] = prompt_short_id(default_reality_cfg.get("short_id", ""))
+            reality_cfg["short_id"] = prompt_short_id(
+                default_reality_cfg.get("short_id", ""),
+                role=role,
+            )
             reality_cfg["dest"] = input_default(
                 "Dest (real target site:port)",
                 default_reality_cfg.get("dest", "www.microsoft.com:443") or "www.microsoft.com:443",
@@ -1731,28 +2025,41 @@ def normalize_mimicry_transport_mode(value, default="websocket"):
         return "websocket"
     if raw in {"http2", "h2"}:
         return "http2"
+    if raw in {"http3", "h3"}:
+        return "http3"
     return default
 
 
-def prompt_mimicry_transport_mode(default="websocket"):
+def prompt_mimicry_transport_mode(default="websocket", allow_http3=False):
     normalized_default = normalize_mimicry_transport_mode(default, "websocket")
-    default_choice = "2" if normalized_default == "http2" else "1"
+    if allow_http3 and normalized_default == "http3":
+        default_choice = "3"
+    elif normalized_default == "http2":
+        default_choice = "2"
+    else:
+        default_choice = "1"
+    menu_lines = [
+        f"{Colors.GREEN}[1]{Colors.ENDC} WebSocket ({Colors.BOLD}ws/wss{Colors.ENDC})",
+        f"{Colors.GREEN}[2]{Colors.ENDC} HTTP/2 stream tunnel",
+    ]
+    if allow_http3:
+        menu_lines.append(f"{Colors.GREEN}[3]{Colors.ENDC} HTTP/3 (QUIC) stream tunnel")
+    max_choice = 3 if allow_http3 else 2
     print_menu(
         "🎛️ Mimicry Transport Mode",
-        [
-            f"{Colors.GREEN}[1]{Colors.ENDC} WebSocket ({Colors.BOLD}ws/wss{Colors.ENDC})",
-            f"{Colors.GREEN}[2]{Colors.ENDC} HTTP/2 stream tunnel",
-        ],
+        menu_lines,
         color=Colors.CYAN,
         min_width=44,
     )
     while True:
-        choice = input_default("Mode [1-2]", default_choice).strip()
+        choice = input_default(f"Mode [1-{max_choice}]", default_choice).strip()
         if choice == "1":
             return "websocket"
         if choice == "2":
             return "http2"
-        print_error("Invalid choice. Pick 1 or 2.")
+        if allow_http3 and choice == "3":
+            return "http3"
+        print_error(f"Invalid choice. Pick 1..{max_choice}.")
 
 
 def prompt_client_destination(default_host="1.2.3.4", default_port=DEFAULT_KHAREJ_PORT):
@@ -1943,7 +2250,8 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
         )
         config["mimicry_preset_region"] = "mixed"
         config["mimicry_transport_mode"] = prompt_mimicry_transport_mode(
-            config.get("mimicry_transport_mode", "websocket")
+            config.get("mimicry_transport_mode", "websocket"),
+            allow_http3=True,
         )
         if role == "server":
             keep_current = input_default("Keep current certificate files? (Y/n)", "y").strip().lower()
@@ -1966,7 +2274,8 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
         )
         config["mimicry_preset_region"] = "mixed"
         config["mimicry_transport_mode"] = prompt_mimicry_transport_mode(
-            config.get("mimicry_transport_mode", "websocket")
+            config.get("mimicry_transport_mode", "websocket"),
+            allow_http3=False,
         )
         config["sni"] = ""
         config["insecure_skip_verify"] = False
@@ -1975,7 +2284,7 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
         config["type"] = "reality"
         config["port"] = prompt_or_keep_port(443)
         config["server_names"] = prompt_server_names(config.get("server_names", []))
-        config["short_id"] = prompt_short_id(config.get("short_id", ""))
+        config["short_id"] = prompt_short_id(config.get("short_id", ""), role=role)
         config["dest"] = input_default(
             "Dest (real target site:port)",
             config.get("dest", "www.microsoft.com:443") or "www.microsoft.com:443",
@@ -2661,9 +2970,9 @@ def base_tuning(role):
         "keepalive_every": "5s",
         "keepalive_timeout": "15s",
         "max_frame_size": 32768,
-        # Symmetric larger buffers to avoid one-way throughput collapse on higher RTT links.
-        "max_receive_buffer": 16777216,
-        "max_stream_buffer": 16777216,
+        # Keep buffers moderate so backpressure kicks in before long one-way stalls.
+        "max_receive_buffer": 4 * 1024 * 1024,
+        "max_stream_buffer": 1024 * 1024,
     }
     return {
         "smux": smux_values,
@@ -2673,7 +2982,9 @@ def base_tuning(role):
             "read_buffer": 8388608,
             "write_buffer": 8388608,
             "conn_limit": 5000,
-            "copy_buffer": 65536,
+            "copy_buffer": 262144,
+            "target_dial_pool": 2,
+            "max_seg": 1300,
             "auto_tune": True,
         },
         "udp": {
@@ -3242,6 +3553,8 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
             f"  write_buffer: {yaml_scalar(tuning['tcp']['write_buffer'])}",
             f"  conn_limit: {yaml_scalar(tuning['tcp']['conn_limit'])}",
             f"  copy_buffer: {yaml_scalar(tuning['tcp']['copy_buffer'])}",
+            f"  target_dial_pool: {yaml_scalar(tuning['tcp']['target_dial_pool'])}",
+            f"  max_seg: {yaml_scalar(tuning['tcp']['max_seg'])}",
             f"  auto_tune: {yaml_scalar(tuning['tcp']['auto_tune'])}",
             "",
             "udp:",
@@ -3413,6 +3726,8 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         f"  write_buffer: {yaml_scalar(tuning['tcp']['write_buffer'])}",
         f"  conn_limit: {yaml_scalar(tuning['tcp']['conn_limit'])}",
         f"  copy_buffer: {yaml_scalar(tuning['tcp']['copy_buffer'])}",
+        f"  target_dial_pool: {yaml_scalar(tuning['tcp']['target_dial_pool'])}",
+        f"  max_seg: {yaml_scalar(tuning['tcp']['max_seg'])}",
         f"  auto_tune: {yaml_scalar(tuning['tcp']['auto_tune'])}",
         "",
         "udp:",
@@ -4112,6 +4427,16 @@ def install_client_flow(
     )
     instance = prompt_instance_name("client")
     server_addr, server_port = prompt_client_destination("1.2.3.4", DEFAULT_KHAREJ_PORT)
+    run_direct_test = input_default(
+        "Run direct connectivity benchmark before tunnel setup? (Y/n)",
+        "y",
+    ).strip().lower()
+    if run_direct_test in {"y", "yes"}:
+        print_info(
+            "Tip: Run this on remote server first to listen for test traffic: "
+            f"`iperf3 -s -p {IPERF_TEST_DEFAULT_PORT}`"
+        )
+        direct_connectivity_test_menu(default_host=server_addr)
     cfg = menu_protocol(
         "client",
         server_addr=server_addr,
@@ -4267,6 +4592,7 @@ def main_menu():
                 f"{Colors.CYAN}[5]{Colors.ENDC} 📊 Monitor / Logs / Service Control",
                 f"{Colors.CYAN}[6]{Colors.ENDC} 🧩 Multi Tunnel Management",
                 f"{Colors.CYAN}[7]{Colors.ENDC} ⚙️ Linux Optimization",
+                f"{Colors.CYAN}[8]{Colors.ENDC} 🌐 Direct Connectivity Test (iperf3)",
                 f"{Colors.WARNING}[0]{Colors.ENDC} 🚪 Exit",
             ],
             color=Colors.CYAN,
@@ -4310,6 +4636,10 @@ def main_menu():
             check_root()
             maybe_apply_linux_network_tuning()
             input("\nPress Enter to continue...")
+
+        elif choice == "8":
+            check_root()
+            direct_connectivity_test_menu()
 
         elif choice == "0":
             sys.exit(0)
