@@ -8,7 +8,6 @@
 
 **[![Telegram](https://img.shields.io/badge/telegram-NoDelayTunnel-blue?logo=telegram)](https://t.me/NoDelayTunnel)**
 
-
 [English Overview](#-english-overview) • [Deploy](#-deploy) • [Config Samples](#-config-samples) • [Benchmarks](#-benchmarks) • [راهنمای فارسی](#-راهنمای-فارسی)
 
 </div>
@@ -65,9 +64,17 @@ NoDelay can be used as a lightweight forwarding core in front of services such a
 - SMUX-based stream multiplexing over each session.
 - Connection pool support for parallel paths and better service continuity.
 - Multi-endpoint support on both sides: `server.listens` and `client.servers`.
+- Supports both deployment patterns:
+  multiple clients to one server (`multi-client`) and one client to multiple servers (`multi-server`).
+- You can run multiple transport types in one config by mixing endpoint entries
+  (for example `tcp` + `ws` + `reality`) under `server.listens` / `client.servers`.
+- There is no hard-coded endpoint count limit in core; practical limits come from
+  OS resources (ports, file descriptors, CPU/RAM, bandwidth).
 - Client-side endpoint selection strategy via `client.connection_strategy`:
   `parallel` (spread workers across endpoints) or `priority` (ordered failover).
 - Health checks and reconnect backoff with jitter.
+- In `reverse` mode with multiple listens/clients, mappings are served by a shared
+  session pool (round-robin over active sessions), not pinned to a specific listen/client.
 
 ### 4. Security stack
 
@@ -177,6 +184,105 @@ Notes:
 
 - If `listens`/`servers` are omitted, runtime falls back to a single default endpoint for each side.
 - `parallel` spreads workers across endpoints; `priority` prefers the first endpoint and falls back in order.
+
+### Sample 0.1: Multi-client (many foreign clients -> one Iran server)
+
+Iran server:
+
+```yaml
+mode: server
+profile: balanced
+
+server:
+  listens:
+    - type: tcp
+      address: ":9999"
+      path: /tunnel
+  mappings:
+    - name: web-443
+      mode: reverse
+      protocol: tcp
+      bind: 0.0.0.0:443
+      target: 127.0.0.1:443
+```
+
+Foreign client #1:
+
+```yaml
+mode: client
+profile: balanced
+
+client:
+  pool_size: 3
+  connection_strategy: priority
+  servers:
+    - type: tcp
+      address: ir-server.example.com:9999
+      path: /tunnel
+```
+
+Foreign client #2 (same Iran server, separate instance):
+
+```yaml
+mode: client
+profile: performance
+
+client:
+  pool_size: 2
+  connection_strategy: priority
+  servers:
+    - type: tcp
+      address: ir-server.example.com:9999
+      path: /tunnel
+```
+
+### Sample 0.2: Multi-server (one foreign client -> multiple Iran servers)
+
+Foreign client:
+
+```yaml
+mode: client
+profile: performance
+
+client:
+  pool_size: 6
+  connection_strategy: parallel # use priority for strict failover order
+  servers:
+    - type: tls
+      address: ir-server-1.example.com:443
+      path: /tunnel
+      tls:
+        server_name: ir-server-1.example.com
+        insecure_skip_verify: false
+    - type: tls
+      address: ir-server-2.example.com:443
+      path: /tunnel
+      tls:
+        server_name: ir-server-2.example.com
+        insecure_skip_verify: false
+```
+
+Iran server #1/#2 (same structure, different host/IP):
+
+```yaml
+mode: server
+profile: performance
+
+server:
+  listens:
+    - type: tls
+      address: ":443"
+      path: /tunnel
+      tls:
+        cert_file: /etc/nodelay/certs/fullchain.pem
+        key_file: /etc/nodelay/certs/privkey.pem
+  mappings:
+    - name: web-443
+      mode: reverse
+      protocol: tcp
+      bind: 0.0.0.0:443
+      target: 127.0.0.1:443
+```
 
 ### Sample 1: Reverse + REALITY
 
@@ -854,9 +960,17 @@ systemctl status nodelay-client
 - Connection Pool برای مسیرهای موازی و پایداری بهتر سرویس
 - پشتیبانی از چند Endpoint در هر دو سمت:
   `server.listens` و `client.servers`
+- پشتیبانی از هر دو الگو:
+  چند کلاینت به یک سرور (`multi-client`) و یک کلاینت به چند سرور (`multi-server`)
+- می‌توانید در یک کانفیگ چند نوع transport را همزمان بالا بیاورید
+  (مثلا `tcp` + `ws` + `reality`) با افزودن endpointهای متعدد در `listens/servers`.
+- در هسته محدودیت عددی ثابت برای تعداد endpoint وجود ندارد؛ محدودیت عملی از منابع
+  سیستم می‌آید (پورت‌ها، file descriptor، CPU/RAM و پهنای‌باند).
 - استراتژی انتخاب Endpoint در کلاینت با `client.connection_strategy`:
   `parallel` (تقسیم workerها روی endpointها) یا `priority` (اولویت ترتیبی با failover)
 - Health check و reconnect با backoff + jitter.
+- در حالت `reverse` و با چند listen/کلاینت، mappingها از یک session pool مشترک سرویس
+  می‌گیرند (round-robin بین sessionهای فعال) و به listen/کلاینت خاص pin نمی‌شوند.
 
 ### 4) لایه امنیت
 
@@ -966,6 +1080,105 @@ client:
 
 - اگر `listens`/`servers` را نگذارید، runtime برای هر سمت یک endpoint پیش‌فرض در نظر می‌گیرد.
 - در `parallel`، workerها بین endpointها پخش می‌شوند؛ در `priority` ابتدا endpoint اول تست می‌شود و در صورت خطا failover ترتیبی انجام می‌شود.
+
+### نمونه 0.1: Multi-client (چند کلاینت خارج -> یک سرور ایران)
+
+سرور ایران:
+
+```yaml
+mode: server
+profile: balanced
+
+server:
+  listens:
+    - type: tcp
+      address: ":9999"
+      path: /tunnel
+  mappings:
+    - name: web-443
+      mode: reverse
+      protocol: tcp
+      bind: 0.0.0.0:443
+      target: 127.0.0.1:443
+```
+
+کلاینت خارج شماره 1:
+
+```yaml
+mode: client
+profile: balanced
+
+client:
+  pool_size: 3
+  connection_strategy: priority
+  servers:
+    - type: tcp
+      address: ir-server.example.com:9999
+      path: /tunnel
+```
+
+کلاینت خارج شماره 2 (همان سرور ایران، instance جدا):
+
+```yaml
+mode: client
+profile: performance
+
+client:
+  pool_size: 2
+  connection_strategy: priority
+  servers:
+    - type: tcp
+      address: ir-server.example.com:9999
+      path: /tunnel
+```
+
+### نمونه 0.2: Multi-server (یک کلاینت خارج -> چند سرور ایران)
+
+کلاینت خارج:
+
+```yaml
+mode: client
+profile: performance
+
+client:
+  pool_size: 6
+  connection_strategy: parallel # برای failover ترتیبی از priority استفاده کنید
+  servers:
+    - type: tls
+      address: ir-server-1.example.com:443
+      path: /tunnel
+      tls:
+        server_name: ir-server-1.example.com
+        insecure_skip_verify: false
+    - type: tls
+      address: ir-server-2.example.com:443
+      path: /tunnel
+      tls:
+        server_name: ir-server-2.example.com
+        insecure_skip_verify: false
+```
+
+سرور ایران شماره 1/2 (ساختار یکسان، فقط Host/IP متفاوت):
+
+```yaml
+mode: server
+profile: performance
+
+server:
+  listens:
+    - type: tls
+      address: ":443"
+      path: /tunnel
+      tls:
+        cert_file: /etc/nodelay/certs/fullchain.pem
+        key_file: /etc/nodelay/certs/privkey.pem
+  mappings:
+    - name: web-443
+      mode: reverse
+      protocol: tcp
+      bind: 0.0.0.0:443
+      target: 127.0.0.1:443
+```
 
 ### نمونه 1: Reverse + REALITY
 
