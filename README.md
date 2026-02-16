@@ -118,6 +118,16 @@ curl -fsSL https://raw.githubusercontent.com/ChownYourLife/NoDelayTunnel/main/de
 sudo python3 deploy.py
 ```
 
+### Benchmark first (recommended before tunnel setup)
+
+Before creating server/client tunnel configs, run a direct connectivity benchmark between the two VPS nodes.
+
+- In `deploy.py`, use `🌐 Direct Connectivity Test (iperf3)` (or accept the benchmark prompt in client setup).
+- Run tests in both directions (uplink/downlink), then decide:
+  - `>=150-200 Mbps`: link quality is good for tunneling.
+  - `<100 Mbps`: swap Iran/Kharej roles and test again before deployment.
+- If direct link quality is poor, tunnel tuning alone usually will not fully fix throughput.
+
 ### What `deploy.py` handles
 
 - Installs or updates the `nodelay` binary.
@@ -1013,6 +1023,16 @@ systemctl status nodelay-client
 curl -fsSL https://raw.githubusercontent.com/ChownYourLife/NoDelayTunnel/main/deploy.py -o deploy.py
 sudo python3 deploy.py
 ```
+
+### قبل از ساخت تونل، اول Benchmark بگیرید (توصیه‌شده)
+
+قبل از اینکه کانفیگ سرور/کلاینت تونل را بسازید، بین دو VPS یک تست اتصال مستقیم بگیرید.
+
+- داخل `deploy.py` از گزینه `🌐 Direct Connectivity Test (iperf3)` استفاده کنید (یا در مسیر نصب کلاینت، پرامپت Benchmark را تایید کنید).
+- تست را در هر دو جهت بگیرید (آپلود/دانلود) و بعد تصمیم بگیرید:
+  - `>=150-200 Mbps`: کیفیت لینک برای تونل مناسب است.
+  - `<100 Mbps`: جای ایران/خارج را عوض کنید و دوباره تست بگیرید.
+- اگر لینک مستقیم ضعیف باشد، صرفا با tuning تونل معمولا مشکل throughput کامل حل نمی‌شود.
 
 ### `deploy.py` چه کار می‌کند؟
 

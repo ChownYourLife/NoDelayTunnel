@@ -55,6 +55,8 @@ TUNING_SECTIONS = ["smux", "tcp", "udp", "kcp", "quic", "reconnect"]
 IPERF_TEST_DEFAULT_PORT = 9777
 IPERF_TEST_DEFAULT_DURATION = 8
 IPERF_TEST_DEFAULT_STREAMS = 8
+# iperf3 controls TCP segment size via MSS; set to 1300 for tunnel-path testing.
+IPERF_TEST_MSS = 1300
 IPERF_GOOD_MBPS = 150.0
 IPERF_EXCELLENT_MBPS = 200.0
 IPERF_POOR_MBPS = 100.0
@@ -741,7 +743,7 @@ def run_direct_connectivity_benchmark(target_host, port, duration, streams):
 
     print_header("🌐 Direct Connectivity Benchmark (iperf3)")
     print_info(
-        f"Target={target_host}:{port} | Duration={duration}s | Streams={streams} | Mode=direct (no tunnel)"
+        f"Target={target_host}:{port} | Duration={duration}s | Streams={streams} | MSS={IPERF_TEST_MSS} | Mode=direct (no tunnel)"
     )
 
     base_cmd = [
@@ -754,6 +756,8 @@ def run_direct_connectivity_benchmark(target_host, port, duration, streams):
         str(duration),
         "-P",
         str(streams),
+        "-M",
+        str(IPERF_TEST_MSS),
         "-J",
     ]
 
@@ -1282,46 +1286,64 @@ def generate_trusted_cert_certbot():
 
 
 def ask_cert_options(default_cert="", default_key="", allow_keep=False):
+    back_signal = "__BACK_TO_TRANSPORT_MENU__"
     has_default_pair = bool(default_cert and default_key)
-    options = []
-    if allow_keep and has_default_pair:
-        options.append("0. Keep current certificate files")
-    options.extend(
-        [
-            "1. Use existing certificate path",
-            "2. Generate self-signed certificate (Auto)",
-            "3. Generate trusted certificate (Certbot ACME)",
-        ]
-    )
-    print_menu(
-        "Certificate Options",
-        options,
-        color=Colors.CYAN,
-        min_width=54,
-    )
     default_choice = "0" if (allow_keep and has_default_pair) else "1"
     choice_prompt = "Select option [0/1/2/3]" if (allow_keep and has_default_pair) else "Select option [1/2/3]"
-    choice = input_default(choice_prompt, default_choice).strip()
-    if choice == "0" and allow_keep and has_default_pair:
-        return default_cert, default_key
-    if choice == "3":
-        return generate_trusted_cert_certbot()
-    if choice == "2":
-        domain = input_default("Common Name (CN) for certificate", "www.bing.com").strip()
-        cert_name = input_default(
-            "Certificate file name prefix (selfsigned-<name>.*)",
-            cert_base_name(domain),
-        ).strip()
-        return generate_self_signed_cert(domain, cert_name)
-    cert = input_default("Certificate Path", default_cert or "").strip()
-    while not cert:
-        print_error("Certificate path is required.")
+
+    while True:
+        options = []
+        if allow_keep and has_default_pair:
+            options.append("0. Keep current certificate files")
+        options.extend(
+            [
+                "1. Use existing certificate path",
+                "2. Generate self-signed certificate (Auto)",
+                "3. Generate trusted certificate (Certbot ACME)",
+            ]
+        )
+        print_menu(
+            "Certificate Options",
+            options,
+            color=Colors.CYAN,
+            min_width=54,
+        )
+
+        choice = input_default(choice_prompt, default_choice).strip()
+        if choice == "0" and allow_keep and has_default_pair:
+            return default_cert, default_key
+
+        if choice in {"2", "3"}:
+            if choice == "3":
+                cert, key = generate_trusted_cert_certbot()
+            else:
+                domain = input_default("Common Name (CN) for certificate", "www.bing.com").strip()
+                cert_name = input_default(
+                    "Certificate file name prefix (selfsigned-<name>.*)",
+                    cert_base_name(domain),
+                ).strip()
+                cert, key = generate_self_signed_cert(domain, cert_name)
+
+            if cert and key:
+                return cert, key
+
+            continue_setup = input_default(
+                "Certificate generation failed. Continue setup? (Y/n)",
+                "y",
+            ).strip().lower()
+            if continue_setup not in {"y", "yes"}:
+                return back_signal, back_signal
+            continue
+
         cert = input_default("Certificate Path", default_cert or "").strip()
-    key = input_default("Private Key Path", default_key or "").strip()
-    while not key:
-        print_error("Private key path is required.")
+        while not cert:
+            print_error("Certificate path is required.")
+            cert = input_default("Certificate Path", default_cert or "").strip()
         key = input_default("Private Key Path", default_key or "").strip()
-    return cert, key
+        while not key:
+            print_error("Private key path is required.")
+            key = input_default("Private Key Path", default_key or "").strip()
+        return cert, key
 
 
 def extract_x25519_key_from_der(der_data, prefix):
@@ -1855,6 +1877,7 @@ def derive_client_address_from_endpoint(endpoint, fallback="127.0.0.1:8443"):
 
 
 def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
+    back_signal = "__BACK_TO_TRANSPORT_MENU__"
     defaults = protocol_config if isinstance(protocol_config, dict) else {}
     endpoints = deep_copy(existing) if isinstance(existing, list) else []
     default_reality_cfg = normalize_endpoint_reality_config(
@@ -1941,6 +1964,8 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
                     default_key=key_default,
                     allow_keep=bool(cert_default and key_default),
                 )
+                if tls_cfg["cert_file"] == back_signal and tls_cfg["key_file"] == back_signal:
+                    return back_signal
                 tls_cfg["ca_file"] = input_default(
                     "TLS client CA file (optional)",
                     "",
@@ -2156,6 +2181,7 @@ def prompt_license_id():
 
 
 def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
+    back_signal = "__BACK_TO_TRANSPORT_MENU__"
     options = [(idx, label) for idx, _, label in TRANSPORT_TYPE_OPTIONS]
     print_menu(
         "📜 Select Protocol",
@@ -2263,7 +2289,11 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
             if keep_current in {"y", "yes"} and config.get("cert") and config.get("key"):
                 pass
             else:
-                config["cert"], config["key"] = ask_cert_options()
+                cert, key = ask_cert_options()
+                if cert == back_signal and key == back_signal:
+                    print_info("Returning to protocol selection menu...")
+                    return menu_protocol(role, server_addr=server_addr, defaults=config, prompt_port=prompt_port)
+                config["cert"], config["key"] = cert, key
         else:
             config["sni"], config["insecure_skip_verify"] = prompt_client_tls_settings(
                 server_addr or config.get("server_addr", ""),
@@ -2285,7 +2315,11 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
             if keep_current in {"y", "yes"} and config.get("cert") and config.get("key"):
                 pass
             else:
-                config["cert"], config["key"] = ask_cert_options()
+                cert, key = ask_cert_options()
+                if cert == back_signal and key == back_signal:
+                    print_info("Returning to protocol selection menu...")
+                    return menu_protocol(role, server_addr=server_addr, defaults=config, prompt_port=prompt_port)
+                config["cert"], config["key"] = cert, key
         else:
             config["sni"], config["insecure_skip_verify"] = prompt_client_tls_settings(
                 server_addr or config.get("server_addr", ""),
@@ -2305,7 +2339,11 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
             if keep_current in {"y", "yes"} and config.get("cert") and config.get("key"):
                 pass
             else:
-                config["cert"], config["key"] = ask_cert_options()
+                cert, key = ask_cert_options()
+                if cert == back_signal and key == back_signal:
+                    print_info("Returning to protocol selection menu...")
+                    return menu_protocol(role, server_addr=server_addr, defaults=config, prompt_port=prompt_port)
+                config["cert"], config["key"] = cert, key
         else:
             config["sni"], config["insecure_skip_verify"] = prompt_client_tls_settings(
                 server_addr or config.get("server_addr", ""),
@@ -2329,7 +2367,11 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
             if keep_current in {"y", "yes"} and config.get("cert") and config.get("key"):
                 pass
             else:
-                config["cert"], config["key"] = ask_cert_options()
+                cert, key = ask_cert_options()
+                if cert == back_signal and key == back_signal:
+                    print_info("Returning to protocol selection menu...")
+                    return menu_protocol(role, server_addr=server_addr, defaults=config, prompt_port=prompt_port)
+                config["cert"], config["key"] = cert, key
         else:
             config["sni"], config["insecure_skip_verify"] = prompt_client_tls_settings(
                 server_addr or config.get("server_addr", ""),
@@ -2378,6 +2420,9 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
         config,
         existing=config.get("additional_endpoints", []),
     )
+    if config["additional_endpoints"] == back_signal:
+        print_info("Returning to protocol selection menu...")
+        return menu_protocol(role, server_addr=server_addr, defaults=config, prompt_port=prompt_port)
     config["network_mtu"] = prompt_network_mtu(config.get("network_mtu", 0))
 
     return config
