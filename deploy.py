@@ -674,7 +674,8 @@ def is_valid_short_id(value):
         return False
     if re.fullmatch(r"[0-9a-f]+", value) is None:
         return False
-    if len(value) < 8:
+    # Core requires at least 8 bytes (16 hex chars).
+    if len(value) < 16:
         return False
     return len(value) % 2 == 0
 
@@ -1069,12 +1070,12 @@ def derive_reality_public_key(private_key_hex):
 
 
 def prompt_short_id(default_value=""):
-    seed = str(default_value or random_hex(8)).strip().lower()
+    seed = str(default_value or random_hex(16)).strip().lower()
     while True:
-        short_id = input_default("Short ID (hex, min 8 chars)", seed).lower()
+        short_id = input_default("Short ID (hex, min 16 chars)", seed).lower()
         if is_valid_short_id(short_id):
             return short_id
-        print_error("Invalid Short ID. Use even-length hex with at least 8 characters.")
+        print_error("Invalid Short ID. Use even-length hex with at least 16 characters.")
 
 
 def prompt_server_names(default_values=None):
@@ -1304,6 +1305,17 @@ def endpoint_uses_tls(transport_type):
     return normalize_endpoint_type(transport_type) in {"tls", "wss", "quic", "httpsmimicry"}
 
 
+def empty_tls_config():
+    return {
+        "cert_file": "",
+        "key_file": "",
+        "ca_file": "",
+        "server_name": "",
+        "insecure_skip_verify": False,
+        "require_client_cert": False,
+    }
+
+
 def default_path_for_transport(transport_type):
     transport_type = normalize_endpoint_type(transport_type)
     if transport_type in {"ws", "wss"}:
@@ -1377,11 +1389,16 @@ def normalize_server_names_list(value):
     return out
 
 
-def normalize_endpoint_reality_config(value, role, fallback=None):
+def normalize_endpoint_reality_config(
+    value,
+    role,
+    fallback=None,
+    default_dest_when_empty=False,
+):
     raw = value if isinstance(value, dict) else {}
     base = fallback if isinstance(fallback, dict) else {}
     dest = str(raw.get("dest", base.get("dest", ""))).strip()
-    if role == "server" and not dest:
+    if default_dest_when_empty and not dest:
         dest = "www.microsoft.com:443"
     server_names = normalize_server_names_list(
         raw.get("server_names", base.get("server_names", []))
@@ -1413,6 +1430,8 @@ def normalize_transport_endpoint(
     ep = endpoint if isinstance(endpoint, dict) else {}
     ep_type = normalize_endpoint_type(ep.get("type", fallback_type), normalize_endpoint_type(fallback_type))
     address = str(ep.get("address", fallback_address) or fallback_address).strip()
+    if not address:
+        address = ":8443" if role == "server" else "127.0.0.1:8443"
     path = normalize_path(ep.get("path", fallback_path), fallback_path)
     url = str(ep.get("url", "") or "").strip()
     tls = ep.get("tls", {}) if isinstance(ep.get("tls"), dict) else {}
@@ -1424,21 +1443,22 @@ def normalize_transport_endpoint(
         "insecure_skip_verify": bool(tls.get("insecure_skip_verify", False)),
         "require_client_cert": bool(tls.get("require_client_cert", False)),
     }
+    if not endpoint_uses_tls(ep_type):
+        tls_cfg = empty_tls_config()
     if role == "server":
         tls_cfg["server_name"] = ""
         tls_cfg["insecure_skip_verify"] = False
     else:
         tls_cfg["require_client_cert"] = False
-    raw_reality = ep.get("reality", {})
     if ep_type == "reality":
-        reality_fallback = fallback_reality
+        reality_cfg = normalize_endpoint_reality_config(
+            ep.get("reality", {}),
+            role=role,
+            fallback=fallback_reality,
+            default_dest_when_empty=True,
+        )
     else:
-        reality_fallback = {}
-    reality_cfg = normalize_endpoint_reality_config(
-        raw_reality,
-        role=role,
-        fallback=reality_fallback,
-    )
+        reality_cfg = {}
     return {
         "type": ep_type,
         "address": address,
@@ -1482,6 +1502,7 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
             "public_key": defaults.get("public_key", ""),
         },
         role=role,
+        default_dest_when_empty=True,
     )
 
     if endpoints:
@@ -1541,14 +1562,7 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
         else:
             path = seed_path
 
-        tls_cfg = {
-            "cert_file": "",
-            "key_file": "",
-            "ca_file": "",
-            "server_name": "",
-            "insecure_skip_verify": False,
-            "require_client_cert": False,
-        }
+        tls_cfg = empty_tls_config()
         if endpoint_uses_tls(ep_type):
             if role == "server":
                 cert_default = str(defaults.get("cert", "")).strip()
@@ -1609,17 +1623,23 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
                         break
                     print_error("Client cert_file and key_file must both be set, or both left empty.")
 
-        reality_cfg = normalize_endpoint_reality_config({}, role=role)
+        reality_cfg = {}
         if ep_type == "reality":
+            reality_cfg = normalize_endpoint_reality_config(
+                {},
+                role=role,
+                fallback=default_reality_cfg,
+                default_dest_when_empty=True,
+            )
             reality_cfg["server_names"] = prompt_server_names(
                 default_values=default_reality_cfg.get("server_names", [])
             )
             reality_cfg["short_id"] = prompt_short_id(default_reality_cfg.get("short_id", ""))
+            reality_cfg["dest"] = input_default(
+                "Dest (real target site:port)",
+                default_reality_cfg.get("dest", "www.microsoft.com:443") or "www.microsoft.com:443",
+            ).strip()
             if role == "server":
-                reality_cfg["dest"] = input_default(
-                    "Dest (real target site:port)",
-                    default_reality_cfg.get("dest", "www.microsoft.com:443") or "www.microsoft.com:443",
-                ).strip()
                 (
                     reality_cfg["private_key"],
                     derived_public_key,
@@ -1801,7 +1821,7 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
         "psk": "",
         "sni": "",
         "insecure_skip_verify": False,
-        "dest": "",
+        "dest": "www.microsoft.com:443",
         "server_names": [],
         "short_id": "",
         "private_key": "",
@@ -1956,10 +1976,11 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
         config["port"] = prompt_or_keep_port(443)
         config["server_names"] = prompt_server_names(config.get("server_names", []))
         config["short_id"] = prompt_short_id(config.get("short_id", ""))
+        config["dest"] = input_default(
+            "Dest (real target site:port)",
+            config.get("dest", "www.microsoft.com:443") or "www.microsoft.com:443",
+        ).strip()
         if role == "server":
-            config["dest"] = input_default(
-                "Dest (real target site:port)", config.get("dest", "www.microsoft.com:443")
-            ).strip()
             (
                 config["private_key"],
                 config["public_key"],
@@ -2282,6 +2303,7 @@ def load_instance_runtime_settings(role, instance):
             primary_listen.get("reality", {}),
             role="server",
             fallback=reality_global,
+            default_dest_when_empty=str(primary_listen.get("type", "tcp")).strip().lower() == "reality",
         )
         protocol_cfg = {
             "type": str(primary_listen.get("type", "tcp")),
@@ -2367,6 +2389,7 @@ def load_instance_runtime_settings(role, instance):
             primary_server.get("reality", {}),
             role="client",
             fallback=reality_global,
+            default_dest_when_empty=str(primary_server.get("type", "tcp")).strip().lower() == "reality",
         )
         try:
             pool_size = int(client.get("pool_size", 3) or 3)
@@ -2394,7 +2417,7 @@ def load_instance_runtime_settings(role, instance):
             "psk": psk,
             "sni": str(tls_cfg.get("server_name", "")),
             "insecure_skip_verify": bool(tls_cfg.get("insecure_skip_verify", False)),
-            "dest": "",
+            "dest": str(primary_reality.get("dest", "www.microsoft.com:443")),
             "server_names": primary_reality.get("server_names", []),
             "short_id": str(primary_reality.get("short_id", "")),
             "private_key": "",
@@ -2720,6 +2743,19 @@ def resolve_http_mimicry_path(protocol_config):
     return "/api/v1/upload"
 
 
+def resolve_http_mimicry_state(protocol_config, endpoints):
+    # Enable mimicry if any configured endpoint uses mimicry transport.
+    if not isinstance(endpoints, list):
+        endpoints = []
+    for ep in endpoints:
+        if not isinstance(ep, dict):
+            continue
+        ep_type = normalize_endpoint_type(ep.get("type", "tcp"), "tcp")
+        if ep_type in {"httpmimicry", "httpsmimicry"}:
+            return True, normalize_path(ep.get("path", "/api/v1/upload"), "/api/v1/upload")
+    return False, "/api/v1/upload"
+
+
 def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
     primary_path = normalize_path(primary_path, "/api/v1/upload")
     preset_region = normalize_mimicry_preset_region(preset_region, "mixed")
@@ -2850,8 +2886,7 @@ def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
     return combined_profiles
 
 
-def render_http_mimicry_lines(protocol_config, http_path):
-    enabled = protocol_config["type"] in {"httpmimicry", "httpsmimicry"}
+def render_http_mimicry_lines(protocol_config, http_path, enabled=False):
     preset_region = "mixed"
     mimicry_transport_mode = normalize_mimicry_transport_mode(
         protocol_config.get("mimicry_transport_mode", "websocket"),
@@ -2895,7 +2930,9 @@ def resolve_ws_url(protocol_config, address, path):
     return ""
 
 
-def build_primary_endpoint_reality(role, protocol_config):
+def build_primary_endpoint_reality(role, protocol_config, endpoint_type=""):
+    if normalize_endpoint_type(endpoint_type, "tcp") != "reality":
+        return {}
     cfg = protocol_config if isinstance(protocol_config, dict) else {}
     return normalize_endpoint_reality_config(
         {
@@ -2906,6 +2943,7 @@ def build_primary_endpoint_reality(role, protocol_config):
             "public_key": cfg.get("public_key", ""),
         },
         role=role,
+        default_dest_when_empty=True,
     )
 
 
@@ -2932,13 +2970,13 @@ def build_server_primary_endpoint(protocol_config):
                 "insecure_skip_verify": False,
                 "require_client_cert": False,
             },
-            "reality": build_primary_endpoint_reality("server", protocol_config),
+            "reality": build_primary_endpoint_reality("server", protocol_config, endpoint_type),
         },
         role="server",
         fallback_type=endpoint_type,
         fallback_address=address,
         fallback_path=path,
-        fallback_reality=build_primary_endpoint_reality("server", protocol_config),
+        fallback_reality=build_primary_endpoint_reality("server", protocol_config, endpoint_type),
     )
 
 
@@ -2965,13 +3003,13 @@ def build_client_primary_endpoint(protocol_config):
                 "insecure_skip_verify": bool(protocol_config.get("insecure_skip_verify", False)),
                 "require_client_cert": False,
             },
-            "reality": build_primary_endpoint_reality("client", protocol_config),
+            "reality": build_primary_endpoint_reality("client", protocol_config, endpoint_type),
         },
         role="client",
         fallback_type=endpoint_type,
         fallback_address=address,
         fallback_path=path,
-        fallback_reality=build_primary_endpoint_reality("client", protocol_config),
+        fallback_reality=build_primary_endpoint_reality("client", protocol_config, endpoint_type),
     )
 
 
@@ -3026,32 +3064,32 @@ def render_named_transport_endpoint_lines(
     endpoint,
     include_require_client_cert=False,
 ):
+    ep_type = normalize_endpoint_type(endpoint.get("type", "tcp"), "tcp")
     tls_cfg = endpoint.get("tls", {}) if isinstance(endpoint.get("tls"), dict) else {}
     reality_cfg = (
         endpoint.get("reality", {}) if isinstance(endpoint.get("reality"), dict) else {}
     )
-    include_reality = (
-        str(endpoint.get("type", "")).strip().lower() == "reality"
-        or bool(str(reality_cfg.get("dest", "")).strip())
-        or bool(normalize_server_names_list(reality_cfg.get("server_names", [])))
-        or bool(str(reality_cfg.get("short_id", "")).strip())
-        or bool(str(reality_cfg.get("private_key", "")).strip())
-        or bool(str(reality_cfg.get("public_key", "")).strip())
-    )
+    include_tls = endpoint_uses_tls(ep_type)
+    include_reality = ep_type == "reality"
     lines = [
         f"{indent}{key_name}:",
-        f"{indent}  type: {yaml_scalar(endpoint.get('type', 'tcp'))}",
+        f"{indent}  type: {yaml_scalar(ep_type)}",
         f"{indent}  address: {yaml_scalar(endpoint.get('address', ''))}",
         f"{indent}  url: {yaml_scalar(endpoint.get('url', ''))}",
         f"{indent}  path: {yaml_scalar(endpoint.get('path', '/tunnel'))}",
-        f"{indent}  tls:",
-        f"{indent}    cert_file: {yaml_scalar(tls_cfg.get('cert_file', ''))}",
-        f"{indent}    key_file: {yaml_scalar(tls_cfg.get('key_file', ''))}",
-        f"{indent}    ca_file: {yaml_scalar(tls_cfg.get('ca_file', ''))}",
-        f"{indent}    server_name: {yaml_scalar(tls_cfg.get('server_name', ''))}",
-        f"{indent}    insecure_skip_verify: {yaml_scalar(bool(tls_cfg.get('insecure_skip_verify', False)))}",
     ]
-    if include_require_client_cert:
+    if include_tls:
+        lines.extend(
+            [
+                f"{indent}  tls:",
+                f"{indent}    cert_file: {yaml_scalar(tls_cfg.get('cert_file', ''))}",
+                f"{indent}    key_file: {yaml_scalar(tls_cfg.get('key_file', ''))}",
+                f"{indent}    ca_file: {yaml_scalar(tls_cfg.get('ca_file', ''))}",
+                f"{indent}    server_name: {yaml_scalar(tls_cfg.get('server_name', ''))}",
+                f"{indent}    insecure_skip_verify: {yaml_scalar(bool(tls_cfg.get('insecure_skip_verify', False)))}",
+            ]
+        )
+    if include_tls and include_require_client_cert:
         lines.append(
             f"{indent}    require_client_cert: {yaml_scalar(bool(tls_cfg.get('require_client_cert', False)))}"
         )
@@ -3079,33 +3117,33 @@ def render_transport_endpoints_list_lines(
         return [f"{indent}{key_name}: []"]
     lines = [f"{indent}{key_name}:"]
     for endpoint in endpoints:
+        ep_type = normalize_endpoint_type(endpoint.get("type", "tcp"), "tcp")
         tls_cfg = endpoint.get("tls", {}) if isinstance(endpoint.get("tls"), dict) else {}
         reality_cfg = (
             endpoint.get("reality", {}) if isinstance(endpoint.get("reality"), dict) else {}
         )
-        include_reality = (
-            str(endpoint.get("type", "")).strip().lower() == "reality"
-            or bool(str(reality_cfg.get("dest", "")).strip())
-            or bool(normalize_server_names_list(reality_cfg.get("server_names", [])))
-            or bool(str(reality_cfg.get("short_id", "")).strip())
-            or bool(str(reality_cfg.get("private_key", "")).strip())
-            or bool(str(reality_cfg.get("public_key", "")).strip())
-        )
+        include_tls = endpoint_uses_tls(ep_type)
+        include_reality = ep_type == "reality"
         lines.extend(
             [
-                f"{indent}  - type: {yaml_scalar(endpoint.get('type', 'tcp'))}",
+                f"{indent}  - type: {yaml_scalar(ep_type)}",
                 f"{indent}    address: {yaml_scalar(endpoint.get('address', ''))}",
                 f"{indent}    url: {yaml_scalar(endpoint.get('url', ''))}",
                 f"{indent}    path: {yaml_scalar(endpoint.get('path', '/tunnel'))}",
-                f"{indent}    tls:",
-                f"{indent}      cert_file: {yaml_scalar(tls_cfg.get('cert_file', ''))}",
-                f"{indent}      key_file: {yaml_scalar(tls_cfg.get('key_file', ''))}",
-                f"{indent}      ca_file: {yaml_scalar(tls_cfg.get('ca_file', ''))}",
-                f"{indent}      server_name: {yaml_scalar(tls_cfg.get('server_name', ''))}",
-                f"{indent}      insecure_skip_verify: {yaml_scalar(bool(tls_cfg.get('insecure_skip_verify', False)))}",
             ]
         )
-        if include_require_client_cert:
+        if include_tls:
+            lines.extend(
+                [
+                    f"{indent}    tls:",
+                    f"{indent}      cert_file: {yaml_scalar(tls_cfg.get('cert_file', ''))}",
+                    f"{indent}      key_file: {yaml_scalar(tls_cfg.get('key_file', ''))}",
+                    f"{indent}      ca_file: {yaml_scalar(tls_cfg.get('ca_file', ''))}",
+                    f"{indent}      server_name: {yaml_scalar(tls_cfg.get('server_name', ''))}",
+                    f"{indent}      insecure_skip_verify: {yaml_scalar(bool(tls_cfg.get('insecure_skip_verify', False)))}",
+                ]
+            )
+        if include_tls and include_require_client_cert:
             lines.append(
                 f"{indent}      require_client_cert: {yaml_scalar(bool(tls_cfg.get('require_client_cert', False)))}"
             )
@@ -3129,14 +3167,38 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
 
     primary_endpoint = build_server_primary_endpoint(protocol_config)
     all_listens = build_all_endpoints_for_render("server", protocol_config, primary_endpoint)
-    path = primary_endpoint["path"]
-    http_path = resolve_http_mimicry_path(protocol_config)
+    mimicry_enabled, http_path = resolve_http_mimicry_state(protocol_config, all_listens)
     network_mtu = normalize_network_mtu(protocol_config.get("network_mtu", 0), 0)
-    reality_enabled = protocol_config["type"] == "reality"
-    reality_dest = protocol_config.get("dest", "www.microsoft.com:443") if reality_enabled else "www.microsoft.com:443"
-    reality_server_names = protocol_config.get("server_names", []) if reality_enabled else []
-    reality_short_id = protocol_config.get("short_id", "") if reality_enabled else ""
-    reality_private_key = protocol_config.get("private_key", "") if reality_enabled else ""
+    reality_enabled = any(
+        normalize_endpoint_type(ep.get("type", "tcp"), "tcp") == "reality"
+        for ep in all_listens
+        if isinstance(ep, dict)
+    )
+    reality_cfg_source = {}
+    for ep in all_listens:
+        if not isinstance(ep, dict):
+            continue
+        if normalize_endpoint_type(ep.get("type", "tcp"), "tcp") != "reality":
+            continue
+        if isinstance(ep.get("reality"), dict):
+            reality_cfg_source = ep["reality"]
+            break
+    reality_cfg = normalize_endpoint_reality_config(
+        reality_cfg_source,
+        role="server",
+        fallback={
+            "dest": protocol_config.get("dest", "www.microsoft.com:443"),
+            "server_names": protocol_config.get("server_names", []),
+            "short_id": protocol_config.get("short_id", ""),
+            "private_key": protocol_config.get("private_key", ""),
+            "public_key": "",
+        },
+        default_dest_when_empty=reality_enabled,
+    )
+    reality_dest = reality_cfg.get("dest", "www.microsoft.com:443")
+    reality_server_names = reality_cfg.get("server_names", [])
+    reality_short_id = reality_cfg.get("short_id", "")
+    reality_private_key = reality_cfg.get("private_key", "")
     lines = [
         "mode: server",
         f"tunnel_mode: {yaml_scalar(protocol_config.get('tunnel_mode', 'reverse'))}",
@@ -3237,7 +3299,7 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
             "",
         ]
     )
-    lines.extend(render_http_mimicry_lines(protocol_config, http_path))
+    lines.extend(render_http_mimicry_lines(protocol_config, http_path, enabled=mimicry_enabled))
     lines.extend(
         [
             "",
@@ -3271,17 +3333,42 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
 
     primary_endpoint = build_client_primary_endpoint(protocol_config)
     all_servers = build_all_endpoints_for_render("client", protocol_config, primary_endpoint)
-    path = primary_endpoint["path"]
-    http_path = resolve_http_mimicry_path(protocol_config)
+    mimicry_enabled, http_path = resolve_http_mimicry_state(protocol_config, all_servers)
     network_mtu = normalize_network_mtu(protocol_config.get("network_mtu", 0), 0)
     connection_strategy = normalize_connection_strategy(
         protocol_config.get("connection_strategy", "parallel"),
         "parallel",
     )
-    reality_enabled = protocol_config["type"] == "reality"
-    reality_server_names = protocol_config.get("server_names", []) if reality_enabled else []
-    reality_short_id = protocol_config.get("short_id", "") if reality_enabled else ""
-    reality_public_key = protocol_config.get("public_key", "") if reality_enabled else ""
+    reality_enabled = any(
+        normalize_endpoint_type(ep.get("type", "tcp"), "tcp") == "reality"
+        for ep in all_servers
+        if isinstance(ep, dict)
+    )
+    reality_cfg_source = {}
+    for ep in all_servers:
+        if not isinstance(ep, dict):
+            continue
+        if normalize_endpoint_type(ep.get("type", "tcp"), "tcp") != "reality":
+            continue
+        if isinstance(ep.get("reality"), dict):
+            reality_cfg_source = ep["reality"]
+            break
+    reality_cfg = normalize_endpoint_reality_config(
+        reality_cfg_source,
+        role="client",
+        fallback={
+            "dest": protocol_config.get("dest", "www.microsoft.com:443"),
+            "server_names": protocol_config.get("server_names", []),
+            "short_id": protocol_config.get("short_id", ""),
+            "private_key": "",
+            "public_key": protocol_config.get("public_key", ""),
+        },
+        default_dest_when_empty=reality_enabled,
+    )
+    reality_dest = reality_cfg.get("dest", "www.microsoft.com:443")
+    reality_server_names = reality_cfg.get("server_names", [])
+    reality_short_id = reality_cfg.get("short_id", "")
+    reality_public_key = reality_cfg.get("public_key", "")
     try:
         pool_size = int(protocol_config.get("pool_size", 3))
     except (TypeError, ValueError):
@@ -3383,7 +3470,7 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         "",
         ]
     )
-    lines.extend(render_http_mimicry_lines(protocol_config, http_path))
+    lines.extend(render_http_mimicry_lines(protocol_config, http_path, enabled=mimicry_enabled))
     lines.extend(
         [
             "",
@@ -3399,7 +3486,7 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
             "",
             "reality:",
             f"  enabled: {yaml_scalar(reality_enabled)}",
-            '  dest: "www.microsoft.com:443"',
+            f"  dest: {yaml_scalar(reality_dest)}",
             f"  server_names: {json.dumps(reality_server_names)}",
             f"  short_id: {yaml_scalar(reality_short_id)}",
             '  private_key: ""',
