@@ -59,7 +59,7 @@ NoDelay can be used as a lightweight forwarding core in front of services such a
 
 - SMUX-based stream multiplexing over each session.
 - Connection pool support for parallel paths and better service continuity.
-- Multi-endpoint support on both sides: `server.listen` + `server.listens`, `client.server` + `client.servers`.
+- Multi-endpoint support on both sides: `server.listens` and `client.servers`.
 - Client-side endpoint selection strategy via `client.connection_strategy`:
   `parallel` (spread workers across endpoints) or `priority` (ordered failover).
 - Health checks and reconnect backoff with jitter.
@@ -135,10 +135,6 @@ mode: server
 profile: performance
 
 server:
-  listen:
-    type: tcp
-    address: ":9999"
-    path: /tunnel
   listens:
     - type: tcp
       address: ":9999"
@@ -163,10 +159,6 @@ profile: performance
 client:
   pool_size: 4
   connection_strategy: parallel # parallel | priority
-  server:
-    type: tcp
-    address: 203.0.113.10:9999
-    path: /tunnel
   servers:
     - type: tcp
       address: 203.0.113.10:9999
@@ -178,7 +170,7 @@ client:
 
 Notes:
 
-- If `listens`/`servers` are omitted, `listen`/`server` is used as the active endpoint set.
+- If `listens`/`servers` are omitted, runtime falls back to a single default endpoint for each side.
 - `parallel` spreads workers across endpoints; `priority` prefers the first endpoint and falls back in order.
 
 ### Sample 1: Reverse + REALITY
@@ -856,7 +848,7 @@ systemctl status nodelay-client
 - مالتی‌پلکس استریم‌ها با SMUX روی هر سشن.
 - Connection Pool برای مسیرهای موازی و پایداری بهتر سرویس
 - پشتیبانی از چند Endpoint در هر دو سمت:
-  `server.listen` + `server.listens` و `client.server` + `client.servers`
+  `server.listens` و `client.servers`
 - استراتژی انتخاب Endpoint در کلاینت با `client.connection_strategy`:
   `parallel` (تقسیم workerها روی endpointها) یا `priority` (اولویت ترتیبی با failover)
 - Health check و reconnect با backoff + jitter.
@@ -932,10 +924,6 @@ mode: server
 profile: performance
 
 server:
-  listen:
-    type: tcp
-    address: ":9999"
-    path: /tunnel
   listens:
     - type: tcp
       address: ":9999"
@@ -960,10 +948,6 @@ profile: performance
 client:
   pool_size: 4
   connection_strategy: parallel # parallel | priority
-  server:
-    type: tcp
-    address: 203.0.113.10:9999
-    path: /tunnel
   servers:
     - type: tcp
       address: 203.0.113.10:9999
@@ -975,7 +959,7 @@ client:
 
 نکته‌ها:
 
-- اگر `listens`/`servers` را نگذارید، همان `listen`/`server` به‌عنوان مجموعه endpoint فعال استفاده می‌شود.
+- اگر `listens`/`servers` را نگذارید، runtime برای هر سمت یک endpoint پیش‌فرض در نظر می‌گیرد.
 - در `parallel`، workerها بین endpointها پخش می‌شوند؛ در `priority` ابتدا endpoint اول تست می‌شود و در صورت خطا failover ترتیبی انجام می‌شود.
 
 ### نمونه 1: Reverse + REALITY
