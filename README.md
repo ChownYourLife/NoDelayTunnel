@@ -4,10 +4,6 @@
 
 **High-performance reverse/direct tunneling with multi-transport routing, profile-based tuning, and DPI-evasion options.**
 
-**لطفا در نظر داشته باشید برای استفاده از این تانل نیاز به خرید لایسنس از ربات تلگرام نودیلی دارید**
-
-**[![Telegram](https://img.shields.io/badge/telegram-NoDelayTunnel-blue?logo=telegram)](https://t.me/NoDelayTunnel)**
-
 [English Overview](#-english-overview) • [Deploy](#-deploy) • [Config Samples](#-config-samples) • [Benchmarks](#-benchmarks) • [راهنمای فارسی](#-راهنمای-فارسی)
 
 </div>
@@ -63,6 +59,9 @@ NoDelay can be used as a lightweight forwarding core in front of services such a
 
 - SMUX-based stream multiplexing over each session.
 - Connection pool support for parallel paths and better service continuity.
+- Multi-endpoint support on both sides: `server.listen` + `server.listens`, `client.server` + `client.servers`.
+- Client-side endpoint selection strategy via `client.connection_strategy`:
+  `parallel` (spread workers across endpoints) or `priority` (ordered failover).
 - Health checks and reconnect backoff with jitter.
 
 ### 4. Security stack
@@ -114,12 +113,77 @@ sudo python3 deploy.py
 - Builds and manages systemd services.
 - Exposes common service controls (start/stop/restart/status/logs).
 - Can apply optional Linux network tuning (for example BBR/fq_codel/sysctl presets).
+- Supports configuring additional transport endpoints and client connection strategy from the interactive menu.
+
+### Config generation modes (latest)
+
+- `Default` deploy mode writes a lean config and relies on runtime defaults + selected `profile`.
+- In `Default` mode, tuning sections are omitted from the file: `smux`, `tcp`, `udp`, `kcp`, `quic`, `reconnect`.
+- `Advanced` deploy mode writes those tuning sections explicitly and lets you customize every field.
+- In multi-tunnel edit mode, if you choose **Edit advanced tuning**, the instance is saved with explicit tuning blocks.
 
 ## 🧪 Config Samples
 
+These samples are full explicit examples (equivalent to `Advanced` deploy output).
+
+### Sample 0: Multi-endpoint + connection strategy
+
+Server (multiple listen endpoints):
+
+```yaml
+mode: server
+profile: performance
+
+server:
+  listen:
+    type: tcp
+    address: ":9999"
+    path: /tunnel
+  listens:
+    - type: tcp
+      address: ":9999"
+      path: /tunnel
+    - type: ws
+      address: ":8080"
+      path: /ws
+  mappings:
+    - name: web-443
+      mode: reverse
+      protocol: tcp
+      bind: 0.0.0.0:443
+      target: 127.0.0.1:443
+```
+
+Client (multiple upstream endpoints + strategy):
+
+```yaml
+mode: client
+profile: performance
+
+client:
+  pool_size: 4
+  connection_strategy: parallel # parallel | priority
+  server:
+    type: tcp
+    address: 203.0.113.10:9999
+    path: /tunnel
+  servers:
+    - type: tcp
+      address: 203.0.113.10:9999
+      path: /tunnel
+    - type: ws
+      address: 203.0.113.11:8080
+      path: /ws
+```
+
+Notes:
+
+- If `listens`/`servers` are omitted, `listen`/`server` is used as the active endpoint set.
+- `parallel` spreads workers across endpoints; `priority` prefers the first endpoint and falls back in order.
+
 ### Sample 1: Reverse + REALITY
 
-Full Server Config:
+Full Server Config (Advanced/Explicit):
 
 ```yaml
 mode: server
@@ -178,7 +242,7 @@ kcp:
   recv_window: 512
 
 quic:
-  alpn: tunnelkit-quic-v1
+  alpn: nodelay-quic-v1
   handshake_timeout: 10s
   max_idle_timeout: 60s
   keepalive_period: 15s
@@ -241,7 +305,7 @@ reality:
   public_key: ""
 ```
 
-Full Client Config:
+Full Client Config (Advanced/Explicit):
 
 ```yaml
 mode: client
@@ -290,7 +354,7 @@ kcp:
   recv_window: 512
 
 quic:
-  alpn: tunnelkit-quic-v1
+  alpn: nodelay-quic-v1
   handshake_timeout: 10s
   max_idle_timeout: 60s
   keepalive_period: 15s
@@ -355,7 +419,7 @@ reality:
 
 ### Sample 2: Reverse + HTTPS Mimicry
 
-Full Server Config:
+Full Server Config (Advanced/Explicit):
 
 ```yaml
 mode: server
@@ -451,7 +515,7 @@ reality:
   public_key: ""
 ```
 
-Full Client Config:
+Full Client Config (Advanced/Explicit):
 
 ```yaml
 mode: client
@@ -529,7 +593,7 @@ reality:
 
 ### Sample 3: Reverse + KCP for mixed TCP/UDP mapping
 
-Full Server Config:
+Full Server Config (Advanced/Explicit):
 
 ```yaml
 mode: server
@@ -602,7 +666,7 @@ obfuscation:
   burst_count: 0
 ```
 
-Full Client Config:
+Full Client Config (Advanced/Explicit):
 
 ```yaml
 mode: client
@@ -791,6 +855,10 @@ systemctl status nodelay-client
 
 - مالتی‌پلکس استریم‌ها با SMUX روی هر سشن.
 - Connection Pool برای مسیرهای موازی و پایداری بهتر سرویس
+- پشتیبانی از چند Endpoint در هر دو سمت:
+  `server.listen` + `server.listens` و `client.server` + `client.servers`
+- استراتژی انتخاب Endpoint در کلاینت با `client.connection_strategy`:
+  `parallel` (تقسیم workerها روی endpointها) یا `priority` (اولویت ترتیبی با failover)
 - Health check و reconnect با backoff + jitter.
 
 ### 4) لایه امنیت
@@ -842,12 +910,77 @@ sudo python3 deploy.py
 - ساخت و مدیریت سرویس‌های systemd
 - ارائه کنترل‌های معمول سرویس (start/stop/restart/status/logs)
 - امکان اعمال تنظیمات اختیاری شبکه لینوکس (مثل BBR/fq_codel/sysctl presets)
+- پشتیبانی از تعریف endpointهای اضافه و تنظیم `connection_strategy` کلاینت از منوی تعاملی
+
+### حالت‌های تولید کانفیگ (نسخه جدید)
+
+- در حالت `Default`، اسکریپت یک کانفیگ سبک می‌سازد و از پیش‌فرض‌های runtime + `profile` انتخاب‌شده استفاده می‌شود.
+- در حالت `Default`، سکشن‌های tuning داخل فایل نوشته نمی‌شوند: `smux`, `tcp`, `udp`, `kcp`, `quic`, `reconnect`.
+- در حالت `Advanced`، همین سکشن‌ها به‌صورت explicit داخل فایل نوشته می‌شوند و همه فیلدها قابل تنظیم هستند.
+- در بخش ویرایش Multi Tunnel، اگر گزینه **Edit advanced tuning** را بزنید، کانفیگ همان instance با tuningهای explicit ذخیره می‌شود.
 
 ## 🧪 نمونه کانفیگ
 
+این نمونه‌ها حالت کامل و explicit هستند (معادل خروجی deploy در حالت `Advanced`).
+
+### نمونه 0: چند endpoint + استراتژی اتصال
+
+سرور (چند listen endpoint):
+
+```yaml
+mode: server
+profile: performance
+
+server:
+  listen:
+    type: tcp
+    address: ":9999"
+    path: /tunnel
+  listens:
+    - type: tcp
+      address: ":9999"
+      path: /tunnel
+    - type: ws
+      address: ":8080"
+      path: /ws
+  mappings:
+    - name: web-443
+      mode: reverse
+      protocol: tcp
+      bind: 0.0.0.0:443
+      target: 127.0.0.1:443
+```
+
+کلاینت (چند upstream endpoint + استراتژی):
+
+```yaml
+mode: client
+profile: performance
+
+client:
+  pool_size: 4
+  connection_strategy: parallel # parallel | priority
+  server:
+    type: tcp
+    address: 203.0.113.10:9999
+    path: /tunnel
+  servers:
+    - type: tcp
+      address: 203.0.113.10:9999
+      path: /tunnel
+    - type: ws
+      address: 203.0.113.11:8080
+      path: /ws
+```
+
+نکته‌ها:
+
+- اگر `listens`/`servers` را نگذارید، همان `listen`/`server` به‌عنوان مجموعه endpoint فعال استفاده می‌شود.
+- در `parallel`، workerها بین endpointها پخش می‌شوند؛ در `priority` ابتدا endpoint اول تست می‌شود و در صورت خطا failover ترتیبی انجام می‌شود.
+
 ### نمونه 1: Reverse + REALITY
 
-کانفیگ کامل سرور:
+کانفیگ کامل سرور (حالت Advanced/Explicit):
 
 ```yaml
 mode: server
@@ -914,7 +1047,7 @@ kcp:
   recv_window: 512
 
 quic:
-  alpn: tunnelkit-quic-v1
+  alpn: nodelay-quic-v1
   handshake_timeout: 10s
   max_idle_timeout: 60s
   keepalive_period: 15s
@@ -969,7 +1102,7 @@ reality:
   public_key: ""
 ```
 
-کانفیگ کامل کلاینت:
+کانفیگ کامل کلاینت (حالت Advanced/Explicit):
 
 ```yaml
 mode: client
@@ -1026,7 +1159,7 @@ kcp:
   recv_window: 512
 
 quic:
-  alpn: tunnelkit-quic-v1
+  alpn: nodelay-quic-v1
   handshake_timeout: 10s
   max_idle_timeout: 60s
   keepalive_period: 15s
@@ -1083,7 +1216,7 @@ reality:
 
 ### نمونه 2: Reverse + HTTPS Mimicry
 
-کانفیگ کامل سرور:
+کانفیگ کامل سرور (حالت Advanced/Explicit):
 
 ```yaml
 mode: server
@@ -1179,7 +1312,7 @@ reality:
   public_key: ""
 ```
 
-کانفیگ کامل کلاینت:
+کانفیگ کامل کلاینت (حالت Advanced/Explicit):
 
 ```yaml
 mode: client
@@ -1257,7 +1390,7 @@ reality:
 
 ### نمونه 3: Reverse + KCP برای TCP/UDP
 
-کانفیگ کامل سرور:
+کانفیگ کامل سرور (حالت Advanced/Explicit):
 
 ```yaml
 mode: server
@@ -1330,7 +1463,7 @@ obfuscation:
   burst_count: 0
 ```
 
-کانفیگ کامل کلاینت:
+کانفیگ کامل کلاینت (حالت Advanced/Explicit):
 
 ```yaml
 mode: client
