@@ -969,13 +969,21 @@ def is_valid_short_id(value):
     return len(value) % 2 == 0
 
 
-def generate_self_signed_cert(common_name="www.example.com"):
+def generate_self_signed_cert(common_name="www.example.com", cert_name=""):
     cert_dir = os.path.join(CONFIG_DIR, "certs")
     if not os.path.exists(cert_dir):
         os.makedirs(cert_dir)
+    base = cert_base_name(cert_name or common_name or "selfsigned")
+    key_path = os.path.join(cert_dir, f"selfsigned-{base}.key")
+    cert_path = os.path.join(cert_dir, f"selfsigned-{base}.crt")
 
-    key_path = os.path.join(cert_dir, "selfsigned.key")
-    cert_path = os.path.join(cert_dir, "selfsigned.crt")
+    for path in (cert_path, key_path):
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                print_info(f"Replacing existing certificate file: {path}")
+            except OSError as exc:
+                print_error(f"Could not replace existing file {path}: {exc}")
 
     print_info(f"Generating self-signed certificate for {common_name}...")
     cmd = f'openssl req -x509 -newkey rsa:2048 -keyout "{key_path}" -out "{cert_path}" -days 3650 -nodes -subj "/CN={common_name}"'
@@ -1027,6 +1035,19 @@ def normalize_ip_identifier(value):
 def cert_base_name(identifier):
     safe = re.sub(r"[^a-z0-9._-]+", "_", str(identifier or "").strip().lower())
     return safe or "trusted_cert"
+
+
+def remove_cert_files_if_exist(cert_path, key_path):
+    for path in (cert_path, key_path):
+        if not path:
+            continue
+        if not os.path.exists(path):
+            continue
+        try:
+            os.remove(path)
+            print_info(f"Replacing existing certificate file: {path}")
+        except OSError as exc:
+            print_error(f"Could not replace existing file {path}: {exc}")
 
 
 def purge_existing_ip_cert_state(acme_sh, identifier, cert_path, key_path):
@@ -1175,9 +1196,14 @@ def generate_trusted_cert_acme():
     if not os.path.exists(cert_dir):
         os.makedirs(cert_dir)
 
-    base = cert_base_name(identifier)
+    cert_name = input_default(
+        "Certificate file name prefix (trusted-<name>.*)",
+        cert_base_name(identifier),
+    ).strip()
+    base = cert_base_name(cert_name or identifier)
     cert_path = os.path.join(cert_dir, f"trusted-{base}.crt")
     key_path = os.path.join(cert_dir, f"trusted-{base}.key")
+    remove_cert_files_if_exist(cert_path, key_path)
 
     if mode == "2":
         purge_existing_ip_cert_state(acme_sh, identifier, cert_path, key_path)
@@ -1229,25 +1255,46 @@ def generate_trusted_cert_acme():
             start_tunnel_services(stopped)
 
 
-def ask_cert_options():
-    print_menu(
-        "Certificate Options",
+def ask_cert_options(default_cert="", default_key="", allow_keep=False):
+    has_default_pair = bool(default_cert and default_key)
+    options = []
+    if allow_keep and has_default_pair:
+        options.append("0. Keep current certificate files")
+    options.extend(
         [
             "1. Use existing certificate path",
             "2. Generate self-signed certificate (Auto)",
             "3. Generate trusted certificate (ACME)",
-        ],
+        ]
+    )
+    print_menu(
+        "Certificate Options",
+        options,
         color=Colors.CYAN,
         min_width=54,
     )
-    choice = input_default("Select option [1/2/3]", "1").strip()
+    default_choice = "0" if (allow_keep and has_default_pair) else "1"
+    choice_prompt = "Select option [0/1/2/3]" if (allow_keep and has_default_pair) else "Select option [1/2/3]"
+    choice = input_default(choice_prompt, default_choice).strip()
+    if choice == "0" and allow_keep and has_default_pair:
+        return default_cert, default_key
     if choice == "3":
         return generate_trusted_cert_acme()
     if choice == "2":
-        domain = input_default("Enter domain for certificate", "www.bing.com")
-        return generate_self_signed_cert(domain)
-    cert = input_required("Certificate Path")
-    key = input_required("Private Key Path")
+        domain = input_default("Common Name (CN) for certificate", "www.bing.com").strip()
+        cert_name = input_default(
+            "Certificate file name prefix (selfsigned-<name>.*)",
+            cert_base_name(domain),
+        ).strip()
+        return generate_self_signed_cert(domain, cert_name)
+    cert = input_default("Certificate Path", default_cert or "").strip()
+    while not cert:
+        print_error("Certificate path is required.")
+        cert = input_default("Certificate Path", default_cert or "").strip()
+    key = input_default("Private Key Path", default_key or "").strip()
+    while not key:
+        print_error("Private key path is required.")
+        key = input_default("Private Key Path", default_key or "").strip()
     return cert, key
 
 
@@ -1852,24 +1899,22 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
             path = normalize_path(input_default(path_label, seed_path), path_default)
         else:
             path = seed_path
+        if ep_type in {"httpmimicry", "httpsmimicry"}:
+            defaults["mimicry_transport_mode"] = prompt_mimicry_transport_mode(
+                defaults.get("mimicry_transport_mode", "websocket"),
+                allow_http3=(ep_type == "httpsmimicry"),
+            )
 
         tls_cfg = empty_tls_config()
         if endpoint_uses_tls(ep_type):
             if role == "server":
                 cert_default = str(defaults.get("cert", "")).strip()
                 key_default = str(defaults.get("key", "")).strip()
-                while True:
-                    tls_cfg["cert_file"] = input_default(
-                        "TLS cert_file for this endpoint",
-                        cert_default,
-                    ).strip()
-                    tls_cfg["key_file"] = input_default(
-                        "TLS key_file for this endpoint",
-                        key_default,
-                    ).strip()
-                    if tls_cfg["cert_file"] and tls_cfg["key_file"]:
-                        break
-                    print_error("cert_file and key_file are required for server-side TLS endpoints.")
+                tls_cfg["cert_file"], tls_cfg["key_file"] = ask_cert_options(
+                    default_cert=cert_default,
+                    default_key=key_default,
+                    allow_keep=bool(cert_default and key_default),
+                )
                 tls_cfg["ca_file"] = input_default(
                     "TLS client CA file (optional)",
                     "",
