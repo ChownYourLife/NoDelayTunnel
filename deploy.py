@@ -854,15 +854,61 @@ def build_iperf_listener_prepare_script(ports):
         return ""
 
     ports_text = " ".join(str(p) for p in clean_ports)
-    return (
-        "set -e; "
-        "if ! command -v iperf3 >/dev/null 2>&1; then echo __NODELAY_IPERF3_MISSING__; exit 127; fi; "
-        f"for p in {ports_text}; do "
-        "pkill -f \"iperf3 -s -p ${p}\" >/dev/null 2>&1 || true; "
-        "iperf3 -s -D -p \"${p}\" >/dev/null 2>&1 || true; "
-        "done; "
-        "echo __NODELAY_IPERF3_READY__"
-    )
+    return f"""
+set -e
+NODELAY_PORTS="{ports_text}"
+
+ensure_iperf3() {{
+  if command -v iperf3 >/dev/null 2>&1; then
+    return 0
+  fi
+
+  INSTALL_CMD=""
+  if command -v apt-get >/dev/null 2>&1; then
+    INSTALL_CMD="apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y iperf3"
+  elif command -v dnf >/dev/null 2>&1; then
+    INSTALL_CMD="dnf install -y iperf3"
+  elif command -v yum >/dev/null 2>&1; then
+    INSTALL_CMD="yum install -y iperf3"
+  elif command -v apk >/dev/null 2>&1; then
+    INSTALL_CMD="apk add --no-cache iperf3"
+  elif command -v pacman >/dev/null 2>&1; then
+    INSTALL_CMD="pacman -Sy --noconfirm iperf3"
+  elif command -v zypper >/dev/null 2>&1; then
+    INSTALL_CMD="zypper --non-interactive install iperf3"
+  else
+    echo __NODELAY_IPERF3_INSTALL_UNSUPPORTED__
+    return 1
+  fi
+
+  if [ "$(id -u)" -eq 0 ]; then
+    sh -lc "$INSTALL_CMD" || return 1
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo -n sh -lc "$INSTALL_CMD" || return 1
+  else
+    return 1
+  fi
+
+  command -v iperf3 >/dev/null 2>&1
+}}
+
+if ! ensure_iperf3; then
+  echo __NODELAY_IPERF3_INSTALL_FAILED__
+  exit 127
+fi
+
+if ! command -v iperf3 >/dev/null 2>&1; then
+  echo __NODELAY_IPERF3_MISSING__
+  exit 127
+fi
+
+for p in $NODELAY_PORTS; do
+  pkill -f "iperf3 -s -p ${{p}}" >/dev/null 2>&1 || true
+  iperf3 -s -D -p "${{p}}" >/dev/null 2>&1 || true
+done
+
+echo __NODELAY_IPERF3_READY__
+"""
 
 
 def prepare_remote_iperf_listeners_over_ssh(target, ssh_port, ports, password=""):
@@ -922,6 +968,10 @@ def prepare_remote_iperf_listeners_over_ssh(target, ssh_port, ports, password=""
     output = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
     if result.returncode == 0 and "__NODELAY_IPERF3_READY__" in output:
         return True, output, script
+    if "__NODELAY_IPERF3_INSTALL_UNSUPPORTED__" in output:
+        return False, "could not detect package manager to install iperf3 on remote host", script
+    if "__NODELAY_IPERF3_INSTALL_FAILED__" in output:
+        return False, "failed to install iperf3 on remote host via SSH", script
     if "__NODELAY_IPERF3_MISSING__" in output:
         return False, "iperf3 is not installed on remote host", script
     short = output[:280] + ("..." if len(output) > 280 else "")
@@ -5579,10 +5629,18 @@ def quick_port_discovery_benchmark(default_host=""):
             if not ok:
                 print_info("Run this manually on remote host, then retry:")
                 print(f"\n{script}\n")
-                return None
+                continue_anyway = input_default(
+                    "Continue benchmark anyway? (y/N)",
+                    "n",
+                ).strip().lower()
+                if continue_anyway not in {"y", "yes"}:
+                    return None
         else:
             print_success("Remote listeners prepared.")
 
+    print_info(
+        f"Starting auto discovery against {target_host} with {len(ports)} candidate ports..."
+    )
     ranked = run_auto_port_benchmark(
         target_host=target_host,
         ports=ports,
