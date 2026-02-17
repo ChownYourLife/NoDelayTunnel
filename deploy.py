@@ -3,6 +3,7 @@ import json
 import os
 import random
 import re
+import socket
 import shlex
 import shutil
 import subprocess
@@ -59,6 +60,8 @@ IPERF_TEST_DEFAULT_STREAMS = 8
 IPERF_TEST_MSS = 1300
 # 25 MB/s ~= 200 Mbit/s
 IPERF_TEST_RATE_LIMIT = "200M"
+IPERF_PORT_BENCHMARK_DEFAULT_PORTS = [443, 80, 8443, 2053, 2083, 2096, 9777, 9999, 10443, 15443, 2443, 3333]
+IPERF_PORT_BENCHMARK_MIN_COUNT = 100
 IPERF_GOOD_MBPS = 150.0
 IPERF_EXCELLENT_MBPS = 200.0
 IPERF_POOR_MBPS = 100.0
@@ -739,15 +742,78 @@ def evaluate_connectivity_quality(uplink_mbps, downlink_mbps):
     )
 
 
-def run_direct_connectivity_benchmark(target_host, port, duration, streams):
-    if not ensure_iperf3_installed():
-        return None
+def parse_port_candidates(raw_value):
+    values = []
+    seen = set()
+    parts = [p.strip() for p in str(raw_value or "").split(",") if p.strip()]
+    for part in parts:
+        if "-" in part:
+            left, right = part.split("-", 1)
+            if not left.strip().isdigit() or not right.strip().isdigit():
+                continue
+            a = int(left.strip())
+            b = int(right.strip())
+            if a > b:
+                a, b = b, a
+            a = max(1, a)
+            b = min(65535, b)
+            for p in range(a, b + 1):
+                if p not in seen:
+                    seen.add(p)
+                    values.append(p)
+            continue
+        if not part.isdigit():
+            continue
+        p = int(part)
+        if 1 <= p <= 65535 and p not in seen:
+            seen.add(p)
+            values.append(p)
+    return values
 
-    print_header("🌐 Direct Connectivity Benchmark (iperf3)")
-    print_info(
-        f"Target={target_host}:{port} | Duration={duration}s | Streams={streams} | MSS={IPERF_TEST_MSS} | RateLimit={IPERF_TEST_RATE_LIMIT} | Mode=direct (no tunnel)"
-    )
 
+def ensure_min_random_ports(ports, min_count=IPERF_PORT_BENCHMARK_MIN_COUNT, low=1024, high=65535):
+    unique = []
+    seen = set()
+    for p in ports:
+        try:
+            port = int(p)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= port <= 65535 and port not in seen:
+            seen.add(port)
+            unique.append(port)
+
+    target = max(1, int(min_count))
+    added = 0
+    max_attempts = target * 40
+    attempts = 0
+    while len(unique) < target and attempts < max_attempts:
+        attempts += 1
+        port = random.randint(int(low), int(high))
+        if port in seen:
+            continue
+        seen.add(port)
+        unique.append(port)
+        added += 1
+    return unique, added
+
+
+def can_connect_tcp(host, port, timeout_sec=1.5):
+    try:
+        with socket.create_connection((host, int(port)), timeout=float(timeout_sec)):
+            return True
+    except Exception:
+        return False
+
+
+def compute_port_score(uplink_mbps, downlink_mbps, up_retr, down_retr):
+    floor = min(float(uplink_mbps), float(downlink_mbps))
+    retr_penalty = min((int(up_retr) + int(down_retr)) * 0.03, 80.0)
+    asym_penalty = abs(float(uplink_mbps) - float(downlink_mbps)) * 0.10
+    return floor - retr_penalty - asym_penalty
+
+
+def run_iperf_benchmark_once(target_host, port, duration, streams):
     base_cmd = [
         "iperf3",
         "-c",
@@ -765,32 +831,55 @@ def run_direct_connectivity_benchmark(target_host, port, duration, streams):
         "-J",
     ]
 
-    print_info("Running downlink test (remote -> local)...")
     down_payload, down_err = run_iperf3_json(base_cmd + ["-R"])
     if down_payload is None:
-        print_error(f"Downlink test failed: {down_err}")
-        print_info(
-            "Ensure remote iperf3 server is running: `iperf3 -s -p "
-            f"{port}`"
-        )
-        return None
+        return None, f"downlink failed: {down_err}"
 
-    print_info("Running uplink test (local -> remote)...")
     up_payload, up_err = run_iperf3_json(base_cmd)
     if up_payload is None:
-        print_error(f"Uplink test failed: {up_err}")
-        print_info(
-            "Ensure remote iperf3 server is running: `iperf3 -s -p "
-            f"{port}`"
-        )
-        return None
+        return None, f"uplink failed: {up_err}"
 
     down = extract_iperf_summary(down_payload)
     up = extract_iperf_summary(up_payload)
     down_mbps = down["effective_mbps"]
     up_mbps = up["effective_mbps"]
-
+    score = compute_port_score(up_mbps, down_mbps, up["retransmits"], down["retransmits"])
     quality, verdict = evaluate_connectivity_quality(up_mbps, down_mbps)
+    return {
+        "port": int(port),
+        "downlink_mbps": float(down_mbps),
+        "uplink_mbps": float(up_mbps),
+        "up_retransmits": int(up["retransmits"]),
+        "down_retransmits": int(down["retransmits"]),
+        "score": float(score),
+        "quality": quality,
+        "verdict": verdict,
+    }, ""
+
+
+def run_direct_connectivity_benchmark(target_host, port, duration, streams):
+    if not ensure_iperf3_installed():
+        return None
+
+    print_header("🌐 Direct Connectivity Benchmark (iperf3)")
+    print_info(
+        f"Target={target_host}:{port} | Duration={duration}s | Streams={streams} | MSS={IPERF_TEST_MSS} | RateLimit={IPERF_TEST_RATE_LIMIT} | Mode=direct (no tunnel)"
+    )
+
+    print_info("Running downlink/uplink tests...")
+    result, err = run_iperf_benchmark_once(target_host, int(port), int(duration), int(streams))
+    if result is None:
+        print_error(f"Benchmark failed: {err}")
+        print_info(
+            "Ensure remote iperf3 server is running: `iperf3 -s -p "
+            f"{port}`"
+        )
+        return None
+
+    down_mbps = result["downlink_mbps"]
+    up_mbps = result["uplink_mbps"]
+    quality = result["quality"]
+    verdict = result["verdict"]
     quality_label = {
         "excellent": f"{Colors.GREEN}excellent{Colors.ENDC}",
         "good": f"{Colors.GREEN}good{Colors.ENDC}",
@@ -803,15 +892,88 @@ def run_direct_connectivity_benchmark(target_host, port, duration, streams):
     print(f"Uplink   (local -> remote): {Colors.BOLD}{up_mbps:.2f} Mbps{Colors.ENDC}")
     print(
         f"Retransmits (uplink/downlink sender): "
-        f"{Colors.BOLD}{up['retransmits']}/{down['retransmits']}{Colors.ENDC}"
+        f"{Colors.BOLD}{result['up_retransmits']}/{result['down_retransmits']}{Colors.ENDC}"
     )
+    print(f"Score: {Colors.BOLD}{result['score']:.2f}{Colors.ENDC}")
     print(f"Quality: {quality_label}")
     print_info(verdict)
     return {
         "downlink_mbps": down_mbps,
         "uplink_mbps": up_mbps,
         "quality": quality,
+        "score": result["score"],
     }
+
+
+def run_auto_port_benchmark(target_host, ports, duration, streams, top_n=5):
+    if not ensure_iperf3_installed():
+        return []
+
+    candidates = []
+    seen = set()
+    for p in ports:
+        try:
+            port = int(p)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= port <= 65535 and port not in seen:
+            seen.add(port)
+            candidates.append(port)
+
+    if not candidates:
+        print_error("No valid candidate ports to test.")
+        return []
+
+    print_header("🧪 Auto Port Benchmark")
+    print_info(
+        f"Target={target_host} | CandidatePorts={len(candidates)} | Duration={duration}s | Streams={streams} | MSS={IPERF_TEST_MSS} | RateLimit={IPERF_TEST_RATE_LIMIT}"
+    )
+    print_info("Ports with closed TCP handshake are skipped quickly.")
+
+    results = []
+    failed = 0
+    skipped = 0
+    total = len(candidates)
+
+    for idx, port in enumerate(candidates, start=1):
+        print_info(f"[{idx}/{total}] probing port {port} ...")
+        if not can_connect_tcp(target_host, port, timeout_sec=1.5):
+            skipped += 1
+            print_info(f"port {port}: TCP connect failed (skipped)")
+            continue
+
+        result, err = run_iperf_benchmark_once(target_host, port, duration, streams)
+        if result is None:
+            failed += 1
+            print_error(f"port {port}: {err}")
+            continue
+
+        results.append(result)
+        print_success(
+            f"port {port}: up={result['uplink_mbps']:.2f} Mbps down={result['downlink_mbps']:.2f} Mbps score={result['score']:.2f}"
+        )
+
+    print_header("📊 Port Benchmark Summary")
+    print(
+        f"Tested={total} | Successful={len(results)} | Failed={failed} | Skipped(connect)={skipped}"
+    )
+    if not results:
+        print_error("No successful benchmark results. Verify remote iperf3 listeners and firewall.")
+        return []
+
+    ranked = sorted(
+        results,
+        key=lambda x: (x.get("score", -10**9), min(x.get("uplink_mbps", 0), x.get("downlink_mbps", 0))),
+        reverse=True,
+    )
+    top_n = max(1, min(int(top_n), len(ranked)))
+    print_info(f"Top {top_n} recommended port(s):")
+    for i, row in enumerate(ranked[:top_n], start=1):
+        floor = min(row["uplink_mbps"], row["downlink_mbps"])
+        print(
+            f"{i}. port={row['port']} | floor={floor:.2f} Mbps | up={row['uplink_mbps']:.2f} | down={row['downlink_mbps']:.2f} | retr={row['up_retransmits']}/{row['down_retransmits']} | score={row['score']:.2f} | quality={row['quality']}"
+        )
+    return ranked
 
 
 def direct_connectivity_test_menu(default_host=""):
@@ -821,6 +983,7 @@ def direct_connectivity_test_menu(default_host=""):
             [
                 "1. Start iperf3 server mode on this node",
                 "2. Run client benchmark to remote node",
+                "3. Auto benchmark candidate ports and rank best ports",
                 "0. Back",
             ],
             color=Colors.CYAN,
@@ -863,6 +1026,56 @@ def direct_connectivity_test_menu(default_host=""):
             if streams < 1:
                 streams = 1
             run_direct_connectivity_benchmark(target_host, int(port), int(duration), int(streams))
+            input("\nPress Enter to continue...")
+            continue
+        if choice == "3":
+            host_seed = default_host or "1.2.3.4"
+            target_host = input_default("Remote server host/IP", host_seed).strip()
+            while not target_host:
+                print_error("Remote host is required.")
+                target_host = input_default("Remote server host/IP", host_seed).strip()
+
+            default_ports = ",".join(str(p) for p in IPERF_PORT_BENCHMARK_DEFAULT_PORTS)
+            raw_ports = input_default(
+                "Candidate ports (comma-separated, supports ranges like 2000-2010)",
+                default_ports,
+            ).strip()
+            ports = parse_port_candidates(raw_ports)
+            ports, random_added = ensure_min_random_ports(
+                ports,
+                min_count=IPERF_PORT_BENCHMARK_MIN_COUNT,
+            )
+            if random_added > 0:
+                print_info(
+                    f"Added {random_added} random ports to reach minimum {IPERF_PORT_BENCHMARK_MIN_COUNT} candidate ports."
+                )
+            if len(ports) < IPERF_PORT_BENCHMARK_MIN_COUNT:
+                print_error(
+                    f"Could not build enough candidate ports (got {len(ports)}, need at least {IPERF_PORT_BENCHMARK_MIN_COUNT})."
+                )
+                input("\nPress Enter to continue...")
+                continue
+
+            duration = prompt_int("Test duration per port (seconds)", max(4, min(IPERF_TEST_DEFAULT_DURATION, 8)))
+            if duration < 3:
+                duration = 3
+            streams = prompt_int("Parallel streams", max(1, min(IPERF_TEST_DEFAULT_STREAMS, 4)))
+            if streams < 1:
+                streams = 1
+            top_n = prompt_int("Show top N ports", 5)
+            if top_n < 1:
+                top_n = 1
+
+            print_info(
+                "Note: remote side must have iperf3 listener on the tested port(s), otherwise those ports will fail/skip."
+            )
+            run_auto_port_benchmark(
+                target_host=target_host,
+                ports=ports,
+                duration=int(duration),
+                streams=int(streams),
+                top_n=int(top_n),
+            )
             input("\nPress Enter to continue...")
             continue
         print_error("Invalid choice.")
