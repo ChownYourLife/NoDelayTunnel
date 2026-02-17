@@ -62,6 +62,7 @@ IPERF_TEST_MSS = 1300
 IPERF_TEST_RATE_LIMIT = "200M"
 IPERF_PORT_BENCHMARK_DEFAULT_PORTS = [443, 80, 8443, 2053, 2083, 2096, 9777, 9999, 10443, 15443, 2443, 3333]
 IPERF_PORT_BENCHMARK_MIN_COUNT = 100
+IPERF_SSH_CONNECT_TIMEOUT = 8
 IPERF_GOOD_MBPS = 150.0
 IPERF_EXCELLENT_MBPS = 200.0
 IPERF_POOR_MBPS = 100.0
@@ -798,6 +799,105 @@ def ensure_min_random_ports(ports, min_count=IPERF_PORT_BENCHMARK_MIN_COUNT, low
     return unique, added
 
 
+def build_iperf_listener_prepare_script(ports):
+    clean_ports = []
+    seen = set()
+    for p in ports:
+        try:
+            port = int(p)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= port <= 65535 and port not in seen:
+            seen.add(port)
+            clean_ports.append(port)
+
+    if not clean_ports:
+        return ""
+
+    ports_text = " ".join(str(p) for p in clean_ports)
+    return (
+        "set -e; "
+        "if ! command -v iperf3 >/dev/null 2>&1; then echo __NODELAY_IPERF3_MISSING__; exit 127; fi; "
+        f"for p in {ports_text}; do "
+        "pkill -f \"iperf3 -s -p ${p}\" >/dev/null 2>&1 || true; "
+        "iperf3 -s -D -p \"${p}\" >/dev/null 2>&1 || true; "
+        "done; "
+        "echo __NODELAY_IPERF3_READY__"
+    )
+
+
+def prepare_remote_iperf_listeners_over_ssh(target, ssh_port, ports):
+    script = build_iperf_listener_prepare_script(ports)
+    if not script:
+        return False, "no valid ports", ""
+    args = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        f"ConnectTimeout={IPERF_SSH_CONNECT_TIMEOUT}",
+        "-p",
+        str(int(ssh_port)),
+        str(target).strip(),
+        "bash",
+        "-lc",
+        script,
+    ]
+    try:
+        result = subprocess.run(args, check=False, text=True, capture_output=True)
+    except Exception as exc:
+        return False, str(exc), script
+
+    output = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+    if result.returncode == 0 and "__NODELAY_IPERF3_READY__" in output:
+        return True, output, script
+    if "__NODELAY_IPERF3_MISSING__" in output:
+        return False, "iperf3 is not installed on remote host", script
+    short = output[:280] + ("..." if len(output) > 280 else "")
+    if not short:
+        short = f"ssh exited with code {result.returncode}"
+    return False, short, script
+
+
+def start_local_iperf_listeners_daemon(ports):
+    if not ensure_iperf3_installed():
+        return 0, 0
+    started = 0
+    failed = 0
+    for p in ports:
+        try:
+            port = int(p)
+        except (TypeError, ValueError):
+            continue
+        if port < 1 or port > 65535:
+            continue
+        patt = shlex.quote(f"iperf3 -s -p {port}")
+        _ = run_command(f"pkill -f {patt}", check=False)
+        ok = run_args_stream(["iperf3", "-s", "-D", "-p", str(port)])
+        if ok:
+            started += 1
+        else:
+            failed += 1
+    return started, failed
+
+
+def stop_local_iperf_listeners_daemon(ports):
+    stopped = 0
+    for p in ports:
+        try:
+            port = int(p)
+        except (TypeError, ValueError):
+            continue
+        if port < 1 or port > 65535:
+            continue
+        patt = shlex.quote(f"iperf3 -s -p {port}")
+        if run_command(f"pkill -f {patt}", check=False):
+            stopped += 1
+    return stopped
+
+
 def can_connect_tcp(host, port, timeout_sec=1.5):
     try:
         with socket.create_connection((host, int(port)), timeout=float(timeout_sec)):
@@ -984,6 +1084,8 @@ def direct_connectivity_test_menu(default_host=""):
                 "1. Start iperf3 server mode on this node",
                 "2. Run client benchmark to remote node",
                 "3. Auto benchmark candidate ports and rank best ports",
+                "4. Start multi-port iperf3 listeners on this node (daemon)",
+                "5. Stop multi-port iperf3 listeners on this node",
                 "0. Back",
             ],
             color=Colors.CYAN,
@@ -1066,9 +1168,41 @@ def direct_connectivity_test_menu(default_host=""):
             if top_n < 1:
                 top_n = 1
 
-            print_info(
-                "Note: remote side must have iperf3 listener on the tested port(s), otherwise those ports will fail/skip."
-            )
+            remote_prepare = input_default(
+                "Auto-start remote iperf3 listeners over SSH before benchmark? (Y/n)",
+                "y",
+            ).strip().lower()
+            if remote_prepare in {"", "y", "yes"}:
+                ssh_user = input_default("Remote SSH user", "root").strip() or "root"
+                ssh_port = prompt_int("Remote SSH port", 22)
+                if ssh_port < 1 or ssh_port > 65535:
+                    ssh_port = 22
+                ssh_target = f"{ssh_user}@{target_host}"
+                print_info(
+                    f"Preparing remote listeners via SSH on {ssh_target}:{ssh_port} for {len(ports)} ports..."
+                )
+                ok, details, script = prepare_remote_iperf_listeners_over_ssh(ssh_target, ssh_port, ports)
+                if ok:
+                    print_success("Remote listeners prepared successfully.")
+                else:
+                    print_error(f"Remote listener auto-prepare failed: {details}")
+                    print_info("Run this command manually on the remote host, then retry benchmark:")
+                    print(f"\n{script}\n")
+                    continue_anyway = input_default("Continue benchmark anyway? (y/N)", "n").strip().lower()
+                    if continue_anyway not in {"y", "yes"}:
+                        input("\nPress Enter to continue...")
+                        continue
+            else:
+                script = build_iperf_listener_prepare_script(ports)
+                print_info(
+                    "Run this command on remote host first to listen on all tested ports:"
+                )
+                print(f"\n{script}\n")
+                ready = input_default("Start benchmark now? (y/N)", "n").strip().lower()
+                if ready not in {"y", "yes"}:
+                    input("\nPress Enter to continue...")
+                    continue
+
             run_auto_port_benchmark(
                 target_host=target_host,
                 ports=ports,
@@ -1076,6 +1210,40 @@ def direct_connectivity_test_menu(default_host=""):
                 streams=int(streams),
                 top_n=int(top_n),
             )
+            input("\nPress Enter to continue...")
+            continue
+        if choice == "4":
+            default_ports = ",".join(str(p) for p in IPERF_PORT_BENCHMARK_DEFAULT_PORTS)
+            raw_ports = input_default(
+                "Ports to listen on (comma-separated, supports ranges like 2000-2010)",
+                default_ports,
+            ).strip()
+            ports = parse_port_candidates(raw_ports)
+            ports, random_added = ensure_min_random_ports(
+                ports,
+                min_count=IPERF_PORT_BENCHMARK_MIN_COUNT,
+            )
+            if random_added > 0:
+                print_info(
+                    f"Added {random_added} random ports to reach minimum {IPERF_PORT_BENCHMARK_MIN_COUNT} listener ports."
+                )
+            started, failed = start_local_iperf_listeners_daemon(ports)
+            print_info(f"Listener setup complete: started={started} failed={failed}")
+            input("\nPress Enter to continue...")
+            continue
+        if choice == "5":
+            default_ports = ",".join(str(p) for p in IPERF_PORT_BENCHMARK_DEFAULT_PORTS)
+            raw_ports = input_default(
+                "Ports to stop (comma-separated, supports ranges like 2000-2010)",
+                default_ports,
+            ).strip()
+            ports = parse_port_candidates(raw_ports)
+            if not ports:
+                print_error("No valid ports were parsed.")
+                input("\nPress Enter to continue...")
+                continue
+            stopped = stop_local_iperf_listeners_daemon(ports)
+            print_info(f"Stop request sent for {stopped} port listeners.")
             input("\nPress Enter to continue...")
             continue
         print_error("Invalid choice.")
@@ -1848,6 +2016,12 @@ def prompt_server_mappings(
 
         bind = f"0.0.0.0:{bind_port}"
         target = f"127.0.0.1:{target_port}"
+        route = ""
+        if mode == "reverse":
+            route = input_default(
+                "Route selector (optional, pin this mapping to one client source IP/CIDR, e.g. 45.67.139.95 or 45.67.139.0/24)",
+                "",
+            ).strip()
 
         mappings.append(
             {
@@ -1856,6 +2030,7 @@ def prompt_server_mappings(
                 "protocol": protocol,
                 "bind": bind,
                 "target": target,
+                "route": route,
             }
         )
 
@@ -2988,6 +3163,7 @@ def load_instance_runtime_settings(role, instance):
                     "protocol": str(m.get("protocol", "tcp")),
                     "bind": str(m.get("bind", "0.0.0.0:2200")),
                     "target": str(m.get("target", "127.0.0.1:22")),
+                    "route": str(m.get("route", "")),
                 }
             )
         protocol_cfg["mappings"] = cleaned_mappings
@@ -3083,6 +3259,7 @@ def load_instance_runtime_settings(role, instance):
                     "protocol": str(m.get("protocol", "tcp")),
                     "bind": str(m.get("bind", "0.0.0.0:2200")),
                     "target": str(m.get("target", "127.0.0.1:22")),
+                    "route": str(m.get("route", "")),
                 }
             )
         protocol_cfg["mappings"] = cleaned_mappings
@@ -3378,6 +3555,9 @@ def render_mappings_lines(mappings):
         lines.append(f"      protocol: {yaml_scalar(item['protocol'])}")
         lines.append(f"      bind: {yaml_scalar(item['bind'])}")
         lines.append(f"      target: {yaml_scalar(item['target'])}")
+        route = str(item.get("route", "")).strip()
+        if route:
+            lines.append(f"      route: {yaml_scalar(route)}")
     return lines
 
 
