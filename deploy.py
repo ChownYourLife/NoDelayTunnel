@@ -57,6 +57,8 @@ IPERF_TEST_DEFAULT_DURATION = 8
 IPERF_TEST_DEFAULT_STREAMS = 8
 # iperf3 controls TCP segment size via MSS; set to 1300 for tunnel-path testing.
 IPERF_TEST_MSS = 1300
+# 25 MB/s ~= 200 Mbit/s
+IPERF_TEST_RATE_LIMIT = "200M"
 IPERF_GOOD_MBPS = 150.0
 IPERF_EXCELLENT_MBPS = 200.0
 IPERF_POOR_MBPS = 100.0
@@ -743,7 +745,7 @@ def run_direct_connectivity_benchmark(target_host, port, duration, streams):
 
     print_header("🌐 Direct Connectivity Benchmark (iperf3)")
     print_info(
-        f"Target={target_host}:{port} | Duration={duration}s | Streams={streams} | MSS={IPERF_TEST_MSS} | Mode=direct (no tunnel)"
+        f"Target={target_host}:{port} | Duration={duration}s | Streams={streams} | MSS={IPERF_TEST_MSS} | RateLimit={IPERF_TEST_RATE_LIMIT} | Mode=direct (no tunnel)"
     )
 
     base_cmd = [
@@ -758,6 +760,8 @@ def run_direct_connectivity_benchmark(target_host, port, duration, streams):
         str(streams),
         "-M",
         str(IPERF_TEST_MSS),
+        "-b",
+        str(IPERF_TEST_RATE_LIMIT),
         "-J",
     ]
 
@@ -4008,6 +4012,8 @@ KillSignal=SIGTERM
 FinalKillSignal=SIGKILL
 SendSIGKILL=yes
 LimitNOFILE=infinity
+LogRateLimitIntervalSec=1h
+LogRateLimitBurst=5000
 
 [Install]
 WantedBy=multi-user.target
