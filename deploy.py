@@ -4,6 +4,7 @@ import os
 import random
 import re
 import socket
+import getpass
 import shlex
 import shutil
 import subprocess
@@ -684,6 +685,44 @@ def ensure_iperf3_installed():
     return True
 
 
+def ensure_sshpass_installed():
+    if shutil.which("sshpass"):
+        return True
+
+    print_info("sshpass is not installed. Attempting automatic installation...")
+    installers = []
+    if shutil.which("apt-get"):
+        installers = [
+            "apt-get update",
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y sshpass",
+        ]
+    elif shutil.which("dnf"):
+        installers = ["dnf install -y sshpass"]
+    elif shutil.which("yum"):
+        installers = ["yum install -y sshpass"]
+    elif shutil.which("apk"):
+        installers = ["apk add --no-cache sshpass"]
+    elif shutil.which("pacman"):
+        installers = ["pacman -Sy --noconfirm sshpass"]
+    elif shutil.which("zypper"):
+        installers = ["zypper --non-interactive install sshpass"]
+
+    if not installers:
+        print_error("Could not detect package manager. Please install sshpass manually.")
+        return False
+
+    for cmd in installers:
+        if not run_command_stream(cmd):
+            print_error(f"Installation command failed: {cmd}")
+            return False
+
+    if not shutil.which("sshpass"):
+        print_error("sshpass installation finished but binary was not found in PATH.")
+        return False
+    print_success("sshpass installed successfully.")
+    return True
+
+
 def run_iperf3_json(command_args):
     try:
         result = subprocess.run(command_args, check=False, text=True, capture_output=True)
@@ -826,27 +865,57 @@ def build_iperf_listener_prepare_script(ports):
     )
 
 
-def prepare_remote_iperf_listeners_over_ssh(target, ssh_port, ports):
+def prepare_remote_iperf_listeners_over_ssh(target, ssh_port, ports, password=""):
     script = build_iperf_listener_prepare_script(ports)
     if not script:
         return False, "no valid ports", ""
-    args = [
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-        "-o",
-        f"ConnectTimeout={IPERF_SSH_CONNECT_TIMEOUT}",
-        "-p",
-        str(int(ssh_port)),
-        str(target).strip(),
-        "bash",
-        "-lc",
-        script,
-    ]
+
+    use_password = bool(str(password).strip())
+    env = None
+    if use_password:
+        if not ensure_sshpass_installed():
+            return False, "sshpass is required for password fallback but is unavailable", script
+        env = os.environ.copy()
+        env["SSHPASS"] = str(password)
+        args = [
+            "sshpass",
+            "-e",
+            "ssh",
+            "-o",
+            "BatchMode=no",
+            "-o",
+            "PreferredAuthentications=password",
+            "-o",
+            "PubkeyAuthentication=no",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            f"ConnectTimeout={IPERF_SSH_CONNECT_TIMEOUT}",
+            "-p",
+            str(int(ssh_port)),
+            str(target).strip(),
+            "bash",
+            "-lc",
+            script,
+        ]
+    else:
+        args = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            f"ConnectTimeout={IPERF_SSH_CONNECT_TIMEOUT}",
+            "-p",
+            str(int(ssh_port)),
+            str(target).strip(),
+            "bash",
+            "-lc",
+            script,
+        ]
     try:
-        result = subprocess.run(args, check=False, text=True, capture_output=True)
+        result = subprocess.run(args, check=False, text=True, capture_output=True, env=env)
     except Exception as exc:
         return False, str(exc), script
 
@@ -896,6 +965,26 @@ def stop_local_iperf_listeners_daemon(ports):
         if run_command(f"pkill -f {patt}", check=False):
             stopped += 1
     return stopped
+
+
+def stop_all_local_iperf_processes():
+    pids = set()
+    for name in ("iperf3", "iperf"):
+        rc, out, _ = run_command_output(f"pgrep -x {shlex.quote(name)}")
+        if rc != 0 or not out:
+            continue
+        for line in out.splitlines():
+            pid = line.strip()
+            if pid.isdigit():
+                pids.add(pid)
+
+    if not pids:
+        return 0
+
+    # Best-effort terminate all iperf/iperf3 processes without needing ports.
+    _ = run_command("pkill -9 -x iperf3", check=False)
+    _ = run_command("pkill -9 -x iperf", check=False)
+    return len(pids)
 
 
 def can_connect_tcp(host, port, timeout_sec=1.5):
@@ -1086,6 +1175,7 @@ def direct_connectivity_test_menu(default_host=""):
                 "3. Auto benchmark candidate ports and rank best ports",
                 "4. Start multi-port iperf3 listeners on this node (daemon)",
                 "5. Stop multi-port iperf3 listeners on this node",
+                "6. Stop ALL local iperf/iperf3 processes (no port needed)",
                 "0. Back",
             ],
             color=Colors.CYAN,
@@ -1185,13 +1275,37 @@ def direct_connectivity_test_menu(default_host=""):
                 if ok:
                     print_success("Remote listeners prepared successfully.")
                 else:
-                    print_error(f"Remote listener auto-prepare failed: {details}")
-                    print_info("Run this command manually on the remote host, then retry benchmark:")
-                    print(f"\n{script}\n")
-                    continue_anyway = input_default("Continue benchmark anyway? (y/N)", "n").strip().lower()
-                    if continue_anyway not in {"y", "yes"}:
-                        input("\nPress Enter to continue...")
-                        continue
+                    print_error(f"Remote listener auto-prepare (key auth) failed: {details}")
+                    try_password = input_default(
+                        "Try SSH password fallback? (Y/n)",
+                        "y",
+                    ).strip().lower()
+                    if try_password in {"", "y", "yes"}:
+                        remote_password = getpass.getpass("Remote SSH password: ").strip()
+                        if not remote_password:
+                            print_error("Password is empty.")
+                        else:
+                            ok_pw, details_pw, script = prepare_remote_iperf_listeners_over_ssh(
+                                ssh_target,
+                                ssh_port,
+                                ports,
+                                password=remote_password,
+                            )
+                            # Best-effort clear reference.
+                            remote_password = ""
+                            if ok_pw:
+                                print_success("Remote listeners prepared successfully (password fallback).")
+                                ok = True
+                            else:
+                                print_error(f"Remote listener auto-prepare (password fallback) failed: {details_pw}")
+
+                    if not ok:
+                        print_info("Run this command manually on the remote host, then retry benchmark:")
+                        print(f"\n{script}\n")
+                        continue_anyway = input_default("Continue benchmark anyway? (y/N)", "n").strip().lower()
+                        if continue_anyway not in {"y", "yes"}:
+                            input("\nPress Enter to continue...")
+                            continue
             else:
                 script = build_iperf_listener_prepare_script(ports)
                 print_info(
@@ -1244,6 +1358,21 @@ def direct_connectivity_test_menu(default_host=""):
                 continue
             stopped = stop_local_iperf_listeners_daemon(ports)
             print_info(f"Stop request sent for {stopped} port listeners.")
+            input("\nPress Enter to continue...")
+            continue
+        if choice == "6":
+            confirm = input_default(
+                "This will kill all local iperf/iperf3 processes. Continue? (y/N)",
+                "n",
+            ).strip().lower()
+            if confirm not in {"y", "yes"}:
+                input("\nPress Enter to continue...")
+                continue
+            killed = stop_all_local_iperf_processes()
+            if killed <= 0:
+                print_info("No local iperf/iperf3 processes were running.")
+            else:
+                print_success(f"Stopped {killed} local iperf/iperf3 process(es).")
             input("\nPress Enter to continue...")
             continue
         print_error("Invalid choice.")
