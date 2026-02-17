@@ -1166,6 +1166,7 @@ def run_auto_port_benchmark(target_host, ports, duration, streams, top_n=5):
 
 
 def direct_connectivity_test_menu(default_host=""):
+    selection = {"best_port": None, "ranked_ports": []}
     while True:
         print_menu(
             "🌐 Direct Connectivity Test (iperf3)",
@@ -1183,7 +1184,7 @@ def direct_connectivity_test_menu(default_host=""):
         )
         choice = input("Select option: ").strip()
         if choice == "0":
-            return
+            return selection
         if choice == "1":
             if not ensure_iperf3_installed():
                 input("\nPress Enter to continue...")
@@ -1317,13 +1318,22 @@ def direct_connectivity_test_menu(default_host=""):
                     input("\nPress Enter to continue...")
                     continue
 
-            run_auto_port_benchmark(
+            ranked = run_auto_port_benchmark(
                 target_host=target_host,
                 ports=ports,
                 duration=int(duration),
                 streams=int(streams),
                 top_n=int(top_n),
             )
+            if ranked:
+                selection["ranked_ports"] = [int(row.get("port", 0)) for row in ranked if int(row.get("port", 0)) > 0]
+                pick = input_default(
+                    "Use top ranked port as selected tunnel port for next step? (Y/n)",
+                    "y",
+                ).strip().lower()
+                if pick in {"", "y", "yes"}:
+                    selection["best_port"] = int(ranked[0]["port"])
+                    print_success(f"Selected best port: {selection['best_port']}")
             input("\nPress Enter to continue...")
             continue
         if choice == "4":
@@ -2239,6 +2249,34 @@ def normalize_connection_strategy(value, default="parallel"):
     return default
 
 
+def normalize_port_hopping_mode(value, default="spread"):
+    raw = str(value or "").strip().lower()
+    if raw in {"spread", "switch"}:
+        return raw
+    return default
+
+
+def prompt_port_hopping_mode(default="spread"):
+    normalized_default = normalize_port_hopping_mode(default, "spread")
+    default_choice = "2" if normalized_default == "switch" else "1"
+    print_menu(
+        "🔁 Port Hopping Mode",
+        [
+            f"{Colors.GREEN}[1]{Colors.ENDC} spread (use multiple ports in parallel)",
+            f"{Colors.GREEN}[2]{Colors.ENDC} switch (prefer ordered/failover style)",
+        ],
+        color=Colors.CYAN,
+        min_width=62,
+    )
+    while True:
+        choice = input_default("Mode [1-2]", default_choice).strip()
+        if choice == "1":
+            return "spread"
+        if choice == "2":
+            return "switch"
+        print_error("Invalid choice. Pick 1 or 2.")
+
+
 def prompt_connection_strategy(default="parallel"):
     normalized_default = normalize_connection_strategy(default, "parallel")
     default_choice = "2" if normalized_default == "priority" else "1"
@@ -2622,6 +2660,42 @@ def normalize_network_mtu(value, default=0):
     return mtu
 
 
+def normalize_port_hopping_settings(value, default_mode="spread"):
+    cfg = value if isinstance(value, dict) else {}
+    enabled = parse_bool(cfg.get("enabled", False), False)
+
+    try:
+        start_port = int(cfg.get("start_port", 10000))
+    except (TypeError, ValueError):
+        start_port = 10000
+    try:
+        end_port = int(cfg.get("end_port", 10100))
+    except (TypeError, ValueError):
+        end_port = 10100
+    try:
+        count = int(cfg.get("count", 0))
+    except (TypeError, ValueError):
+        count = 0
+
+    start_port = max(1, min(65535, start_port))
+    end_port = max(1, min(65535, end_port))
+    if end_port < start_port:
+        end_port = start_port
+    if count < 0:
+        count = 0
+    if count > 2048:
+        count = 2048
+
+    mode = normalize_port_hopping_mode(cfg.get("mode", default_mode), default_mode)
+    return {
+        "enabled": enabled,
+        "start_port": start_port,
+        "end_port": end_port,
+        "count": count,
+        "mode": mode,
+    }
+
+
 def prompt_network_mtu(default=0):
     normalized_default = normalize_network_mtu(default, 0)
     while True:
@@ -2740,6 +2814,11 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
         "mimicry_transport_mode": "websocket",
         "pool_size": 3,
         "connection_strategy": "parallel",
+        "port_hopping_enabled": False,
+        "port_hopping_start_port": 10000,
+        "port_hopping_end_port": 10100,
+        "port_hopping_count": 0,
+        "port_hopping_mode": "spread",
         "additional_endpoints": [],
         "cert": "",
         "key": "",
@@ -2771,6 +2850,23 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
             "PSK (shared secret, leave empty to disable)",
             config.get("psk") or generate_uuid(),
         )
+        enable_hopping_default = bool(config.get("port_hopping_enabled", False))
+        enable_hopping = input_default(
+            "Enable tunnel port hopping (multi-port listen)? (y/N)",
+            "y" if enable_hopping_default else "n",
+        ).strip().lower()
+        config["port_hopping_enabled"] = enable_hopping in {"y", "yes"}
+        if config["port_hopping_enabled"]:
+            start_default = int(config.get("port_hopping_start_port", 10000) or 10000)
+            end_default = int(config.get("port_hopping_end_port", 10100) or 10100)
+            count_default = int(config.get("port_hopping_count", 0) or 0)
+            config["port_hopping_start_port"] = prompt_int("Port hopping start_port", start_default)
+            config["port_hopping_end_port"] = prompt_int("Port hopping end_port", end_default)
+            config["port_hopping_count"] = prompt_int(
+                "Port hopping count (0 = full range)",
+                count_default,
+            )
+            config["port_hopping_mode"] = "spread"
     else:
         while True:
             config["psk"] = input_default(
@@ -2797,6 +2893,28 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
         config["connection_strategy"] = prompt_connection_strategy(
             config.get("connection_strategy", "parallel")
         )
+        enable_hopping_default = bool(config.get("port_hopping_enabled", False))
+        enable_hopping = input_default(
+            "Enable tunnel port hopping (multi-port upstream)? (y/N)",
+            "y" if enable_hopping_default else "n",
+        ).strip().lower()
+        config["port_hopping_enabled"] = enable_hopping in {"y", "yes"}
+        if config["port_hopping_enabled"]:
+            start_default = int(config.get("port_hopping_start_port", 10000) or 10000)
+            end_default = int(config.get("port_hopping_end_port", 10100) or 10100)
+            count_default = int(config.get("port_hopping_count", 0) or 0)
+            config["port_hopping_start_port"] = prompt_int("Port hopping start_port", start_default)
+            config["port_hopping_end_port"] = prompt_int("Port hopping end_port", end_default)
+            config["port_hopping_count"] = prompt_int(
+                "Port hopping count (0 = full range)",
+                count_default,
+            )
+            mode_default = normalize_port_hopping_mode(config.get("port_hopping_mode", "spread"), "spread")
+            config["port_hopping_mode"] = prompt_port_hopping_mode(mode_default)
+            if config["port_hopping_mode"] == "spread":
+                config["connection_strategy"] = "parallel"
+            else:
+                config["connection_strategy"] = "priority"
 
     if choice == "1":
         config["type"] = "tcp"
@@ -3212,6 +3330,10 @@ def load_instance_runtime_settings(role, instance):
 
     if role == "server":
         server_cfg = parsed.get("server", {}) if isinstance(parsed.get("server"), dict) else {}
+        port_hopping_cfg = normalize_port_hopping_settings(
+            server_cfg.get("port_hopping", {}),
+            "spread",
+        )
         listen = server_cfg.get("listen", {}) if isinstance(server_cfg.get("listen"), dict) else {}
         listens = server_cfg.get("listens", [])
         if not isinstance(listens, list):
@@ -3273,6 +3395,11 @@ def load_instance_runtime_settings(role, instance):
             "reality_key_generated": False,
             "license": license_id,
             "profile": profile,
+            "port_hopping_enabled": bool(port_hopping_cfg["enabled"]),
+            "port_hopping_start_port": int(port_hopping_cfg["start_port"]),
+            "port_hopping_end_port": int(port_hopping_cfg["end_port"]),
+            "port_hopping_count": int(port_hopping_cfg["count"]),
+            "port_hopping_mode": str(port_hopping_cfg["mode"]),
         }
         mappings = (
             server_cfg.get("mappings", [])
@@ -3298,6 +3425,10 @@ def load_instance_runtime_settings(role, instance):
         protocol_cfg["mappings"] = cleaned_mappings
     else:
         client = parsed.get("client", {}) if isinstance(parsed.get("client"), dict) else {}
+        port_hopping_cfg = normalize_port_hopping_settings(
+            client.get("port_hopping", {}),
+            "spread",
+        )
         server_ep = client.get("server", {}) if isinstance(client.get("server"), dict) else {}
         servers = client.get("servers", [])
         if not isinstance(servers, list):
@@ -3344,16 +3475,22 @@ def load_instance_runtime_settings(role, instance):
             pool_size = 3
         if pool_size < 1:
             pool_size = 1
+        connection_strategy = normalize_connection_strategy(
+            client.get("connection_strategy", "parallel"),
+            "parallel",
+        )
+        if port_hopping_cfg["enabled"]:
+            if port_hopping_cfg["mode"] == "switch":
+                connection_strategy = "priority"
+            else:
+                connection_strategy = "parallel"
         protocol_cfg = {
             "type": str(primary_server.get("type", "tcp")),
             "tunnel_mode": tunnel_mode,
             "port": parse_port_from_address(primary_addr, 8443),
             "server_addr": parse_host_from_address(primary_addr, "127.0.0.1"),
             "pool_size": pool_size,
-            "connection_strategy": normalize_connection_strategy(
-                client.get("connection_strategy", "parallel"),
-                "parallel",
-            ),
+            "connection_strategy": connection_strategy,
             "path": str(primary_server.get("path", "/tunnel")),
             "network_mtu": network_mtu,
             "mimicry_preset_region": mimicry_preset_region,
@@ -3373,6 +3510,11 @@ def load_instance_runtime_settings(role, instance):
             "reality_key_generated": False,
             "license": license_id,
             "profile": profile,
+            "port_hopping_enabled": bool(port_hopping_cfg["enabled"]),
+            "port_hopping_start_port": int(port_hopping_cfg["start_port"]),
+            "port_hopping_end_port": int(port_hopping_cfg["end_port"]),
+            "port_hopping_count": int(port_hopping_cfg["count"]),
+            "port_hopping_mode": str(port_hopping_cfg["mode"]),
         }
         mappings = client.get("mappings", [])
         if not isinstance(mappings, list):
@@ -4159,6 +4301,16 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
         "",
         "server:",
     ]
+    port_hopping_cfg = normalize_port_hopping_settings(
+        {
+            "enabled": protocol_config.get("port_hopping_enabled", False),
+            "start_port": protocol_config.get("port_hopping_start_port", 10000),
+            "end_port": protocol_config.get("port_hopping_end_port", 10100),
+            "count": protocol_config.get("port_hopping_count", 0),
+            "mode": protocol_config.get("port_hopping_mode", "spread"),
+        },
+        "spread",
+    )
     lines.extend(
         render_transport_endpoints_list_lines(
             "  ",
@@ -4166,6 +4318,16 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
             all_listens,
             include_require_client_cert=True,
         )
+    )
+    lines.extend(
+        [
+            "  port_hopping:",
+            f"    enabled: {yaml_scalar(port_hopping_cfg['enabled'])}",
+            f"    start_port: {yaml_scalar(port_hopping_cfg['start_port'])}",
+            f"    end_port: {yaml_scalar(port_hopping_cfg['end_port'])}",
+            f"    count: {yaml_scalar(port_hopping_cfg['count'])}",
+            f"    mode: {yaml_scalar(port_hopping_cfg['mode'])}",
+        ]
     )
     if str(protocol_config.get("tunnel_mode", "reverse")).strip().lower() == "direct":
         lines.append("  mappings: []")
@@ -4294,6 +4456,21 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         protocol_config.get("connection_strategy", "parallel"),
         "parallel",
     )
+    port_hopping_cfg = normalize_port_hopping_settings(
+        {
+            "enabled": protocol_config.get("port_hopping_enabled", False),
+            "start_port": protocol_config.get("port_hopping_start_port", 10000),
+            "end_port": protocol_config.get("port_hopping_end_port", 10100),
+            "count": protocol_config.get("port_hopping_count", 0),
+            "mode": protocol_config.get("port_hopping_mode", "spread"),
+        },
+        "spread",
+    )
+    if port_hopping_cfg["enabled"]:
+        if port_hopping_cfg["mode"] == "switch":
+            connection_strategy = "priority"
+        else:
+            connection_strategy = "parallel"
     reality_enabled = any(
         normalize_endpoint_type(ep.get("type", "tcp"), "tcp") == "reality"
         for ep in all_servers
@@ -4340,6 +4517,16 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         f"  connection_strategy: {yaml_scalar(connection_strategy)}",
     ]
     lines.extend(render_transport_endpoints_list_lines("  ", "servers", all_servers))
+    lines.extend(
+        [
+            "  port_hopping:",
+            f"    enabled: {yaml_scalar(port_hopping_cfg['enabled'])}",
+            f"    start_port: {yaml_scalar(port_hopping_cfg['start_port'])}",
+            f"    end_port: {yaml_scalar(port_hopping_cfg['end_port'])}",
+            f"    count: {yaml_scalar(port_hopping_cfg['count'])}",
+            f"    mode: {yaml_scalar(port_hopping_cfg['mode'])}",
+        ]
+    )
     if str(protocol_config.get("tunnel_mode", "reverse")).strip().lower() == "direct":
         mappings = protocol_config.get("mappings", [])
         if mappings:
@@ -5080,7 +5267,21 @@ def install_client_flow(
             "Tip: Run this on remote server first to listen for test traffic: "
             f"`iperf3 -s -p {IPERF_TEST_DEFAULT_PORT}`"
         )
-        direct_connectivity_test_menu(default_host=server_addr)
+        bench_result = direct_connectivity_test_menu(default_host=server_addr)
+        if isinstance(bench_result, dict):
+            best_port = bench_result.get("best_port")
+            try:
+                best_port = int(best_port)
+            except (TypeError, ValueError):
+                best_port = 0
+            if 1 <= best_port <= 65535 and best_port != int(server_port):
+                use_best = input_default(
+                    f"Use discovered best port {best_port} for tunnel destination? (Y/n)",
+                    "y",
+                ).strip().lower()
+                if use_best in {"", "y", "yes"}:
+                    server_port = best_port
+                    print_success(f"Client destination port updated to {server_port}")
     cfg = menu_protocol(
         "client",
         server_addr=server_addr,
@@ -5223,24 +5424,303 @@ def install_tunnel_flow(tunnel_type):
         return
 
 
+def pause_continue():
+    input("\nPress Enter to continue...")
+
+
+def quick_deploy_menu():
+    while True:
+        print_menu(
+            "🚀 Deploy Tunnel",
+            [
+                "1. Guided Setup (Recommended)",
+                "2. Reverse Tunnel (Kharej -> Iran)",
+                "3. Direct Tunnel (Iran -> Kharej)",
+                "0. Back",
+            ],
+            color=Colors.CYAN,
+            min_width=56,
+        )
+        choice = input("Select option: ").strip()
+        if choice == "0":
+            return
+        if choice == "1":
+            print_menu(
+                "Guided Tunnel Type",
+                [
+                    "1. Reverse Tunnel (Recommended for most use-cases)",
+                    "2. Direct Tunnel",
+                    "0. Back",
+                ],
+                color=Colors.CYAN,
+                min_width=66,
+            )
+            guided_choice = input_default("Select type [0-2]", "1").strip()
+            if guided_choice == "1":
+                install_tunnel_flow("reverse")
+                pause_continue()
+            elif guided_choice == "2":
+                install_tunnel_flow("direct")
+                pause_continue()
+            elif guided_choice != "0":
+                print_error("Invalid choice.")
+                pause_continue()
+            continue
+        if choice == "2":
+            install_tunnel_flow("reverse")
+            pause_continue()
+            continue
+        if choice == "3":
+            install_tunnel_flow("direct")
+            pause_continue()
+            continue
+        print_error("Invalid choice.")
+
+
+def quick_single_port_benchmark(default_host=""):
+    host_seed = default_host or "1.2.3.4"
+    target_host = input_default("Remote server host/IP", host_seed).strip()
+    while not target_host:
+        print_error("Remote host is required.")
+        target_host = input_default("Remote server host/IP", host_seed).strip()
+
+    port = prompt_int("Remote iperf3 port", IPERF_TEST_DEFAULT_PORT)
+    while port < 1 or port > 65535:
+        print_error("Port must be between 1 and 65535.")
+        port = prompt_int("Remote iperf3 port", IPERF_TEST_DEFAULT_PORT)
+
+    duration = prompt_int("Test duration (seconds)", IPERF_TEST_DEFAULT_DURATION)
+    if duration < 3:
+        duration = 3
+    streams = prompt_int("Parallel streams", IPERF_TEST_DEFAULT_STREAMS)
+    if streams < 1:
+        streams = 1
+
+    return run_direct_connectivity_benchmark(
+        target_host=target_host,
+        port=int(port),
+        duration=int(duration),
+        streams=int(streams),
+    )
+
+
+def quick_port_discovery_benchmark(default_host=""):
+    host_seed = default_host or "1.2.3.4"
+    target_host = input_default("Remote server host/IP", host_seed).strip()
+    while not target_host:
+        print_error("Remote host is required.")
+        target_host = input_default("Remote server host/IP", host_seed).strip()
+
+    default_ports = ",".join(str(p) for p in IPERF_PORT_BENCHMARK_DEFAULT_PORTS)
+    raw_ports = input_default(
+        "Seed candidate ports (comma/range, random fill to >=100)",
+        default_ports,
+    ).strip()
+    ports = parse_port_candidates(raw_ports)
+    ports, random_added = ensure_min_random_ports(
+        ports,
+        min_count=IPERF_PORT_BENCHMARK_MIN_COUNT,
+    )
+    if random_added > 0:
+        print_info(
+            f"Added {random_added} random ports to reach minimum {IPERF_PORT_BENCHMARK_MIN_COUNT} ports."
+        )
+    if len(ports) < IPERF_PORT_BENCHMARK_MIN_COUNT:
+        print_error(
+            f"Could not build enough candidate ports (got {len(ports)}, need at least {IPERF_PORT_BENCHMARK_MIN_COUNT})."
+        )
+        return None
+
+    duration = prompt_int("Test duration per port (seconds)", max(4, min(IPERF_TEST_DEFAULT_DURATION, 8)))
+    if duration < 3:
+        duration = 3
+    streams = prompt_int("Parallel streams", max(1, min(IPERF_TEST_DEFAULT_STREAMS, 4)))
+    if streams < 1:
+        streams = 1
+    top_n = prompt_int("Show top N ports", 5)
+    if top_n < 1:
+        top_n = 1
+
+    remote_prepare = input_default(
+        "Auto-start remote iperf3 listeners over SSH? (Y/n)",
+        "y",
+    ).strip().lower()
+    if remote_prepare in {"", "y", "yes"}:
+        ssh_user = input_default("Remote SSH user", "root").strip() or "root"
+        ssh_port = prompt_int("Remote SSH port", 22)
+        if ssh_port < 1 or ssh_port > 65535:
+            ssh_port = 22
+        ssh_target = f"{ssh_user}@{target_host}"
+        print_info(
+            f"Preparing remote listeners on {ssh_target}:{ssh_port} for {len(ports)} ports..."
+        )
+        ok, details, script = prepare_remote_iperf_listeners_over_ssh(ssh_target, ssh_port, ports)
+        if not ok:
+            print_error(f"Remote listener auto-prepare failed: {details}")
+            try_password = input_default(
+                "Try SSH password fallback? (Y/n)",
+                "y",
+            ).strip().lower()
+            if try_password in {"", "y", "yes"}:
+                remote_password = getpass.getpass("Remote SSH password: ").strip()
+                if remote_password:
+                    ok_pw, details_pw, script = prepare_remote_iperf_listeners_over_ssh(
+                        ssh_target,
+                        ssh_port,
+                        ports,
+                        password=remote_password,
+                    )
+                    remote_password = ""
+                    if ok_pw:
+                        ok = True
+                        print_success("Remote listeners prepared successfully (password fallback).")
+                    else:
+                        print_error(f"Password fallback failed: {details_pw}")
+            if not ok:
+                print_info("Run this manually on remote host, then retry:")
+                print(f"\n{script}\n")
+                return None
+        else:
+            print_success("Remote listeners prepared.")
+
+    ranked = run_auto_port_benchmark(
+        target_host=target_host,
+        ports=ports,
+        duration=int(duration),
+        streams=int(streams),
+        top_n=int(top_n),
+    )
+    if not ranked:
+        return None
+
+    best_port = int(ranked[0]["port"])
+    print_success(f"Best discovered port: {best_port}")
+    return {"best_port": best_port, "ranked": ranked}
+
+
+def benchmark_workflow_menu():
+    while True:
+        print_menu(
+            "📊 Benchmark & Port Discovery",
+            [
+                "1. Quick single-port benchmark (recommended first)",
+                "2. Quick auto port discovery (100+ ports)",
+                "3. Advanced benchmark toolkit",
+                "0. Back",
+            ],
+            color=Colors.CYAN,
+            min_width=64,
+        )
+        choice = input("Select option: ").strip()
+        if choice == "0":
+            return
+        if choice == "1":
+            quick_single_port_benchmark()
+            pause_continue()
+            continue
+        if choice == "2":
+            quick_port_discovery_benchmark()
+            pause_continue()
+            continue
+        if choice == "3":
+            direct_connectivity_test_menu()
+            continue
+        print_error("Invalid choice.")
+
+
+def optimization_workflow_menu():
+    while True:
+        print_menu(
+            "⚙️ Linux Optimization",
+            [
+                "1. Apply Balanced profile (Recommended)",
+                "2. Apply Aggressive profile",
+                "3. Restore Linux defaults",
+                "4. Advanced optimization menu",
+                "0. Back",
+            ],
+            color=Colors.CYAN,
+            min_width=58,
+        )
+        choice = input("Select option: ").strip()
+        if choice == "0":
+            return
+        if choice == "1":
+            apply_linux_network_tuning("balanced")
+            pause_continue()
+            continue
+        if choice == "2":
+            apply_linux_network_tuning("aggressive")
+            pause_continue()
+            continue
+        if choice == "3":
+            restore_linux_network_defaults()
+            pause_continue()
+            continue
+        if choice == "4":
+            maybe_apply_linux_network_tuning()
+            pause_continue()
+            continue
+        print_error("Invalid choice.")
+
+
+def operations_menu():
+    while True:
+        print_menu(
+            "🧰 Operations & Maintenance",
+            [
+                "1. Monitor / Logs / Service Control",
+                "2. Multi Tunnel Management",
+                "3. Update Binary (and restart installed services)",
+                "4. Uninstall",
+                "0. Back",
+            ],
+            color=Colors.CYAN,
+            min_width=66,
+        )
+        choice = input("Select option: ").strip()
+        if choice == "0":
+            return
+        if choice == "1":
+            service_control_menu()
+            continue
+        if choice == "2":
+            multi_tunnel_menu()
+            continue
+        if choice == "3":
+            if download_binary():
+                restart_installed_services()
+                print_success("✅ Updated successfully.")
+            pause_continue()
+            continue
+        if choice == "4":
+            confirm = input_default(
+                "Uninstall all tunnel services and configs (binary kept)? (y/N)",
+                "n",
+            ).strip().lower()
+            if confirm in {"y", "yes"}:
+                uninstall_everything()
+            pause_continue()
+            continue
+        print_error("Invalid choice.")
+
+
 def main_menu():
     while True:
         print_banner()
         print_menu(
-            "Main Menu",
+            "Main Workflow",
             [
-                f"{Colors.GREEN}[1]{Colors.ENDC} 🟢 Direct Tunnel Setup (IR -> KH)",
-                f"{Colors.GREEN}[2]{Colors.ENDC} 🔁 Reverse Tunnel Setup (KH -> IR)",
-                f"{Colors.CYAN}[3]{Colors.ENDC} 🔄 Update Binary",
-                f"{Colors.CYAN}[4]{Colors.ENDC} 🗑️  Uninstall",
-                f"{Colors.CYAN}[5]{Colors.ENDC} 📊 Monitor / Logs / Service Control",
-                f"{Colors.CYAN}[6]{Colors.ENDC} 🧩 Multi Tunnel Management",
-                f"{Colors.CYAN}[7]{Colors.ENDC} ⚙️ Linux Optimization",
-                f"{Colors.CYAN}[8]{Colors.ENDC} 🌐 Direct Connectivity Test (iperf3)",
+                "Recommended order: Benchmark -> Deploy -> Optimize -> Monitor",
+                "",
+                f"{Colors.GREEN}[1]{Colors.ENDC} 🚀 Deploy Tunnel",
+                f"{Colors.GREEN}[2]{Colors.ENDC} 📊 Benchmark & Port Discovery",
+                f"{Colors.CYAN}[3]{Colors.ENDC} ⚙️ Linux Optimization",
+                f"{Colors.CYAN}[4]{Colors.ENDC} 🧰 Operations & Maintenance",
                 f"{Colors.WARNING}[0]{Colors.ENDC} 🚪 Exit",
             ],
             color=Colors.CYAN,
-            min_width=58,
+            min_width=66,
         )
 
         choice = input(f"\n{Colors.BOLD}Select option: {Colors.ENDC}").strip()
@@ -5248,47 +5728,27 @@ def main_menu():
         if choice == "1":
             check_root()
             if ensure_binary():
-                install_tunnel_flow("direct")
-                input("\nPress Enter to continue...")
+                quick_deploy_menu()
+            continue
 
-        elif choice == "2":
+        if choice == "2":
             check_root()
-            if ensure_binary():
-                install_tunnel_flow("reverse")
-                input("\nPress Enter to continue...")
+            benchmark_workflow_menu()
+            continue
 
-        elif choice == "3":
+        if choice == "3":
             check_root()
-            if download_binary():
-                restart_installed_services()
-                print_success("✅ Updated successfully.")
-                input("\nPress Enter to continue...")
+            optimization_workflow_menu()
+            continue
 
-        elif choice == "4":
-            uninstall_everything()
-            input("\nPress Enter to continue...")
-
-        elif choice == "5":
+        if choice == "4":
             check_root()
-            service_control_menu()
+            operations_menu()
+            continue
 
-        elif choice == "6":
-            check_root()
-            multi_tunnel_menu()
-
-        elif choice == "7":
-            check_root()
-            maybe_apply_linux_network_tuning()
-            input("\nPress Enter to continue...")
-
-        elif choice == "8":
-            check_root()
-            direct_connectivity_test_menu()
-
-        elif choice == "0":
+        if choice == "0":
             sys.exit(0)
-        else:
-            print_error("Invalid choice.")
+        print_error("Invalid choice.")
 
 
 if __name__ == "__main__":
