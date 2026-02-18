@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="fa" dir="rtl">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>NoDelay Web Panel</title>
+  <title>پنل NoDelay</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
@@ -12,44 +12,51 @@
 
   <header class="topbar">
     <div>
-      <h1>NoDelay Web Panel</h1>
-      <p>Monitor resources, tunnel status, throughput, and manage instances</p>
+      <h1 data-i18n="app.title">🚀 پنل NoDelay</h1>
+      <p data-i18n="app.subtitle">مانیتورینگ منابع، وضعیت تونل‌ها و مدیریت سرویس‌ها</p>
     </div>
     <div class="topbar-actions">
-      <button id="refreshBtn" class="btn">Refresh</button>
-      <button id="createBtn" class="btn btn-primary">Create Tunnel</button>
+      <label class="lang-switch">
+        <span data-i18n="app.lang">🌐 زبان</span>
+        <select id="langSelect">
+          <option value="fa">فارسی</option>
+          <option value="en">English</option>
+        </select>
+      </label>
+      <button id="refreshBtn" class="btn" data-i18n="btn.refresh">🔄 بروزرسانی</button>
+      <button id="createBtn" class="btn btn-primary" data-i18n="btn.create_tunnel">➕ ساخت تونل</button>
     </div>
   </header>
 
   <main class="layout">
     <section class="card resources">
-      <h2>Server Resources</h2>
+      <h2 data-i18n="resources.title">📊 منابع سرور</h2>
       <div class="resource-grid">
-        <div class="metric"><label>CPU</label><strong id="cpuVal">-</strong></div>
-        <div class="metric"><label>Memory</label><strong id="memVal">-</strong></div>
-        <div class="metric"><label>Disk</label><strong id="diskVal">-</strong></div>
-        <div class="metric"><label>Load</label><strong id="loadVal">-</strong></div>
-        <div class="metric"><label>Uptime</label><strong id="uptimeVal">-</strong></div>
-        <div class="metric"><label>Host Throughput</label><strong id="hostNetVal">-</strong></div>
+        <div class="metric"><label data-i18n="resources.cpu">🧠 CPU</label><strong id="cpuVal">-</strong></div>
+        <div class="metric"><label data-i18n="resources.mem">🧮 حافظه</label><strong id="memVal">-</strong></div>
+        <div class="metric"><label data-i18n="resources.disk">💾 دیسک</label><strong id="diskVal">-</strong></div>
+        <div class="metric"><label data-i18n="resources.load">⚖️ Load</label><strong id="loadVal">-</strong></div>
+        <div class="metric"><label data-i18n="resources.uptime">⏱️ آپ‌تایم</label><strong id="uptimeVal">-</strong></div>
+        <div class="metric"><label data-i18n="resources.net">📡 ترافیک میزبان</label><strong id="hostNetVal">-</strong></div>
       </div>
     </section>
 
     <section class="card tunnels">
       <div class="section-head">
-        <h2>Tunnels</h2>
+        <h2 data-i18n="tunnels.title">🛣️ تونل‌ها</h2>
         <span id="lastUpdated" class="muted">-</span>
       </div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th>Service</th>
-              <th>Role</th>
-              <th>Status</th>
-              <th>Profile / Mode</th>
-              <th>Endpoints</th>
-              <th>Throughput</th>
-              <th>Actions</th>
+              <th data-i18n="table.service">سرویس</th>
+              <th data-i18n="table.role">نقش</th>
+              <th data-i18n="table.status">وضعیت</th>
+              <th data-i18n="table.profile_mode">پروفایل / مود</th>
+              <th data-i18n="table.endpoints">اندپوینت‌ها</th>
+              <th data-i18n="table.throughput">نرخ عبور</th>
+              <th data-i18n="table.actions">اقدامات</th>
             </tr>
           </thead>
           <tbody id="tunnelRows"></tbody>
@@ -59,43 +66,56 @@
 
     <section class="card logs">
       <div class="section-head">
-        <h2>Logs</h2>
+        <h2 data-i18n="logs.title">📜 لاگ‌ها</h2>
         <div>
           <select id="logService"></select>
-          <button id="loadLogsBtn" class="btn">Load</button>
+          <button id="loadLogsBtn" class="btn" data-i18n="btn.load_logs">📥 بارگذاری</button>
         </div>
       </div>
-      <pre id="logsBox" class="logs-box">Select a tunnel and load logs.</pre>
+      <pre id="logsBox" class="logs-box" data-i18n="logs.hint">یک تونل انتخاب کنید و لاگ را بارگذاری کنید.</pre>
     </section>
   </main>
 
   <dialog id="createModal" class="modal">
     <form id="createForm" class="modal-body" method="dialog">
       <div class="modal-head">
-        <h3>Create Tunnel</h3>
+        <h3 data-i18n="create.title">🧩 ساخت تونل</h3>
         <button type="button" class="icon-btn" id="closeCreate">✕</button>
       </div>
 
       <div class="form-grid">
-        <label>Role
+      <label>
+        <span data-i18n="form.role">نقش</span>
           <select name="role">
-            <option value="server">Server</option>
-            <option value="client">Client</option>
+            <option value="server" data-i18n="role.server">سرور</option>
+            <option value="client" data-i18n="role.client">کلاینت</option>
           </select>
         </label>
-        <label>Instance
-          <input name="instance" placeholder="default" />
+      <label>
+        <span data-i18n="form.instance">اینستنس</span>
+          <input name="instance" placeholder="default" data-i18n-placeholder="ph.instance" />
         </label>
-        <label>Tunnel Mode
+      <label>
+        <span data-i18n="form.tunnel_mode">مود تونل</span>
           <select name="tunnel_mode">
             <option value="reverse">reverse</option>
             <option value="direct">direct</option>
           </select>
         </label>
-        <label>Profile
-          <input name="profile" value="balanced" />
+      <label>
+        <span data-i18n="form.profile">پروفایل</span>
+          <select name="profile">
+            <option value="balanced">balanced</option>
+            <option value="performance">performance</option>
+            <option value="latency">latency</option>
+            <option value="high-load">high-load</option>
+            <option value="aggressive">aggressive</option>
+            <option value="cpu-efficient">cpu-efficient</option>
+            <option value="gaming">gaming</option>
+          </select>
         </label>
-        <label>Transport
+      <label>
+        <span data-i18n="form.transport">ترنسپورت</span>
           <select name="transport">
             <option value="tcp">tcp</option>
             <option value="tls">tls</option>
@@ -108,31 +128,39 @@
             <option value="reality">reality</option>
           </select>
         </label>
-        <label>Port
+      <label>
+        <span data-i18n="form.port">پورت</span>
           <input name="port" value="9999" />
         </label>
-        <label>Server Addr (client)
-          <input name="server_addr" placeholder="1.2.3.4" />
+      <label>
+        <span data-i18n="form.server_addr">آدرس سرور (کلاینت)</span>
+          <input name="server_addr" placeholder="1.2.3.4" data-i18n-placeholder="ph.server_addr" />
         </label>
-        <label>Listen Host (server)
-          <input name="listen_host" placeholder="empty = all interfaces" />
+      <label>
+        <span data-i18n="form.listen_host">Listen Host (سرور)</span>
+          <input name="listen_host" placeholder="empty = all interfaces" data-i18n-placeholder="ph.listen_host" />
         </label>
-        <label>Path
+      <label>
+        <span data-i18n="form.path">مسیر</span>
           <input name="path" value="/tunnel" />
         </label>
-        <label>PSK
-          <input name="psk" placeholder="optional" />
+      <label>
+        <span data-i18n="form.psk">PSK</span>
+          <input name="psk" placeholder="optional" data-i18n-placeholder="ph.psk" />
         </label>
-        <label>Pool Size (client)
+      <label>
+        <span data-i18n="form.pool_size">Pool Size (کلاینت)</span>
           <input name="pool_size" value="3" />
         </label>
-        <label>Strategy (client)
+      <label>
+        <span data-i18n="form.strategy">استراتژی (کلاینت)</span>
           <select name="connection_strategy">
             <option value="parallel">parallel</option>
             <option value="priority">priority</option>
           </select>
         </label>
-        <label>Mux
+      <label>
+        <span data-i18n="form.mux">Mux</span>
           <select name="mux_type">
             <option value="smux">smux</option>
             <option value="yamux">yamux</option>
@@ -142,13 +170,13 @@
       </div>
 
       <label class="advanced-label">
-        Advanced YAML override (optional)
-        <textarea name="config_text" rows="10" placeholder="If set, this YAML is written directly."></textarea>
+        <span data-i18n="form.advanced_yaml">YAML پیشرفته (اختیاری)</span>
+        <textarea name="config_text" rows="10" data-i18n-placeholder="ph.advanced_yaml" placeholder="If set, this YAML is written directly."></textarea>
       </label>
 
       <div class="modal-actions">
-        <button type="button" class="btn" id="cancelCreate">Cancel</button>
-        <button type="submit" class="btn btn-primary">Create / Apply</button>
+        <button type="button" class="btn" id="cancelCreate" data-i18n="btn.cancel">لغو</button>
+        <button type="submit" class="btn btn-primary" data-i18n="btn.create_apply">✅ ایجاد / اعمال</button>
       </div>
     </form>
   </dialog>
@@ -156,16 +184,17 @@
   <dialog id="editModal" class="modal">
     <form id="editForm" class="modal-body" method="dialog">
       <div class="modal-head">
-        <h3 id="editTitle">Edit Config</h3>
+        <h3 id="editTitle" data-i18n="edit.title">📝 ویرایش کانفیگ</h3>
         <button type="button" class="icon-btn" id="closeEdit">✕</button>
       </div>
       <textarea id="editConfigText" rows="18"></textarea>
       <label class="checkbox-row">
-        <input type="checkbox" id="editRestart" checked /> Restart service after save
+        <input type="checkbox" id="editRestart" checked />
+        <span data-i18n="edit.restart">ری‌استارت سرویس بعد از ذخیره</span>
       </label>
       <div class="modal-actions">
-        <button type="button" class="btn" id="cancelEdit">Cancel</button>
-        <button type="submit" class="btn btn-primary">Save</button>
+        <button type="button" class="btn" id="cancelEdit" data-i18n="btn.cancel">لغو</button>
+        <button type="submit" class="btn btn-primary" data-i18n="btn.save">💾 ذخیره</button>
       </div>
     </form>
   </dialog>

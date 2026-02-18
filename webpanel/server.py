@@ -409,26 +409,40 @@ def collect_pid_socket_totals():
     if rc != 0 or not out:
         return {}
 
-    lines = out.splitlines()
     totals = {}
+    lines = out.splitlines()
+    current = None
 
-    for idx, line in enumerate(lines):
-        if "users:((" not in line:
-            continue
-
-        pids = [int(v) for v in re.findall(r"pid=(\d+)", line)]
-        if not pids:
-            continue
-
-        blob = line
-        if idx + 1 < len(lines) and lines[idx + 1].lstrip().startswith("cubic"):
-            blob += " " + lines[idx + 1]
-
+    def flush_current():
+        nonlocal current
+        if not current:
+            return
+        pids = current.get("pids", [])
+        blob = " ".join(current.get("blob", []))
         rx_bytes, tx_bytes = parse_ss_bytes_blob(blob)
         for pid in pids:
             row = totals.setdefault(pid, {"rx": 0, "tx": 0})
             row["rx"] += rx_bytes
             row["tx"] += tx_bytes
+        current = None
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if "users:((" in line:
+            flush_current()
+            pids = [int(v) for v in re.findall(r"pid=(\d+)", line)]
+            if not pids:
+                current = None
+                continue
+            current = {"pids": pids, "blob": [line]}
+            continue
+        if current:
+            # Keep all continuation lines (bbr/cubic/reno + skmem, etc).
+            current["blob"].append(line)
+
+    flush_current()
 
     return totals
 
@@ -439,13 +453,19 @@ def estimate_service_throughput(service_pid_map):
     result = {}
 
     with THROUGHPUT_LOCK:
+        active_services = set(service_pid_map.keys())
+        for stale in list(THROUGHPUT_STATE.keys()):
+            if stale not in active_services:
+                THROUGHPUT_STATE.pop(stale, None)
+
         for service_name, pid in service_pid_map.items():
             cur = pid_totals.get(pid, {"rx": 0, "tx": 0}) if pid > 0 else {"rx": 0, "tx": 0}
             prev = THROUGHPUT_STATE.get(service_name)
 
             rx_bps = 0.0
             tx_bps = 0.0
-            if prev and now > prev.get("ts", 0):
+            same_pid = prev and int(prev.get("pid", 0) or 0) == int(pid or 0)
+            if same_pid and now > prev.get("ts", 0):
                 dt = now - prev["ts"]
                 drx = cur["rx"] - prev.get("rx", 0)
                 dtx = cur["tx"] - prev.get("tx", 0)
@@ -456,6 +476,7 @@ def estimate_service_throughput(service_pid_map):
 
             THROUGHPUT_STATE[service_name] = {
                 "ts": now,
+                "pid": int(pid or 0),
                 "rx": cur["rx"],
                 "tx": cur["tx"],
                 "rx_bps": rx_bps,
