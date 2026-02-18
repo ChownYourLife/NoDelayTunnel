@@ -28,6 +28,11 @@ SERVER_SERVICE_NAME = "nodelay-server"
 CLIENT_SERVICE_NAME = "nodelay-client"
 LEGACY_SERVICE_NAME = "nodelay"
 SYSTEMD_DIR = "/etc/systemd/system"
+WEBPANEL_DIR = "/opt/nodelay-webpanel"
+WEBPANEL_SERVICE_NAME = "nodelay-webpanel"
+WEBPANEL_BINARY_NAME = "nodelay-webpanel"
+WEBPANEL_DEFAULT_HOST = "0.0.0.0"
+WEBPANEL_DEFAULT_PORT = 8787
 NODELAY_SYSCTL_D_PATH = "/etc/sysctl.d/99-nodelay.conf"
 SYSCTL_CONF_PATH = "/etc/sysctl.conf"
 SYSCTL_CONF_BEGIN = "# BEGIN NoDelay Tunnel managed settings"
@@ -217,6 +222,15 @@ def command_succeeds(command):
     return result.returncode == 0
 
 
+def local_primary_ip():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
 def service_file_path(service_name):
     return os.path.join(SYSTEMD_DIR, f"{service_name}.service")
 
@@ -401,8 +415,8 @@ def apply_mss_clamp_rules(mss=MSS_CLAMP_DEFAULT):
         mss = int(mss)
     except (TypeError, ValueError):
         mss = MSS_CLAMP_DEFAULT
-    if mss < 1200:
-        mss = 1200
+    if mss < 536:
+        mss = 536
     if mss > 1460:
         mss = 1460
 
@@ -410,6 +424,19 @@ def apply_mss_clamp_rules(mss=MSS_CLAMP_DEFAULT):
     if not tools:
         print_info("Skipping MSS clamp: iptables/ip6tables not found.")
         return False
+
+    # Remove previously configured TCPMSS clamp rules so the new value is effective.
+    mss_rule_pattern = " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "
+    for tool in tools:
+        for chain in ("OUTPUT", "FORWARD"):
+            rc, out, _ = run_command_output(f"{tool} -t mangle -S {chain}")
+            if rc != 0:
+                continue
+            for line in out.splitlines():
+                if mss_rule_pattern not in line:
+                    continue
+                delete_rule = line.replace("-A ", "-D ", 1)
+                run_command(f"{tool} -t mangle {delete_rule}", check=False)
 
     rule = f"-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss}"
     any_ok = False
@@ -433,8 +460,8 @@ def remove_mss_clamp_rules(mss=MSS_CLAMP_DEFAULT):
         mss = int(mss)
     except (TypeError, ValueError):
         mss = MSS_CLAMP_DEFAULT
-    if mss < 1200:
-        mss = 1200
+    if mss < 536:
+        mss = 536
     if mss > 1460:
         mss = 1460
 
@@ -449,6 +476,22 @@ def remove_mss_clamp_rules(mss=MSS_CLAMP_DEFAULT):
             while run_command(f"{tool} -t mangle -D {chain} {rule}", check=False):
                 removed_any = True
     return removed_any
+
+
+def apply_tunnel_mss_clamp(protocol_cfg, role="server"):
+    if role != "server":
+        return False
+
+    mtu = normalize_network_mtu(protocol_cfg.get("network_mtu", 0), 0)
+    if mtu > 0:
+        mss_value = mtu
+        print_info(f"Applying tunnel MSS clamp from config network.mtu={mtu}")
+    else:
+        mss_value = MSS_CLAMP_DEFAULT
+        print_info(
+            f"network.mtu is disabled (0); applying default tunnel MSS clamp={MSS_CLAMP_DEFAULT}"
+        )
+    return apply_mss_clamp_rules(mss_value)
 
 
 def apply_linux_network_tuning(profile_key="balanced"):
@@ -475,6 +518,7 @@ def apply_linux_network_tuning(profile_key="balanced"):
                 ("net.core.somaxconn", "4096"),
                 ("net.ipv4.tcp_fastopen", "1"),
                 ("net.ipv4.tcp_mtu_probing", "1"),
+                ("net.ipv4.ip_no_pmtu_disc", "0"),
                 ("net.ipv4.tcp_base_mss", "1024"),
                 ("net.ipv4.tcp_keepalive_time", "120"),
                 ("net.ipv4.tcp_keepalive_intvl", "10"),
@@ -505,6 +549,7 @@ def apply_linux_network_tuning(profile_key="balanced"):
                 # Keep fastopen conservative to avoid middlebox/path quirks.
                 ("net.ipv4.tcp_fastopen", "1"),
                 ("net.ipv4.tcp_mtu_probing", "1"),
+                ("net.ipv4.ip_no_pmtu_disc", "0"),
                 ("net.ipv4.tcp_base_mss", "1024"),
                 ("net.ipv4.tcp_keepalive_time", "120"),
                 ("net.ipv4.tcp_keepalive_intvl", "10"),
@@ -1495,6 +1540,51 @@ def download_binary():
         return False
 
 
+def webpanel_raw_urls():
+    return [
+        f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/{WEBPANEL_BINARY_NAME}",
+        f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/master/{WEBPANEL_BINARY_NAME}",
+        f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/webpanel/{WEBPANEL_BINARY_NAME}",
+        f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/master/webpanel/{WEBPANEL_BINARY_NAME}",
+    ]
+
+
+def download_webpanel_binary(target_path):
+    last_error = None
+    for url in webpanel_raw_urls():
+        print_info(f"Trying webpanel binary URL: {url}")
+        tmp_path = ""
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "NoDelayDeploy/1.0"})
+            with urllib.request.urlopen(req, timeout=45) as response:
+                with tempfile.NamedTemporaryFile(delete=False, dir="/tmp") as tmp_file:
+                    shutil.copyfileobj(response, tmp_file)
+                    tmp_path = tmp_file.name
+
+            if os.path.getsize(tmp_path) <= 0:
+                raise ValueError("downloaded file is empty")
+            os.chmod(tmp_path, 0o755)
+            shutil.move(tmp_path, target_path)
+            print_success(f"✅ Webpanel binary downloaded from repo: {url}")
+            return True
+        except Exception as exc:
+            last_error = exc
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            print_info(f"Failed URL: {exc}")
+
+    print_error(
+        "Could not download webpanel binary from repository raw URLs. "
+        f"Last error: {last_error}"
+    )
+    return False
+
+
+def systemd_env_value(value):
+    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{text}"'
+
+
 def generate_uuid():
     return str(uuid.uuid4())
 
@@ -1748,6 +1838,17 @@ def certbot_lineage_name(value):
     return raw or "trusted-cert"
 
 
+def prompt_certbot_eab_if_needed(ca_provider):
+    if str(ca_provider).strip().lower() != "zerossl":
+        return "", ""
+
+    print_info("ZeroSSL requires External Account Binding (EAB).")
+    print_info("Get EAB KID and EAB HMAC key from your ZeroSSL ACME dashboard.")
+    eab_kid = input_required("ZeroSSL EAB KID")
+    eab_hmac_key = input_required("ZeroSSL EAB HMAC key")
+    return eab_kid, eab_hmac_key
+
+
 def generate_trusted_cert_certbot():
     print_menu(
         "Trusted Certificate (ACME)",
@@ -1789,6 +1890,7 @@ def generate_trusted_cert_certbot():
     certbot = ensure_certbot_installed()
     if not certbot:
         return "", ""
+    eab_kid, eab_hmac_key = prompt_certbot_eab_if_needed(ca_provider)
 
     cert_dir = os.path.join(CONFIG_DIR, "certs")
     if not os.path.exists(cert_dir):
@@ -1830,12 +1932,27 @@ def generate_trusted_cert_certbot():
         ]
         if ca_server_url:
             issue_args.extend(["--server", ca_server_url])
+        if eab_kid and eab_hmac_key:
+            issue_args.extend(["--eab-kid", eab_kid, "--eab-hmac-key", eab_hmac_key])
 
         print_info(
             f"Issuing trusted certificate for {identifier} using certbot ({ca_provider})..."
         )
-        if not run_args_stream(issue_args):
-            print_error("Certificate issuance failed. Ensure challenge ports are reachable from the internet.")
+        result = subprocess.run(issue_args, check=False, text=True, capture_output=True)
+        if result.returncode != 0:
+            output = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+            if "external account binding" in output.lower() or "--eab-kid" in output.lower():
+                print_error(
+                    "Certificate issuance failed: this CA requires EAB. "
+                    "For ZeroSSL, provide valid EAB KID and EAB HMAC key."
+                )
+            else:
+                print_error(
+                    "Certificate issuance failed. Ensure challenge ports are reachable "
+                    "from the internet and ACME inputs are correct."
+                )
+            if output:
+                print(output)
             return "", ""
 
         live_dir = os.path.join("/etc/letsencrypt/live", lineage_name)
@@ -3901,6 +4018,26 @@ def resolve_http_mimicry_state(protocol_config, endpoints):
     return False, "/api/v1/upload"
 
 
+def mimicry_user_agent_for_browser(browser):
+    browser = str(browser or "chrome").strip().lower()
+    if browser == "firefox":
+        return "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0"
+    if browser == "edge":
+        return (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
+        )
+    if browser == "safari":
+        return (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15"
+        )
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+
+
 def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
     primary_path = normalize_path(primary_path, "/api/v1/upload")
     preset_region = normalize_mimicry_preset_region(preset_region, "mixed")
@@ -3913,9 +4050,8 @@ def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
-                "X-Requested-With": "XMLHttpRequest",
+                "User-Agent": mimicry_user_agent_for_browser("chrome"),
                 "Referer": "https://www.zoomg.ir/",
-                "Cache-Control": "max-age=0",
             },
         },
         "virgool_read": {
@@ -3925,9 +4061,8 @@ def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
+                "User-Agent": mimicry_user_agent_for_browser("chrome"),
                 "Referer": "https://virgool.io/",
-                "Sec-Fetch-Site": "same-origin",
-                "Pragma": "no-cache",
             },
         },
         "hamyarwp_blog": {
@@ -3937,9 +4072,8 @@ def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
+                "User-Agent": mimicry_user_agent_for_browser("firefox"),
                 "Referer": "https://hamyarwp.com/",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Connection": "keep-alive",
             },
         },
         "rasaneh3_feed": {
@@ -3949,9 +4083,8 @@ def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
+                "User-Agent": mimicry_user_agent_for_browser("chrome"),
                 "Referer": "https://www.rasanetv.com/",
-                "Sec-Fetch-Site": "same-origin",
-                "Cache-Control": "no-cache",
             },
         },
         "mizbanfa_docs": {
@@ -3961,9 +4094,8 @@ def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
+                "User-Agent": mimicry_user_agent_for_browser("edge"),
                 "Referer": "https://mizbanfa.net/",
-                "Sec-Fetch-Site": "same-origin",
-                "Pragma": "no-cache",
             },
         },
         "f_droid_packages": {
@@ -3973,9 +4105,8 @@ def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
+                "User-Agent": mimicry_user_agent_for_browser("firefox"),
                 "Referer": "https://f-droid.org/",
-                "Sec-Fetch-Site": "same-origin",
-                "Cache-Control": "max-age=0",
             },
         },
         "archwiki_page": {
@@ -3985,9 +4116,8 @@ def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
+                "User-Agent": mimicry_user_agent_for_browser("edge"),
                 "Referer": "https://wiki.archlinux.org/",
-                "Sec-Fetch-Site": "same-origin",
-                "Pragma": "no-cache",
             },
         },
         "mdn_docs": {
@@ -3997,9 +4127,8 @@ def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
+                "User-Agent": mimicry_user_agent_for_browser("chrome"),
                 "Referer": "https://developer.mozilla.org/",
-                "Sec-Fetch-Site": "none",
-                "Pragma": "no-cache",
             },
         },
         "linode_docs": {
@@ -4009,9 +4138,8 @@ def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
+                "User-Agent": mimicry_user_agent_for_browser("firefox"),
                 "Referer": "https://www.linode.com/",
-                "Sec-Fetch-Site": "none",
-                "Cache-Control": "max-age=0",
             },
         },
         "gnu_manuals": {
@@ -4021,9 +4149,8 @@ def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
+                "User-Agent": mimicry_user_agent_for_browser("chrome"),
                 "Referer": "https://www.gnu.org/",
-                "Sec-Fetch-Site": "same-origin",
-                "Connection": "keep-alive",
             },
         },
     }
@@ -5094,6 +5221,7 @@ def edit_service_instance(service_name):
                     config_file,
                     explicit_tuning=explicit_tuning,
                 )
+                _ = apply_tunnel_mss_clamp(protocol_cfg, role="server")
             else:
                 generate_client_config(
                     protocol_cfg,
@@ -5219,6 +5347,111 @@ def uninstall_everything():
     print_success("🗑️  Uninstalled services and configs (binary kept).")
 
 
+def install_or_update_webpanel(bind_host=WEBPANEL_DEFAULT_HOST, bind_port=WEBPANEL_DEFAULT_PORT):
+    check_root()
+
+    host = str(bind_host or WEBPANEL_DEFAULT_HOST).strip() or WEBPANEL_DEFAULT_HOST
+    try:
+        port = int(bind_port)
+    except (TypeError, ValueError):
+        port = WEBPANEL_DEFAULT_PORT
+    if port < 1 or port > 65535:
+        print_error("Webpanel port must be between 1 and 65535.")
+        return False
+
+    os.makedirs(WEBPANEL_DIR, exist_ok=True)
+    target_binary = os.path.join(WEBPANEL_DIR, WEBPANEL_BINARY_NAME)
+    if not download_webpanel_binary(target_binary):
+        return False
+
+    username = ""
+    while not username:
+        username = input_default("Webpanel username", "admin").strip()
+        if not username:
+            print_error("Webpanel username cannot be empty.")
+
+    password = ""
+    while not password:
+        password = getpass.getpass("Webpanel password: ").strip()
+        if not password:
+            print_error("Webpanel password cannot be empty.")
+            continue
+        confirm = getpass.getpass("Confirm webpanel password: ").strip()
+        if password != confirm:
+            print_error("Password confirmation does not match.")
+            password = ""
+
+    env_path = os.path.join(WEBPANEL_DIR, ".env")
+    env_lines = [
+        f"NODELAY_WEBPANEL_HOST={systemd_env_value(host)}",
+        f"NODELAY_WEBPANEL_PORT={systemd_env_value(port)}",
+        f"NODELAY_WEBPANEL_USER={systemd_env_value(username)}",
+        f"NODELAY_WEBPANEL_PASS={systemd_env_value(password)}",
+    ]
+    with open(env_path, "w") as f:
+        f.write("\n".join(env_lines) + "\n")
+    os.chmod(env_path, 0o600)
+
+    service_path = service_file_path(WEBPANEL_SERVICE_NAME)
+    service_content = f"""[Unit]
+Description=NoDelay Tunnel Web Panel
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory={WEBPANEL_DIR}
+EnvironmentFile=-{env_path}
+ExecStart={target_binary} --host {host} --port {port}
+Restart=always
+RestartSec=2
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
+"""
+    with open(service_path, "w") as f:
+        f.write(service_content)
+
+    run_command("systemctl daemon-reload")
+    run_command(f"systemctl enable {WEBPANEL_SERVICE_NAME}")
+    run_command(f"systemctl restart {WEBPANEL_SERVICE_NAME}")
+
+    active_rc, active_out, active_err = run_command_output(
+        f"systemctl is-active {shlex.quote(WEBPANEL_SERVICE_NAME)}.service"
+    )
+    if active_rc == 0 and active_out.strip().lower() == "active":
+        print_success(f"✅ Webpanel installed and running: {WEBPANEL_SERVICE_NAME}.service")
+    else:
+        print_error(
+            f"Webpanel service may not be active: {(active_out or active_err).strip() or 'unknown'}"
+        )
+
+    display_host = host if host not in {"0.0.0.0", "::"} else local_primary_ip()
+    print_info(f"Webpanel URL: http://{display_host}:{port}")
+    print_info(f"Webpanel auth user: {username}")
+    print_info(f"Webpanel env file: {env_path}")
+    print_info(f"Service logs: journalctl -fu {WEBPANEL_SERVICE_NAME}.service")
+    return True
+
+
+def remove_webpanel(remove_files=False):
+    check_root()
+    run_command(f"systemctl stop {WEBPANEL_SERVICE_NAME}", check=False)
+    run_command(f"systemctl disable {WEBPANEL_SERVICE_NAME}", check=False)
+    service_path = service_file_path(WEBPANEL_SERVICE_NAME)
+    if os.path.exists(service_path):
+        os.remove(service_path)
+    run_command("systemctl daemon-reload", check=False)
+
+    if remove_files and os.path.isdir(WEBPANEL_DIR):
+        shutil.rmtree(WEBPANEL_DIR)
+        print_info(f"Removed webpanel files: {WEBPANEL_DIR}")
+
+    print_success("🗑️ Webpanel service removed.")
+    return True
+
+
 def install_server_flow(
     server_location_label="Iran",
     tunnel_label="Reverse Tunnel",
@@ -5264,6 +5497,7 @@ def install_server_flow(
     )
     create_service("server", instance)
     maybe_apply_linux_network_tuning()
+    _ = apply_tunnel_mss_clamp(cfg, role="server")
 
     all_listens = collect_render_endpoints("server", cfg)
 
@@ -5731,6 +5965,8 @@ def operations_menu():
                 "2. Multi Tunnel Management",
                 "3. Update Binary (and restart installed services)",
                 "4. Uninstall",
+                "5. Install / Update Web Panel",
+                "6. Remove Web Panel",
                 "0. Back",
             ],
             color=Colors.CYAN,
@@ -5758,6 +5994,20 @@ def operations_menu():
             ).strip().lower()
             if confirm in {"y", "yes"}:
                 uninstall_everything()
+            pause_continue()
+            continue
+        if choice == "5":
+            host = input_default("Webpanel bind host", WEBPANEL_DEFAULT_HOST).strip() or WEBPANEL_DEFAULT_HOST
+            port = prompt_int("Webpanel bind port", WEBPANEL_DEFAULT_PORT)
+            install_or_update_webpanel(host, port)
+            pause_continue()
+            continue
+        if choice == "6":
+            remove_files = input_default(
+                f"Also delete webpanel files in {WEBPANEL_DIR}? (y/N)",
+                "n",
+            ).strip().lower() in {"y", "yes"}
+            remove_webpanel(remove_files=remove_files)
             pause_continue()
             continue
         print_error("Invalid choice.")
