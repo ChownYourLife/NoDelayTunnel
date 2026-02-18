@@ -2494,6 +2494,69 @@ def normalize_port_hopping_mode(value, default="spread"):
     return default
 
 
+def normalize_port_hopping_ports(value):
+    if isinstance(value, list):
+        raw_items = value
+    elif isinstance(value, str):
+        raw_items = parse_csv(value)
+    else:
+        raw_items = []
+
+    out = []
+    seen = set()
+    for item in raw_items:
+        try:
+            port = int(str(item).strip())
+        except (TypeError, ValueError):
+            continue
+        if port < 1 or port > 65535:
+            continue
+        if port in seen:
+            continue
+        seen.add(port)
+        out.append(port)
+        if len(out) >= 2048:
+            break
+    return out
+
+
+def prompt_port_hopping_layout(default="range"):
+    normalized_default = str(default or "range").strip().lower()
+    if normalized_default not in {"range", "list"}:
+        normalized_default = "range"
+    default_choice = "2" if normalized_default == "list" else "1"
+    print_menu(
+        "🎯 Port Hopping Selection",
+        [
+            f"{Colors.GREEN}[1]{Colors.ENDC} Port range (start/end/count)",
+            f"{Colors.GREEN}[2]{Colors.ENDC} Explicit port list (comma separated)",
+        ],
+        color=Colors.CYAN,
+        min_width=62,
+    )
+    while True:
+        choice = input_default("Selection [1-2]", default_choice).strip()
+        if choice == "1":
+            return "range"
+        if choice == "2":
+            return "list"
+        print_error("Invalid choice. Pick 1 or 2.")
+
+
+def prompt_port_hopping_ports(default_ports=None):
+    seed = normalize_port_hopping_ports(default_ports or [])
+    default_text = ",".join(str(p) for p in seed)
+    while True:
+        raw = input_default(
+            "Port hopping ports (comma separated, e.g. 443,8443,2053)",
+            default_text,
+        ).strip()
+        ports = normalize_port_hopping_ports(raw)
+        if ports:
+            return ports
+        print_error("Enter at least one valid port between 1 and 65535.")
+
+
 def prompt_port_hopping_mode(default="spread"):
     normalized_default = normalize_port_hopping_mode(default, "spread")
     default_choice = "2" if normalized_default == "switch" else "1"
@@ -2901,6 +2964,7 @@ def normalize_network_mtu(value, default=0):
 def normalize_port_hopping_settings(value, default_mode="spread"):
     cfg = value if isinstance(value, dict) else {}
     enabled = parse_bool(cfg.get("enabled", False), False)
+    ports = normalize_port_hopping_ports(cfg.get("ports", []))
 
     try:
         start_port = int(cfg.get("start_port", 10000))
@@ -2923,10 +2987,16 @@ def normalize_port_hopping_settings(value, default_mode="spread"):
         count = 0
     if count > 2048:
         count = 2048
+    if ports:
+        start_port = min(ports)
+        end_port = max(ports)
+        if count <= 0 or count > len(ports):
+            count = len(ports)
 
     mode = normalize_port_hopping_mode(cfg.get("mode", default_mode), default_mode)
     return {
         "enabled": enabled,
+        "ports": ports,
         "start_port": start_port,
         "end_port": end_port,
         "count": count,
@@ -3054,6 +3124,7 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
         "pool_size": 3,
         "connection_strategy": "parallel",
         "port_hopping_enabled": False,
+        "port_hopping_ports": [],
         "port_hopping_start_port": 10000,
         "port_hopping_end_port": 10100,
         "port_hopping_count": 0,
@@ -3096,15 +3167,26 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
         ).strip().lower()
         config["port_hopping_enabled"] = enable_hopping in {"y", "yes"}
         if config["port_hopping_enabled"]:
+            ports_default = normalize_port_hopping_ports(config.get("port_hopping_ports", []))
+            layout_default = "list" if ports_default else "range"
+            hopping_layout = prompt_port_hopping_layout(layout_default)
             start_default = int(config.get("port_hopping_start_port", 10000) or 10000)
             end_default = int(config.get("port_hopping_end_port", 10100) or 10100)
             count_default = int(config.get("port_hopping_count", 0) or 0)
-            config["port_hopping_start_port"] = prompt_int("Port hopping start_port", start_default)
-            config["port_hopping_end_port"] = prompt_int("Port hopping end_port", end_default)
-            config["port_hopping_count"] = prompt_int(
-                "Port hopping count (0 = full range)",
-                count_default,
-            )
+            if hopping_layout == "list":
+                selected_ports = prompt_port_hopping_ports(ports_default)
+                config["port_hopping_ports"] = selected_ports
+                config["port_hopping_start_port"] = min(selected_ports)
+                config["port_hopping_end_port"] = max(selected_ports)
+                config["port_hopping_count"] = len(selected_ports)
+            else:
+                config["port_hopping_ports"] = []
+                config["port_hopping_start_port"] = prompt_int("Port hopping start_port", start_default)
+                config["port_hopping_end_port"] = prompt_int("Port hopping end_port", end_default)
+                config["port_hopping_count"] = prompt_int(
+                    "Port hopping count (0 = full range)",
+                    count_default,
+                )
             config["port_hopping_mode"] = "spread"
     else:
         while True:
@@ -3139,15 +3221,26 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
         ).strip().lower()
         config["port_hopping_enabled"] = enable_hopping in {"y", "yes"}
         if config["port_hopping_enabled"]:
+            ports_default = normalize_port_hopping_ports(config.get("port_hopping_ports", []))
+            layout_default = "list" if ports_default else "range"
+            hopping_layout = prompt_port_hopping_layout(layout_default)
             start_default = int(config.get("port_hopping_start_port", 10000) or 10000)
             end_default = int(config.get("port_hopping_end_port", 10100) or 10100)
             count_default = int(config.get("port_hopping_count", 0) or 0)
-            config["port_hopping_start_port"] = prompt_int("Port hopping start_port", start_default)
-            config["port_hopping_end_port"] = prompt_int("Port hopping end_port", end_default)
-            config["port_hopping_count"] = prompt_int(
-                "Port hopping count (0 = full range)",
-                count_default,
-            )
+            if hopping_layout == "list":
+                selected_ports = prompt_port_hopping_ports(ports_default)
+                config["port_hopping_ports"] = selected_ports
+                config["port_hopping_start_port"] = min(selected_ports)
+                config["port_hopping_end_port"] = max(selected_ports)
+                config["port_hopping_count"] = len(selected_ports)
+            else:
+                config["port_hopping_ports"] = []
+                config["port_hopping_start_port"] = prompt_int("Port hopping start_port", start_default)
+                config["port_hopping_end_port"] = prompt_int("Port hopping end_port", end_default)
+                config["port_hopping_count"] = prompt_int(
+                    "Port hopping count (0 = full range)",
+                    count_default,
+                )
             mode_default = normalize_port_hopping_mode(config.get("port_hopping_mode", "spread"), "spread")
             config["port_hopping_mode"] = prompt_port_hopping_mode(mode_default)
             if config["port_hopping_mode"] == "spread":
@@ -3640,6 +3733,7 @@ def load_instance_runtime_settings(role, instance):
             "license": license_id,
             "profile": profile,
             "port_hopping_enabled": bool(port_hopping_cfg["enabled"]),
+            "port_hopping_ports": deep_copy(port_hopping_cfg["ports"]),
             "port_hopping_start_port": int(port_hopping_cfg["start_port"]),
             "port_hopping_end_port": int(port_hopping_cfg["end_port"]),
             "port_hopping_count": int(port_hopping_cfg["count"]),
@@ -3756,6 +3850,7 @@ def load_instance_runtime_settings(role, instance):
             "license": license_id,
             "profile": profile,
             "port_hopping_enabled": bool(port_hopping_cfg["enabled"]),
+            "port_hopping_ports": deep_copy(port_hopping_cfg["ports"]),
             "port_hopping_start_port": int(port_hopping_cfg["start_port"]),
             "port_hopping_end_port": int(port_hopping_cfg["end_port"]),
             "port_hopping_count": int(port_hopping_cfg["count"]),
@@ -4560,6 +4655,7 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
     port_hopping_cfg = normalize_port_hopping_settings(
         {
             "enabled": protocol_config.get("port_hopping_enabled", False),
+            "ports": protocol_config.get("port_hopping_ports", []),
             "start_port": protocol_config.get("port_hopping_start_port", 10000),
             "end_port": protocol_config.get("port_hopping_end_port", 10100),
             "count": protocol_config.get("port_hopping_count", 0),
@@ -4579,6 +4675,7 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
         [
             "  port_hopping:",
             f"    enabled: {yaml_scalar(port_hopping_cfg['enabled'])}",
+            f"    ports: {json.dumps(port_hopping_cfg['ports'])}",
             f"    start_port: {yaml_scalar(port_hopping_cfg['start_port'])}",
             f"    end_port: {yaml_scalar(port_hopping_cfg['end_port'])}",
             f"    count: {yaml_scalar(port_hopping_cfg['count'])}",
@@ -4718,6 +4815,7 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
     port_hopping_cfg = normalize_port_hopping_settings(
         {
             "enabled": protocol_config.get("port_hopping_enabled", False),
+            "ports": protocol_config.get("port_hopping_ports", []),
             "start_port": protocol_config.get("port_hopping_start_port", 10000),
             "end_port": protocol_config.get("port_hopping_end_port", 10100),
             "count": protocol_config.get("port_hopping_count", 0),
@@ -4781,6 +4879,7 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         [
             "  port_hopping:",
             f"    enabled: {yaml_scalar(port_hopping_cfg['enabled'])}",
+            f"    ports: {json.dumps(port_hopping_cfg['ports'])}",
             f"    start_port: {yaml_scalar(port_hopping_cfg['start_port'])}",
             f"    end_port: {yaml_scalar(port_hopping_cfg['end_port'])}",
             f"    count: {yaml_scalar(port_hopping_cfg['count'])}",
