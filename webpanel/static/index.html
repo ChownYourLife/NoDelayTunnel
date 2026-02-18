@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NoDelay Web Panel</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="bg-orb orb-a"></div>
+  <div class="bg-orb orb-b"></div>
+
+  <header class="topbar">
+    <div>
+      <h1>NoDelay Web Panel</h1>
+      <p>Monitor resources, tunnel status, throughput, and manage instances</p>
+    </div>
+    <div class="topbar-actions">
+      <button id="refreshBtn" class="btn">Refresh</button>
+      <button id="createBtn" class="btn btn-primary">Create Tunnel</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="card resources">
+      <h2>Server Resources</h2>
+      <div class="resource-grid">
+        <div class="metric"><label>CPU</label><strong id="cpuVal">-</strong></div>
+        <div class="metric"><label>Memory</label><strong id="memVal">-</strong></div>
+        <div class="metric"><label>Disk</label><strong id="diskVal">-</strong></div>
+        <div class="metric"><label>Load</label><strong id="loadVal">-</strong></div>
+        <div class="metric"><label>Uptime</label><strong id="uptimeVal">-</strong></div>
+        <div class="metric"><label>Host Throughput</label><strong id="hostNetVal">-</strong></div>
+      </div>
+    </section>
+
+    <section class="card tunnels">
+      <div class="section-head">
+        <h2>Tunnels</h2>
+        <span id="lastUpdated" class="muted">-</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Service</th>
+              <th>Role</th>
+              <th>Status</th>
+              <th>Profile / Mode</th>
+              <th>Endpoints</th>
+              <th>Throughput</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="tunnelRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card logs">
+      <div class="section-head">
+        <h2>Logs</h2>
+        <div>
+          <select id="logService"></select>
+          <button id="loadLogsBtn" class="btn">Load</button>
+        </div>
+      </div>
+      <pre id="logsBox" class="logs-box">Select a tunnel and load logs.</pre>
+    </section>
+  </main>
+
+  <dialog id="createModal" class="modal">
+    <form id="createForm" class="modal-body" method="dialog">
+      <div class="modal-head">
+        <h3>Create Tunnel</h3>
+        <button type="button" class="icon-btn" id="closeCreate">✕</button>
+      </div>
+
+      <div class="form-grid">
+        <label>Role
+          <select name="role">
+            <option value="server">Server</option>
+            <option value="client">Client</option>
+          </select>
+        </label>
+        <label>Instance
+          <input name="instance" placeholder="default" />
+        </label>
+        <label>Tunnel Mode
+          <select name="tunnel_mode">
+            <option value="reverse">reverse</option>
+            <option value="direct">direct</option>
+          </select>
+        </label>
+        <label>Profile
+          <input name="profile" value="balanced" />
+        </label>
+        <label>Transport
+          <select name="transport">
+            <option value="tcp">tcp</option>
+            <option value="tls">tls</option>
+            <option value="ws">ws</option>
+            <option value="wss">wss</option>
+            <option value="kcp">kcp</option>
+            <option value="quic">quic</option>
+            <option value="httpmimicry">httpmimicry</option>
+            <option value="httpsmimicry">httpsmimicry</option>
+            <option value="reality">reality</option>
+          </select>
+        </label>
+        <label>Port
+          <input name="port" value="9999" />
+        </label>
+        <label>Server Addr (client)
+          <input name="server_addr" placeholder="1.2.3.4" />
+        </label>
+        <label>Listen Host (server)
+          <input name="listen_host" placeholder="empty = all interfaces" />
+        </label>
+        <label>Path
+          <input name="path" value="/tunnel" />
+        </label>
+        <label>PSK
+          <input name="psk" placeholder="optional" />
+        </label>
+        <label>Pool Size (client)
+          <input name="pool_size" value="3" />
+        </label>
+        <label>Strategy (client)
+          <select name="connection_strategy">
+            <option value="parallel">parallel</option>
+            <option value="priority">priority</option>
+          </select>
+        </label>
+        <label>Mux
+          <select name="mux_type">
+            <option value="smux">smux</option>
+            <option value="yamux">yamux</option>
+            <option value="h2mux">h2mux</option>
+          </select>
+        </label>
+      </div>
+
+      <label class="advanced-label">
+        Advanced YAML override (optional)
+        <textarea name="config_text" rows="10" placeholder="If set, this YAML is written directly."></textarea>
+      </label>
+
+      <div class="modal-actions">
+        <button type="button" class="btn" id="cancelCreate">Cancel</button>
+        <button type="submit" class="btn btn-primary">Create / Apply</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="editModal" class="modal">
+    <form id="editForm" class="modal-body" method="dialog">
+      <div class="modal-head">
+        <h3 id="editTitle">Edit Config</h3>
+        <button type="button" class="icon-btn" id="closeEdit">✕</button>
+      </div>
+      <textarea id="editConfigText" rows="18"></textarea>
+      <label class="checkbox-row">
+        <input type="checkbox" id="editRestart" checked /> Restart service after save
+      </label>
+      <div class="modal-actions">
+        <button type="button" class="btn" id="cancelEdit">Cancel</button>
+        <button type="submit" class="btn btn-primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
