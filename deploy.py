@@ -60,6 +60,8 @@ ROLE_LABELS = {
 
 DEFAULT_IRAN_PORT = 9999
 DEFAULT_KHAREJ_PORT = 9999
+DEFAULT_POOL_SIZE = 6
+DEFAULT_NETWORK_MTU = 1300
 TUNING_SECTIONS = ["smux", "tcp", "udp", "kcp", "quic", "reconnect"]
 MUX_TYPES = ["smux", "yamux", "h2mux"]
 IPERF_TEST_DEFAULT_PORT = 9777
@@ -485,7 +487,7 @@ def apply_tunnel_mss_clamp(protocol_cfg, role="server"):
     if role != "server":
         return False
 
-    mtu = normalize_network_mtu(protocol_cfg.get("network_mtu", 0), 0)
+    mtu = normalize_network_mtu(protocol_cfg.get("network_mtu", DEFAULT_NETWORK_MTU), 0)
     if mtu > 0:
         mss_value = mtu
         print_info(f"Applying tunnel MSS clamp from config network.mtu={mtu}")
@@ -515,8 +517,10 @@ def apply_linux_network_tuning(profile_key="balanced"):
                 ("net.ipv4.tcp_rmem", "4096 131072 16777216"),
                 ("net.ipv4.tcp_wmem", "4096 131072 16777216"),
                 ("net.ipv4.tcp_window_scaling", "1"),
+                ("net.ipv4.tcp_moderate_rcvbuf", "1"),
                 ("net.ipv4.tcp_timestamps", "1"),
                 ("net.ipv4.tcp_sack", "1"),
+                ("net.ipv4.tcp_slow_start_after_idle", "0"),
                 ("net.core.netdev_max_backlog", "8192"),
                 ("net.core.somaxconn", "4096"),
                 ("net.ipv4.tcp_fastopen", "1"),
@@ -545,8 +549,10 @@ def apply_linux_network_tuning(profile_key="balanced"):
                 ("net.ipv4.tcp_rmem", "4096 131072 33554432"),
                 ("net.ipv4.tcp_wmem", "4096 131072 33554432"),
                 ("net.ipv4.tcp_window_scaling", "1"),
+                ("net.ipv4.tcp_moderate_rcvbuf", "1"),
                 ("net.ipv4.tcp_timestamps", "1"),
                 ("net.ipv4.tcp_sack", "1"),
+                ("net.ipv4.tcp_slow_start_after_idle", "0"),
                 ("net.core.netdev_max_backlog", "16384"),
                 ("net.core.somaxconn", "8192"),
                 # Keep fastopen conservative to avoid middlebox/path quirks.
@@ -2961,6 +2967,41 @@ def normalize_network_mtu(value, default=0):
     return mtu
 
 
+def effective_tcp_max_seg(value, network_mtu=0):
+    try:
+        max_seg = int(value)
+    except (TypeError, ValueError):
+        max_seg = MSS_CLAMP_DEFAULT
+    if max_seg <= 0:
+        max_seg = MSS_CLAMP_DEFAULT
+    if max_seg < 536:
+        max_seg = 536
+    if max_seg > 1460:
+        max_seg = 1460
+    mtu = normalize_network_mtu(network_mtu, 0)
+    if mtu > 0 and max_seg > mtu:
+        max_seg = mtu
+    return max_seg
+
+
+def effective_udp_max_datagram(value, network_mtu=0):
+    try:
+        max_datagram = int(value)
+    except (TypeError, ValueError):
+        max_datagram = 65507
+    if max_datagram <= 0:
+        max_datagram = 65507
+    mtu = normalize_network_mtu(network_mtu, 0)
+    if mtu <= 0:
+        return max_datagram
+    udp_cap = mtu - 28  # IPv4(20) + UDP(8)
+    if udp_cap < 548:
+        udp_cap = 548
+    if max_datagram > udp_cap:
+        return udp_cap
+    return max_datagram
+
+
 def normalize_port_hopping_settings(value, default_mode="spread"):
     cfg = value if isinstance(value, dict) else {}
     enabled = parse_bool(cfg.get("enabled", False), False)
@@ -3005,10 +3046,10 @@ def normalize_port_hopping_settings(value, default_mode="spread"):
 
 
 def prompt_network_mtu(default=0):
-    normalized_default = normalize_network_mtu(default, 0)
+    normalized_default = normalize_network_mtu(default, DEFAULT_NETWORK_MTU)
     while True:
         mtu = prompt_int(
-            "Path MTU override (0=disabled, set same on both sides; suggested 1200-1400)",
+            "Path MTU override (0=disabled, set same on both sides; recommended 1300 for Iran paths)",
             normalized_default,
         )
         if mtu == 0:
@@ -3118,10 +3159,10 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
         "port": str(DEFAULT_IRAN_PORT),
         "path": "/tunnel",
         "mux_type": "smux",
-        "network_mtu": 0,
+        "network_mtu": DEFAULT_NETWORK_MTU,
         "mimicry_preset_region": "mixed",
         "mimicry_transport_mode": "websocket",
-        "pool_size": 3,
+        "pool_size": DEFAULT_POOL_SIZE,
         "connection_strategy": "parallel",
         "port_hopping_enabled": False,
         "port_hopping_ports": [],
@@ -3202,9 +3243,9 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
             if confirm_empty in {"y", "yes"}:
                 break
         try:
-            default_pool_size = int(config.get("pool_size", 3))
+            default_pool_size = int(config.get("pool_size", DEFAULT_POOL_SIZE))
         except (TypeError, ValueError):
-            default_pool_size = 3
+            default_pool_size = DEFAULT_POOL_SIZE
         while True:
             pool_size = prompt_int("Connection Pool Size", default_pool_size)
             if pool_size >= 1:
@@ -3396,7 +3437,7 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
     if config["additional_endpoints"] == back_signal:
         print_info("Returning to protocol selection menu...")
         return menu_protocol(role, server_addr=server_addr, defaults=config, prompt_port=prompt_port)
-    config["network_mtu"] = prompt_network_mtu(config.get("network_mtu", 0))
+    config["network_mtu"] = prompt_network_mtu(config.get("network_mtu", DEFAULT_NETWORK_MTU))
 
     return config
 
@@ -3652,7 +3693,7 @@ def load_instance_runtime_settings(role, instance):
     psk = str(security.get("psk", ""))
     license_id = str(parsed.get("license", ""))
     network_cfg = parsed.get("network", {}) if isinstance(parsed.get("network"), dict) else {}
-    network_mtu = normalize_network_mtu(network_cfg.get("mtu", 0), 0)
+    network_mtu = normalize_network_mtu(network_cfg.get("mtu", DEFAULT_NETWORK_MTU), 0)
     http_mimicry_cfg = (
         parsed.get("http_mimicry", {}) if isinstance(parsed.get("http_mimicry"), dict) else {}
     )
@@ -3808,9 +3849,9 @@ def load_instance_runtime_settings(role, instance):
             default_dest_when_empty=str(primary_server.get("type", "tcp")).strip().lower() == "reality",
         )
         try:
-            pool_size = int(client.get("pool_size", 3) or 3)
+            pool_size = int(client.get("pool_size", DEFAULT_POOL_SIZE) or DEFAULT_POOL_SIZE)
         except (TypeError, ValueError):
-            pool_size = 3
+            pool_size = DEFAULT_POOL_SIZE
         if pool_size < 1:
             pool_size = 1
         connection_strategy = normalize_connection_strategy(
@@ -4089,28 +4130,28 @@ def base_tuning(role):
         "version": 2,
         "keepalive_enabled": True,
         "keepalive_every": "5s",
-        "keepalive_timeout": "15s",
+        "keepalive_timeout": "20s",
         "max_frame_size": 32768,
         # Keep buffers moderate so backpressure kicks in before long one-way stalls.
-        "max_receive_buffer": 4 * 1024 * 1024,
-        "max_stream_buffer": 1024 * 1024,
+        "max_receive_buffer": 6 * 1024 * 1024,
+        "max_stream_buffer": 2 * 1024 * 1024,
     }
     return {
         "smux": smux_values,
         "tcp": {
             "no_delay": True,
             "keepalive": "15s",
-            "read_buffer": 8388608,
-            "write_buffer": 8388608,
-            "conn_limit": 5000,
-            "copy_buffer": 262144,
-            "target_dial_pool": 2,
+            "read_buffer": 16777216,
+            "write_buffer": 16777216,
+            "conn_limit": 12000,
+            "copy_buffer": 1048576,
+            "target_dial_pool": 6,
             "max_seg": 1300,
             "auto_tune": True,
         },
         "udp": {
-            "read_buffer": 8388608,
-            "write_buffer": 8388608,
+            "read_buffer": 16777216,
+            "write_buffer": 16777216,
             "max_datagram_size": 65507,
             "session_idle_timeout": "2m",
         },
@@ -4121,9 +4162,9 @@ def base_tuning(role):
             "interval": 20,
             "resend": 2,
             "no_congestion": 1,
-            "mtu": 1200,
-            "send_window": 512,
-            "recv_window": 512,
+            "mtu": 1300,
+            "send_window": 1024,
+            "recv_window": 1024,
         },
         "quic": {
             "alpn": "nodelay-quic-v1",
@@ -4140,8 +4181,132 @@ def base_tuning(role):
     }
 
 
-def configure_tuning(role, deployment_mode):
+def apply_profile_tuning(profile_key, tuning):
+    profile = str(profile_key or "balanced").strip().lower()
+
+    if profile == "performance":
+        tuning["smux"].update(
+            {
+                "keepalive_every": "4s",
+                "keepalive_timeout": "20s",
+                "max_frame_size": 65535,
+                "max_receive_buffer": 8 * 1024 * 1024,
+                "max_stream_buffer": 3 * 1024 * 1024,
+            }
+        )
+        tuning["tcp"].update(
+            {
+                "read_buffer": 16777216,
+                "write_buffer": 16777216,
+                "conn_limit": 20000,
+                "copy_buffer": 1048576,
+                "target_dial_pool": 10,
+            }
+        )
+        tuning["udp"].update({"read_buffer": 16777216, "write_buffer": 16777216})
+        return tuning
+
+    if profile == "latency":
+        tuning["smux"].update(
+            {
+                "keepalive_every": "4s",
+                "keepalive_timeout": "15s",
+                "max_frame_size": 16384,
+                "max_receive_buffer": 2 * 1024 * 1024,
+                "max_stream_buffer": 1024 * 1024,
+            }
+        )
+        tuning["tcp"].update(
+            {
+                "read_buffer": 8388608,
+                "write_buffer": 8388608,
+                "copy_buffer": 524288,
+                "target_dial_pool": 2,
+            }
+        )
+        return tuning
+
+    if profile == "high-load":
+        tuning["smux"].update(
+            {
+                "keepalive_every": "6s",
+                "keepalive_timeout": "30s",
+                "max_frame_size": 65535,
+                "max_receive_buffer": 12 * 1024 * 1024,
+                "max_stream_buffer": 4 * 1024 * 1024,
+            }
+        )
+        tuning["tcp"].update(
+            {
+                "read_buffer": 33554432,
+                "write_buffer": 33554432,
+                "conn_limit": 50000,
+                "copy_buffer": 2097152,
+                "target_dial_pool": 16,
+            }
+        )
+        tuning["udp"].update({"read_buffer": 33554432, "write_buffer": 33554432})
+        return tuning
+
+    if profile == "aggressive":
+        tuning["smux"].update(
+            {
+                "keepalive_every": "5s",
+                "keepalive_timeout": "20s",
+                "max_frame_size": 65535,
+                "max_receive_buffer": 10 * 1024 * 1024,
+                "max_stream_buffer": 4 * 1024 * 1024,
+            }
+        )
+        tuning["tcp"].update(
+            {
+                "copy_buffer": 1048576,
+                "target_dial_pool": 12,
+            }
+        )
+        return tuning
+
+    if profile == "cpu-efficient":
+        tuning["smux"].update(
+            {
+                "keepalive_every": "20s",
+                "keepalive_timeout": "45s",
+                "max_receive_buffer": 2 * 1024 * 1024,
+                "max_stream_buffer": 512 * 1024,
+            }
+        )
+        tuning["tcp"].update(
+            {
+                "copy_buffer": 262144,
+                "target_dial_pool": 1,
+            }
+        )
+        return tuning
+
+    if profile == "gaming":
+        tuning["smux"].update(
+            {
+                "keepalive_every": "3s",
+                "keepalive_timeout": "10s",
+                "max_frame_size": 8192,
+                "max_receive_buffer": 2 * 1024 * 1024,
+                "max_stream_buffer": 1024 * 1024,
+            }
+        )
+        tuning["tcp"].update(
+            {
+                "copy_buffer": 524288,
+                "target_dial_pool": 2,
+            }
+        )
+        return tuning
+
+    return tuning
+
+
+def configure_tuning(role, deployment_mode, profile_key="balanced"):
     tuning = json.loads(json.dumps(base_tuning(role)))
+    tuning = apply_profile_tuning(profile_key, tuning)
     if deployment_mode != "advanced":
         return tuning
 
@@ -4613,7 +4778,18 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
     primary_endpoint = build_server_primary_endpoint(protocol_config)
     all_listens = build_all_endpoints_for_render("server", protocol_config, primary_endpoint)
     mimicry_enabled, http_path = resolve_http_mimicry_state(protocol_config, all_listens)
-    network_mtu = normalize_network_mtu(protocol_config.get("network_mtu", 0), 0)
+    network_mtu = normalize_network_mtu(
+        protocol_config.get("network_mtu", DEFAULT_NETWORK_MTU),
+        DEFAULT_NETWORK_MTU,
+    )
+    tcp_max_seg = effective_tcp_max_seg(tuning["tcp"].get("max_seg"), network_mtu)
+    udp_max_datagram = effective_udp_max_datagram(
+        tuning["udp"].get("max_datagram_size"),
+        network_mtu,
+    )
+    kcp_mtu = tuning["kcp"].get("mtu", 1300)
+    if network_mtu > 0 and (not isinstance(kcp_mtu, int) or kcp_mtu <= 0 or kcp_mtu > network_mtu):
+        kcp_mtu = network_mtu
     reality_enabled = any(
         normalize_endpoint_type(ep.get("type", "tcp"), "tcp") == "reality"
         for ep in all_listens
@@ -4714,13 +4890,13 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
             f"  conn_limit: {yaml_scalar(tuning['tcp']['conn_limit'])}",
             f"  copy_buffer: {yaml_scalar(tuning['tcp']['copy_buffer'])}",
             f"  target_dial_pool: {yaml_scalar(tuning['tcp']['target_dial_pool'])}",
-            f"  max_seg: {yaml_scalar(tuning['tcp']['max_seg'])}",
+            f"  max_seg: {yaml_scalar(tcp_max_seg)}",
             f"  auto_tune: {yaml_scalar(tuning['tcp']['auto_tune'])}",
             "",
             "udp:",
             f"  read_buffer: {yaml_scalar(tuning['udp']['read_buffer'])}",
             f"  write_buffer: {yaml_scalar(tuning['udp']['write_buffer'])}",
-            f"  max_datagram_size: {yaml_scalar(tuning['udp']['max_datagram_size'])}",
+            f"  max_datagram_size: {yaml_scalar(udp_max_datagram)}",
             f"  session_idle_timeout: {yaml_scalar(tuning['udp']['session_idle_timeout'])}",
             "",
             "kcp:",
@@ -4730,7 +4906,7 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
             f"  interval: {yaml_scalar(tuning['kcp']['interval'])}",
             f"  resend: {yaml_scalar(tuning['kcp']['resend'])}",
             f"  no_congestion: {yaml_scalar(tuning['kcp']['no_congestion'])}",
-            f"  mtu: {yaml_scalar(tuning['kcp']['mtu'])}",
+            f"  mtu: {yaml_scalar(kcp_mtu)}",
             f"  send_window: {yaml_scalar(tuning['kcp']['send_window'])}",
             f"  recv_window: {yaml_scalar(tuning['kcp']['recv_window'])}",
             "",
@@ -4807,7 +4983,18 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
     primary_endpoint = build_client_primary_endpoint(protocol_config)
     all_servers = build_all_endpoints_for_render("client", protocol_config, primary_endpoint)
     mimicry_enabled, http_path = resolve_http_mimicry_state(protocol_config, all_servers)
-    network_mtu = normalize_network_mtu(protocol_config.get("network_mtu", 0), 0)
+    network_mtu = normalize_network_mtu(
+        protocol_config.get("network_mtu", DEFAULT_NETWORK_MTU),
+        DEFAULT_NETWORK_MTU,
+    )
+    tcp_max_seg = effective_tcp_max_seg(tuning["tcp"].get("max_seg"), network_mtu)
+    udp_max_datagram = effective_udp_max_datagram(
+        tuning["udp"].get("max_datagram_size"),
+        network_mtu,
+    )
+    kcp_mtu = tuning["kcp"].get("mtu", 1300)
+    if network_mtu > 0 and (not isinstance(kcp_mtu, int) or kcp_mtu <= 0 or kcp_mtu > network_mtu):
+        kcp_mtu = network_mtu
     connection_strategy = normalize_connection_strategy(
         protocol_config.get("connection_strategy", "parallel"),
         "parallel",
@@ -4860,9 +5047,9 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
     reality_public_key = reality_cfg.get("public_key", "")
     mux_type = normalize_mux_type(protocol_config.get("mux_type", "smux"), "smux")
     try:
-        pool_size = int(protocol_config.get("pool_size", 3))
+        pool_size = int(protocol_config.get("pool_size", DEFAULT_POOL_SIZE))
     except (TypeError, ValueError):
-        pool_size = 3
+        pool_size = DEFAULT_POOL_SIZE
     if pool_size < 1:
         pool_size = 1
     lines = [
@@ -4918,13 +5105,13 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         f"  conn_limit: {yaml_scalar(tuning['tcp']['conn_limit'])}",
         f"  copy_buffer: {yaml_scalar(tuning['tcp']['copy_buffer'])}",
         f"  target_dial_pool: {yaml_scalar(tuning['tcp']['target_dial_pool'])}",
-        f"  max_seg: {yaml_scalar(tuning['tcp']['max_seg'])}",
+        f"  max_seg: {yaml_scalar(tcp_max_seg)}",
         f"  auto_tune: {yaml_scalar(tuning['tcp']['auto_tune'])}",
         "",
         "udp:",
         f"  read_buffer: {yaml_scalar(tuning['udp']['read_buffer'])}",
         f"  write_buffer: {yaml_scalar(tuning['udp']['write_buffer'])}",
-        f"  max_datagram_size: {yaml_scalar(tuning['udp']['max_datagram_size'])}",
+        f"  max_datagram_size: {yaml_scalar(udp_max_datagram)}",
         f"  session_idle_timeout: {yaml_scalar(tuning['udp']['session_idle_timeout'])}",
         "",
         "kcp:",
@@ -4934,7 +5121,7 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         f"  interval: {yaml_scalar(tuning['kcp']['interval'])}",
         f"  resend: {yaml_scalar(tuning['kcp']['resend'])}",
         f"  no_congestion: {yaml_scalar(tuning['kcp']['no_congestion'])}",
-        f"  mtu: {yaml_scalar(tuning['kcp']['mtu'])}",
+        f"  mtu: {yaml_scalar(kcp_mtu)}",
         f"  send_window: {yaml_scalar(tuning['kcp']['send_window'])}",
         f"  recv_window: {yaml_scalar(tuning['kcp']['recv_window'])}",
         "",
@@ -5667,7 +5854,7 @@ def install_server_flow(
     cfg["license"] = prompt_license_id()
     cfg["profile"] = select_config_profile()
     deployment_mode = select_deployment_mode()
-    tuning = configure_tuning("server", deployment_mode)
+    tuning = configure_tuning("server", deployment_mode, cfg.get("profile", "balanced"))
     obfuscation_cfg = select_obfuscation_profile()
     if collect_mappings:
         cfg["mappings"] = prompt_server_mappings(
@@ -5701,7 +5888,7 @@ def install_server_flow(
     print(f"Listens:  {Colors.BOLD}{len(all_listens)} endpoint(s){Colors.ENDC}")
     for ep in all_listens:
         print(f"  - {format_endpoint_summary(ep)}")
-    print(f"Path MTU: {Colors.BOLD}{cfg.get('network_mtu', 0)}{Colors.ENDC}")
+    print(f"Path MTU: {Colors.BOLD}{cfg.get('network_mtu', DEFAULT_NETWORK_MTU)}{Colors.ENDC}")
     print(f"Profile:  {Colors.BOLD}{cfg['profile']}{Colors.ENDC}")
     print(f"Mux:      {Colors.BOLD}{cfg.get('mux_type', 'smux')}{Colors.ENDC}")
     print(f"Deploy:   {Colors.BOLD}{deployment_mode}{Colors.ENDC}")
@@ -5767,7 +5954,7 @@ def install_client_flow(
     cfg["license"] = ""
     cfg["profile"] = select_config_profile()
     deployment_mode = select_deployment_mode()
-    tuning = configure_tuning("client", deployment_mode)
+    tuning = configure_tuning("client", deployment_mode, cfg.get("profile", "balanced"))
     obfuscation_cfg = select_obfuscation_profile()
     cfg["server_addr"] = server_addr
     if collect_mappings:
@@ -5798,12 +5985,12 @@ def install_client_flow(
     print(f"Config:     {Colors.BOLD}{config_path}{Colors.ENDC}")
     print(f"Run command: {Colors.BOLD}nodelay client -c {config_path}{Colors.ENDC}")
     print(f"Profile:    {Colors.BOLD}{cfg['profile']}{Colors.ENDC}")
-    print(f"Pool Size:  {Colors.BOLD}{cfg.get('pool_size', 3)}{Colors.ENDC}")
+    print(f"Pool Size:  {Colors.BOLD}{cfg.get('pool_size', DEFAULT_POOL_SIZE)}{Colors.ENDC}")
     print(f"Strategy:   {Colors.BOLD}{cfg.get('connection_strategy', 'parallel')}{Colors.ENDC}")
     print(f"Upstreams:  {Colors.BOLD}{len(all_servers)} endpoint(s){Colors.ENDC}")
     for ep in all_servers:
         print(f"  - {format_endpoint_summary(ep)}")
-    print(f"Path MTU:   {Colors.BOLD}{cfg.get('network_mtu', 0)}{Colors.ENDC}")
+    print(f"Path MTU:   {Colors.BOLD}{cfg.get('network_mtu', DEFAULT_NETWORK_MTU)}{Colors.ENDC}")
     print(f"Mux:        {Colors.BOLD}{cfg.get('mux_type', 'smux')}{Colors.ENDC}")
     print(f"Deploy:     {Colors.BOLD}{deployment_mode}{Colors.ENDC}")
     if cfg["type"] == "reality":
