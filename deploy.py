@@ -33,6 +33,8 @@ WEBPANEL_SERVICE_NAME = "nodelay-webpanel"
 WEBPANEL_BINARY_NAME = "nodelay-webpanel"
 WEBPANEL_DEFAULT_HOST = "0.0.0.0"
 WEBPANEL_DEFAULT_PORT = 8787
+WEBPANEL_REPO_DIR = os.path.join(WEBPANEL_DIR, "repo")
+WEBPANEL_APP_SUBDIR = "webpanel"
 NODELAY_SYSCTL_D_PATH = "/etc/sysctl.d/99-nodelay.conf"
 SYSCTL_CONF_PATH = "/etc/sysctl.conf"
 SYSCTL_CONF_BEGIN = "# BEGIN NoDelay Tunnel managed settings"
@@ -1541,44 +1543,85 @@ def download_binary():
         return False
 
 
-def webpanel_raw_urls():
-    return [
-        f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/{WEBPANEL_BINARY_NAME}",
-        f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/master/{WEBPANEL_BINARY_NAME}",
-        f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/webpanel/{WEBPANEL_BINARY_NAME}",
-        f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/master/webpanel/{WEBPANEL_BINARY_NAME}",
-    ]
+def ensure_git_installed():
+    if shutil.which("git"):
+        return True
+
+    print_info("git is not installed. Attempting automatic installation...")
+    installers = []
+    if shutil.which("apt-get"):
+        installers = [
+            "apt-get update",
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y git",
+        ]
+    elif shutil.which("dnf"):
+        installers = ["dnf install -y git"]
+    elif shutil.which("yum"):
+        installers = ["yum install -y git"]
+    elif shutil.which("apk"):
+        installers = ["apk add --no-cache git"]
+    elif shutil.which("pacman"):
+        installers = ["pacman -Sy --noconfirm git"]
+    elif shutil.which("zypper"):
+        installers = ["zypper --non-interactive install git"]
+
+    if not installers:
+        print_error("Could not detect package manager. Please install git manually.")
+        return False
+
+    for cmd in installers:
+        if not run_command_stream(cmd):
+            print_error(f"Installation command failed: {cmd}")
+            return False
+
+    if not shutil.which("git"):
+        print_error("git installation finished but binary was not found in PATH.")
+        return False
+    print_success("git installed successfully.")
+    return True
 
 
-def download_webpanel_binary(target_path):
-    last_error = None
-    for url in webpanel_raw_urls():
-        print_info(f"Trying webpanel binary URL: {url}")
-        tmp_path = ""
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "NoDelayDeploy/1.0"})
-            with urllib.request.urlopen(req, timeout=45) as response:
-                with tempfile.NamedTemporaryFile(delete=False, dir="/tmp") as tmp_file:
-                    shutil.copyfileobj(response, tmp_file)
-                    tmp_path = tmp_file.name
+def clone_webpanel_repo():
+    if not ensure_git_installed():
+        return None
 
-            if os.path.getsize(tmp_path) <= 0:
-                raise ValueError("downloaded file is empty")
-            os.chmod(tmp_path, 0o755)
-            shutil.move(tmp_path, target_path)
-            print_success(f"✅ Webpanel binary downloaded from repo: {url}")
-            return True
-        except Exception as exc:
-            last_error = exc
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            print_info(f"Failed URL: {exc}")
+    repo_url = f"https://github.com/{REPO_OWNER}/{REPO_NAME}.git"
+    os.makedirs(WEBPANEL_DIR, exist_ok=True)
+
+    if os.path.isdir(WEBPANEL_REPO_DIR):
+        print_info(f"Refreshing existing webpanel repository at {WEBPANEL_REPO_DIR}")
+        shutil.rmtree(WEBPANEL_REPO_DIR)
+
+    repo_q = shlex.quote(WEBPANEL_REPO_DIR)
+    url_q = shlex.quote(repo_url)
+    for branch in ("main", "master"):
+        print_info(f"Cloning repository branch '{branch}'...")
+        cmd = f"git clone --depth 1 --branch {shlex.quote(branch)} {url_q} {repo_q}"
+        rc, out, err = run_command_output(cmd)
+        if rc == 0:
+            app_dir = os.path.join(WEBPANEL_REPO_DIR, WEBPANEL_APP_SUBDIR)
+            server_path = os.path.join(app_dir, "server.py")
+            static_dir = os.path.join(app_dir, "static")
+            if os.path.isfile(server_path) and os.path.isdir(static_dir):
+                os.chmod(server_path, 0o755)
+                print_success(f"✅ Webpanel source ready in {app_dir}")
+                return {
+                    "repo_dir": WEBPANEL_REPO_DIR,
+                    "app_dir": app_dir,
+                    "server_path": server_path,
+                    "env_path": os.path.join(app_dir, ".env"),
+                }
+            print_error(
+                f"Repository cloned but webpanel source files not found in {app_dir}"
+            )
+            return None
+        reason = (err or out or "unknown error").strip()
+        print_info(f"Clone failed for branch '{branch}': {reason}")
 
     print_error(
-        "Could not download webpanel binary from repository raw URLs. "
-        f"Last error: {last_error}"
+        "Failed to clone NoDelay repository. Check network/DNS/GitHub access and try again."
     )
-    return False
+    return None
 
 
 def systemd_env_value(value):
@@ -5403,10 +5446,11 @@ def install_or_update_webpanel(bind_host=WEBPANEL_DEFAULT_HOST, bind_port=WEBPAN
         print_error("Webpanel port must be between 1 and 65535.")
         return False
 
-    os.makedirs(WEBPANEL_DIR, exist_ok=True)
-    target_binary = os.path.join(WEBPANEL_DIR, WEBPANEL_BINARY_NAME)
-    if not download_webpanel_binary(target_binary):
+    repo_paths = clone_webpanel_repo()
+    if not repo_paths:
         return False
+    source_server_path = repo_paths["server_path"]
+    app_dir = repo_paths["app_dir"]
 
     username = ""
     while not username:
@@ -5425,7 +5469,7 @@ def install_or_update_webpanel(bind_host=WEBPANEL_DEFAULT_HOST, bind_port=WEBPAN
             print_error("Password confirmation does not match.")
             password = ""
 
-    env_path = os.path.join(WEBPANEL_DIR, ".env")
+    env_path = repo_paths["env_path"]
     env_lines = [
         f"NODELAY_WEBPANEL_HOST={systemd_env_value(host)}",
         f"NODELAY_WEBPANEL_PORT={systemd_env_value(port)}",
@@ -5437,6 +5481,8 @@ def install_or_update_webpanel(bind_host=WEBPANEL_DEFAULT_HOST, bind_port=WEBPAN
     os.chmod(env_path, 0o600)
 
     service_path = service_file_path(WEBPANEL_SERVICE_NAME)
+    exec_start = f"/usr/bin/env python3 {source_server_path} --host {host} --port {port}"
+
     service_content = f"""[Unit]
 Description=NoDelay Tunnel Web Panel
 After=network.target
@@ -5444,9 +5490,9 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory={WEBPANEL_DIR}
+WorkingDirectory={app_dir}
 EnvironmentFile=-{env_path}
-ExecStart={target_binary} --host {host} --port {port}
+ExecStart={exec_start}
 Restart=always
 RestartSec=2
 KillMode=control-group
@@ -5474,6 +5520,7 @@ WantedBy=multi-user.target
     display_host = host if host not in {"0.0.0.0", "::"} else local_primary_ip()
     print_info(f"Webpanel URL: http://{display_host}:{port}")
     print_info(f"Webpanel auth user: {username}")
+    print_info(f"Webpanel source: {app_dir}")
     print_info(f"Webpanel env file: {env_path}")
     print_info(f"Service logs: journalctl -fu {WEBPANEL_SERVICE_NAME}.service")
     return True
