@@ -59,6 +59,7 @@ ROLE_LABELS = {
 DEFAULT_IRAN_PORT = 9999
 DEFAULT_KHAREJ_PORT = 9999
 TUNING_SECTIONS = ["smux", "tcp", "udp", "kcp", "quic", "reconnect"]
+MUX_TYPES = ["smux", "yamux", "h2mux"]
 IPERF_TEST_DEFAULT_PORT = 9777
 IPERF_TEST_DEFAULT_DURATION = 8
 IPERF_TEST_DEFAULT_STREAMS = 8
@@ -2416,6 +2417,33 @@ def normalize_connection_strategy(value, default="parallel"):
     return default
 
 
+def normalize_mux_type(value, default="smux"):
+    raw = str(value or "").strip().lower()
+    if raw in MUX_TYPES:
+        return raw
+    return default
+
+
+def prompt_mux_type(default="smux"):
+    normalized_default = normalize_mux_type(default, "smux")
+    default_choice = str(MUX_TYPES.index(normalized_default) + 1)
+    print_menu(
+        "🧩 Stream Multiplexer",
+        [
+            f"{Colors.GREEN}[1]{Colors.ENDC} smux (stable default)",
+            f"{Colors.GREEN}[2]{Colors.ENDC} yamux",
+            f"{Colors.GREEN}[3]{Colors.ENDC} h2mux",
+        ],
+        color=Colors.CYAN,
+        min_width=48,
+    )
+    while True:
+        choice = input_default("Mux type [1-3]", default_choice).strip()
+        if choice in {"1", "2", "3"}:
+            return MUX_TYPES[int(choice) - 1]
+        print_error("Invalid choice. Pick 1, 2, or 3.")
+
+
 def normalize_port_hopping_mode(value, default="spread"):
     raw = str(value or "").strip().lower()
     if raw in {"spread", "switch"}:
@@ -2976,6 +3004,7 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
     config = {
         "port": str(DEFAULT_IRAN_PORT),
         "path": "/tunnel",
+        "mux_type": "smux",
         "network_mtu": 0,
         "mimicry_preset_region": "mixed",
         "mimicry_transport_mode": "websocket",
@@ -3082,6 +3111,8 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
                 config["connection_strategy"] = "parallel"
             else:
                 config["connection_strategy"] = "priority"
+
+    config["mux_type"] = prompt_mux_type(config.get("mux_type", "smux"))
 
     if choice == "1":
         config["type"] = "tcp"
@@ -3489,6 +3520,8 @@ def load_instance_runtime_settings(role, instance):
     http_mimicry_cfg = (
         parsed.get("http_mimicry", {}) if isinstance(parsed.get("http_mimicry"), dict) else {}
     )
+    mux_cfg = parsed.get("mux", {}) if isinstance(parsed.get("mux"), dict) else {}
+    mux_type = normalize_mux_type(mux_cfg.get("type", "smux"), "smux")
     mimicry_preset_region = "mixed"
     mimicry_transport_mode = normalize_mimicry_transport_mode(
         http_mimicry_cfg.get("transport_mode", "websocket"),
@@ -3543,6 +3576,7 @@ def load_instance_runtime_settings(role, instance):
         protocol_cfg = {
             "type": str(primary_listen.get("type", "tcp")),
             "tunnel_mode": tunnel_mode,
+            "mux_type": mux_type,
             "port": parse_port_from_address(primary_listen.get("address", ":8443"), 8443),
             "listen_host": parse_host_from_address(primary_listen.get("address", ":8443"), ""),
             "path": str(primary_listen.get("path", "/tunnel")),
@@ -3654,6 +3688,7 @@ def load_instance_runtime_settings(role, instance):
         protocol_cfg = {
             "type": str(primary_server.get("type", "tcp")),
             "tunnel_mode": tunnel_mode,
+            "mux_type": mux_type,
             "port": parse_port_from_address(primary_addr, 8443),
             "server_addr": parse_host_from_address(primary_addr, "127.0.0.1"),
             "pool_size": pool_size,
@@ -4471,6 +4506,7 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
     reality_server_names = reality_cfg.get("server_names", [])
     reality_short_id = reality_cfg.get("short_id", "")
     reality_private_key = reality_cfg.get("private_key", "")
+    mux_type = normalize_mux_type(protocol_config.get("mux_type", "smux"), "smux")
     lines = [
         "mode: server",
         f"tunnel_mode: {yaml_scalar(protocol_config.get('tunnel_mode', 'reverse'))}",
@@ -4517,6 +4553,9 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
             lines.append("  mappings: []")
     lines.extend(
         [
+            "",
+            "mux:",
+            f"  type: {yaml_scalar(mux_type)}",
             "",
             "smux:",
             f"  version: {yaml_scalar(tuning['smux']['version'])}",
@@ -4678,6 +4717,7 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
     reality_server_names = reality_cfg.get("server_names", [])
     reality_short_id = reality_cfg.get("short_id", "")
     reality_public_key = reality_cfg.get("public_key", "")
+    mux_type = normalize_mux_type(protocol_config.get("mux_type", "smux"), "smux")
     try:
         pool_size = int(protocol_config.get("pool_size", 3))
     except (TypeError, ValueError):
@@ -4715,6 +4755,9 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         lines.append("  mappings: []")
     lines.extend(
         [
+        "",
+        "mux:",
+        f"  type: {yaml_scalar(mux_type)}",
         "",
         "smux:",
         f"  version: {yaml_scalar(tuning['smux']['version'])}",
@@ -5106,6 +5149,7 @@ def edit_service_instance(service_name):
             f"Protocol:    {protocol_cfg.get('type')}:{protocol_cfg.get('port')}",
             f"TunnelMode:  {protocol_cfg.get('tunnel_mode', 'reverse')}",
             f"Profile:     {protocol_cfg.get('profile', 'balanced')}",
+            f"Mux:         {protocol_cfg.get('mux_type', 'smux')}",
             f"Obfuscation: {'enabled' if obfuscation_cfg.get('enabled') else 'disabled'}",
         ]
         if role == "server":
@@ -5513,6 +5557,7 @@ def install_server_flow(
         print(f"  - {format_endpoint_summary(ep)}")
     print(f"Path MTU: {Colors.BOLD}{cfg.get('network_mtu', 0)}{Colors.ENDC}")
     print(f"Profile:  {Colors.BOLD}{cfg['profile']}{Colors.ENDC}")
+    print(f"Mux:      {Colors.BOLD}{cfg.get('mux_type', 'smux')}{Colors.ENDC}")
     print(f"Deploy:   {Colors.BOLD}{deployment_mode}{Colors.ENDC}")
     if cfg["type"] == "reality":
         print(f"ShortID:  {Colors.BOLD}{cfg['short_id']}{Colors.ENDC}")
@@ -5613,6 +5658,7 @@ def install_client_flow(
     for ep in all_servers:
         print(f"  - {format_endpoint_summary(ep)}")
     print(f"Path MTU:   {Colors.BOLD}{cfg.get('network_mtu', 0)}{Colors.ENDC}")
+    print(f"Mux:        {Colors.BOLD}{cfg.get('mux_type', 'smux')}{Colors.ENDC}")
     print(f"Deploy:     {Colors.BOLD}{deployment_mode}{Colors.ENDC}")
     if cfg["type"] == "reality":
         print(f"ShortID:    {Colors.BOLD}{cfg['short_id']}{Colors.ENDC}")
