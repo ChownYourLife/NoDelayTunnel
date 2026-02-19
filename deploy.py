@@ -80,10 +80,8 @@ IPERF_POOR_MBPS = 100.0
 MSS_CLAMP_DEFAULT = 1300
 NODELAY_SERVICE_ENV = {
     "GODEBUG": "madvdontneed=1",
-    "GOGC": "80",
-    "GOMEMLIMIT": "2GiB",
-    "NODELAY_FREE_OS_MEM_EVERY": "1m",
-    "NODELAY_PPROF_ADDR": "off",
+    "NODELAY_FREE_OS_MEM_EVERY": "10m",
+    "NODELAY_PPROF_ADDR": "127.0.0.1:6060",
 }
 
 # DER prefixes for extracting raw x25519 keys (last 32 bytes are key material)
