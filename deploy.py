@@ -21,6 +21,8 @@ REPO_OWNER = "ChownYourLife"
 REPO_NAME = "NoDelayTunnel"
 BINARY_NAME = "nodelay"
 INSTALL_DIR = "/usr/local/bin"
+MANAGER_ALIAS_NAME = "nodelay-manager"
+MANAGER_ALIAS_PATH = os.path.join(INSTALL_DIR, MANAGER_ALIAS_NAME)
 CONFIG_DIR = "/etc/nodelay"
 SERVER_SERVICE_NAME = "nodelay-server"
 CLIENT_SERVICE_NAME = "nodelay-client"
@@ -61,6 +63,13 @@ IPERF_GOOD_MBPS = 150.0
 IPERF_EXCELLENT_MBPS = 200.0
 IPERF_POOR_MBPS = 100.0
 MSS_CLAMP_DEFAULT = 1300
+SYSTEMD_RUNTIME_ENV = {
+    "GODEBUG": "madvdontneed=1",
+    "GOMEMLIMIT": "512MiB",
+    "NODELAY_MEM_HOUSEKEEPER": "1",
+    "NODELAY_MEM_HOUSEKEEPER_INTERVAL": "30s",
+    "NODELAY_MEM_HOUSEKEEPER_MIN_HEAP": "256MiB",
+}
 
 # DER prefixes for extracting raw x25519 keys (last 32 bytes are key material)
 X25519_PRIVATE_DER_PREFIX = bytes.fromhex("302e020100300506032b656e04220420")
@@ -348,6 +357,36 @@ def check_root():
         sys.exit(1)
 
 
+
+def install_manager_alias():
+    check_root()
+
+    source_script = os.path.realpath(__file__)
+    if not os.path.exists(source_script):
+        print_error(f"Source script not found: {source_script}")
+        return False
+
+    if os.path.isdir(MANAGER_ALIAS_PATH):
+        print_error(f"Cannot install alias because path is a directory: {MANAGER_ALIAS_PATH}")
+        return False
+
+    wrapper = (
+        "#!/usr/bin/env bash\n"
+        f"exec python3 {shlex.quote(source_script)} \"$@\"\n"
+    )
+
+    try:
+        with open(MANAGER_ALIAS_PATH, "w") as handle:
+            handle.write(wrapper)
+        os.chmod(MANAGER_ALIAS_PATH, 0o755)
+    except OSError as exc:
+        print_error(f"Failed to install alias at {MANAGER_ALIAS_PATH}: {exc}")
+        return False
+
+    print_success(f"Installed command alias: {MANAGER_ALIAS_NAME}")
+    print_info(f"Path: {MANAGER_ALIAS_PATH}")
+    print_info(f"Run: {MANAGER_ALIAS_NAME}")
+    return True
 def set_sysctl_conf_managed_block(setting_lines):
     existing_lines = []
     if os.path.exists(SYSCTL_CONF_PATH):
@@ -4036,6 +4075,10 @@ def create_service(role, instance="default"):
     config_path = os.path.join(CONFIG_DIR, build_config_filename(role, instance))
     exec_start = f"{os.path.join(INSTALL_DIR, BINARY_NAME)} {profile['mode']} -c {config_path}"
     description = profile["description"] if instance == "default" else f"{profile['description']} [{instance}]"
+    env_lines = "\n".join(
+        f'Environment="{key}={value}"'
+        for key, value in SYSTEMD_RUNTIME_ENV.items()
+    )
     content = f"""[Unit]
 Description={description}
 After=network.target
@@ -4043,6 +4086,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
+{env_lines}
 ExecStart={exec_start}
 Restart=always
 RestartSec=3
@@ -4756,6 +4800,7 @@ def main_menu():
                 f"{Colors.CYAN}[6]{Colors.ENDC} 🧩 Multi Tunnel Management",
                 f"{Colors.CYAN}[7]{Colors.ENDC} ⚙️ Linux Optimization",
                 f"{Colors.CYAN}[8]{Colors.ENDC} 🌐 Direct Connectivity Test (iperf3)",
+                f"{Colors.CYAN}[9]{Colors.ENDC} 🧷 Install nodelay-manager alias",
                 f"{Colors.WARNING}[0]{Colors.ENDC} 🚪 Exit",
             ],
             color=Colors.CYAN,
@@ -4804,15 +4849,39 @@ def main_menu():
             check_root()
             direct_connectivity_test_menu()
 
+        elif choice == "9":
+            install_manager_alias()
+            input("\nPress Enter to continue...")
+
         elif choice == "0":
             sys.exit(0)
         else:
             print_error("Invalid choice.")
 
 
+
+def handle_cli_args():
+    if len(sys.argv) <= 1:
+        return False
+
+    arg = str(sys.argv[1]).strip().lower()
+    if arg in {"--install-manager", "install-manager"}:
+        install_manager_alias()
+        return True
+
+    if arg in {"-h", "--help", "help"}:
+        print("Usage:")
+        print(f"  {os.path.basename(__file__)} --install-manager")
+        print(f"      Install command alias at {MANAGER_ALIAS_PATH}")
+        print(f"  {os.path.basename(__file__)}")
+        print("      Launch interactive manager menu")
+        return True
+
+    return False
 if __name__ == "__main__":
     try:
-        main_menu()
+        if not handle_cli_args():
+            main_menu()
     except KeyboardInterrupt:
         print("\nExiting...")
         sys.exit(0)
