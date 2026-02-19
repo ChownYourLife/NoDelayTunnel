@@ -78,6 +78,13 @@ IPERF_GOOD_MBPS = 150.0
 IPERF_EXCELLENT_MBPS = 200.0
 IPERF_POOR_MBPS = 100.0
 MSS_CLAMP_DEFAULT = 1300
+NODELAY_SERVICE_ENV = {
+    "GODEBUG": "madvdontneed=1",
+    "GOGC": "80",
+    "GOMEMLIMIT": "2GiB",
+    "NODELAY_FREE_OS_MEM_EVERY": "1m",
+    "NODELAY_PPROF_ADDR": "off",
+}
 
 # DER prefixes for extracting raw x25519 keys (last 32 bytes are key material)
 X25519_PRIVATE_DER_PREFIX = bytes.fromhex("302e020100300506032b656e04220420")
@@ -4141,11 +4148,11 @@ def base_tuning(role):
         "tcp": {
             "no_delay": True,
             "keepalive": "15s",
-            "read_buffer": 16777216,
-            "write_buffer": 16777216,
+            "read_buffer": 0,
+            "write_buffer": 0,
             "conn_limit": 12000,
-            "copy_buffer": 1048576,
-            "target_dial_pool": 6,
+            "copy_buffer": 131072,
+            "target_dial_pool": 2,
             "max_seg": 1300,
             "auto_tune": True,
         },
@@ -4191,16 +4198,17 @@ def apply_profile_tuning(profile_key, tuning):
                 "keepalive_timeout": "20s",
                 "max_frame_size": 65535,
                 "max_receive_buffer": 8 * 1024 * 1024,
-                "max_stream_buffer": 3 * 1024 * 1024,
+                "max_stream_buffer": 2 * 1024 * 1024,
             }
         )
         tuning["tcp"].update(
             {
-                "read_buffer": 16777216,
-                "write_buffer": 16777216,
+                "read_buffer": 0,
+                "write_buffer": 0,
                 "conn_limit": 20000,
-                "copy_buffer": 1048576,
-                "target_dial_pool": 10,
+                "copy_buffer": 131072,
+                "target_dial_pool": 2,
+                "auto_tune": True,
             }
         )
         tuning["udp"].update({"read_buffer": 16777216, "write_buffer": 16777216})
@@ -4218,9 +4226,9 @@ def apply_profile_tuning(profile_key, tuning):
         )
         tuning["tcp"].update(
             {
-                "read_buffer": 8388608,
-                "write_buffer": 8388608,
-                "copy_buffer": 524288,
+                "read_buffer": 0,
+                "write_buffer": 0,
+                "copy_buffer": 131072,
                 "target_dial_pool": 2,
             }
         )
@@ -4233,16 +4241,17 @@ def apply_profile_tuning(profile_key, tuning):
                 "keepalive_timeout": "30s",
                 "max_frame_size": 65535,
                 "max_receive_buffer": 12 * 1024 * 1024,
-                "max_stream_buffer": 4 * 1024 * 1024,
+                "max_stream_buffer": 2 * 1024 * 1024,
             }
         )
         tuning["tcp"].update(
             {
-                "read_buffer": 33554432,
-                "write_buffer": 33554432,
+                "read_buffer": 0,
+                "write_buffer": 0,
                 "conn_limit": 50000,
-                "copy_buffer": 2097152,
-                "target_dial_pool": 16,
+                "copy_buffer": 131072,
+                "target_dial_pool": 2,
+                "auto_tune": True,
             }
         )
         tuning["udp"].update({"read_buffer": 33554432, "write_buffer": 33554432})
@@ -4255,13 +4264,14 @@ def apply_profile_tuning(profile_key, tuning):
                 "keepalive_timeout": "20s",
                 "max_frame_size": 65535,
                 "max_receive_buffer": 10 * 1024 * 1024,
-                "max_stream_buffer": 4 * 1024 * 1024,
+                "max_stream_buffer": 2 * 1024 * 1024,
             }
         )
         tuning["tcp"].update(
             {
-                "copy_buffer": 1048576,
-                "target_dial_pool": 12,
+                "copy_buffer": 131072,
+                "target_dial_pool": 2,
+                "auto_tune": True,
             }
         )
         return tuning
@@ -4277,8 +4287,8 @@ def apply_profile_tuning(profile_key, tuning):
         )
         tuning["tcp"].update(
             {
-                "copy_buffer": 262144,
-                "target_dial_pool": 1,
+                "copy_buffer": 131072,
+                "target_dial_pool": 2,
             }
         )
         return tuning
@@ -4295,7 +4305,7 @@ def apply_profile_tuning(profile_key, tuning):
         )
         tuning["tcp"].update(
             {
-                "copy_buffer": 524288,
+                "copy_buffer": 131072,
                 "target_dial_pool": 2,
             }
         )
@@ -5254,6 +5264,10 @@ def create_service(role, instance="default"):
     config_path = os.path.join(CONFIG_DIR, build_config_filename(role, instance))
     exec_start = f"{os.path.join(INSTALL_DIR, BINARY_NAME)} {profile['mode']} -c {config_path}"
     description = profile["description"] if instance == "default" else f"{profile['description']} [{instance}]"
+    env_lines = "\n".join(
+        f"Environment={systemd_env_value(f'{key}={value}')}"
+        for key, value in NODELAY_SERVICE_ENV.items()
+    )
     content = f"""[Unit]
 Description={description}
 After=network.target
@@ -5261,6 +5275,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
+{env_lines}
 ExecStart={exec_start}
 Restart=always
 RestartSec=3
@@ -5269,7 +5284,6 @@ TimeoutStopSec=8s
 KillSignal=SIGTERM
 FinalKillSignal=SIGKILL
 SendSIGKILL=yes
-LimitNOFILE=infinity
 LogRateLimitIntervalSec=1h
 LogRateLimitBurst=5000
 
