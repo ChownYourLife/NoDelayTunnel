@@ -23,6 +23,8 @@ BINARY_NAME = "nodelay"
 INSTALL_DIR = "/usr/local/bin"
 MANAGER_ALIAS_NAME = "nodelay-manager"
 MANAGER_ALIAS_PATH = os.path.join(INSTALL_DIR, MANAGER_ALIAS_NAME)
+MANAGER_UPDATE_RAW_MAIN = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/deploy.py"
+MANAGER_UPDATE_TIMEOUT = 20
 CONFIG_DIR = "/etc/nodelay"
 SERVER_SERVICE_NAME = "nodelay-server"
 CLIENT_SERVICE_NAME = "nodelay-client"
@@ -387,6 +389,104 @@ def install_manager_alias():
     print_info(f"Path: {MANAGER_ALIAS_PATH}")
     print_info(f"Run: {MANAGER_ALIAS_NAME}")
     return True
+
+
+def update_manager_script():
+    check_root()
+
+    source_script = os.path.realpath(__file__)
+    if not os.path.exists(source_script):
+        print_error(f"Source script not found: {source_script}")
+        return False
+
+    print_header("⬆️ Updating nodelay-manager Script")
+
+    release = get_latest_release()
+    candidate_urls = []
+    latest_tag = ""
+    if isinstance(release, dict):
+        latest_tag = str(release.get("tag_name", "")).strip()
+        if latest_tag:
+            candidate_urls.append(
+                f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/{latest_tag}/deploy.py"
+            )
+    candidate_urls.append(MANAGER_UPDATE_RAW_MAIN)
+
+    fetched_text = ""
+    fetched_from = ""
+    errors_seen = []
+
+    for url in candidate_urls:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "nodelay-manager-updater"},
+            )
+            with urllib.request.urlopen(req, timeout=MANAGER_UPDATE_TIMEOUT) as resp:
+                body = resp.read().decode("utf-8")
+            if "def main_menu(" not in body or "NoDelay" not in body:
+                raise ValueError("downloaded file does not look like deploy.py")
+            fetched_text = body
+            fetched_from = url
+            break
+        except Exception as exc:
+            errors_seen.append(f"{url}: {exc}")
+
+    if not fetched_text:
+        print_error("Failed to download latest deploy.py")
+        for item in errors_seen:
+            print_error(item)
+        return False
+
+    try:
+        with open(source_script, "r", encoding="utf-8") as handle:
+            current_text = handle.read()
+    except OSError as exc:
+        print_error(f"Failed to read current script: {exc}")
+        return False
+    normalized_new = fetched_text.replace("\r\n", "\n")
+    if not normalized_new.endswith("\n"):
+        normalized_new += "\n"
+
+    if current_text == normalized_new:
+        print_info("nodelay-manager is already up to date.")
+        print_info(f"Source: {fetched_from}")
+        install_manager_alias()
+        return True
+
+    backup_path = f"{source_script}.bak.{int(time.time())}"
+    tmp_path = ""
+    try:
+        shutil.copy2(source_script, backup_path)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=os.path.dirname(source_script) or ".",
+            delete=False,
+        ) as tmp:
+            tmp.write(normalized_new)
+            tmp_path = tmp.name
+        os.chmod(tmp_path, 0o755)
+        os.replace(tmp_path, source_script)
+    except Exception as exc:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        print_error(f"Failed to replace script: {exc}")
+        print_info(f"Backup kept at: {backup_path}")
+        return False
+
+    print_success("Updated nodelay-manager script successfully.")
+    if latest_tag:
+        print_info(f"Release tag: {latest_tag}")
+    print_info(f"Downloaded from: {fetched_from}")
+    print_info(f"Backup: {backup_path}")
+
+    install_manager_alias()
+    return True
+
 def set_sysctl_conf_managed_block(setting_lines):
     existing_lines = []
     if os.path.exists(SYSCTL_CONF_PATH):
@@ -4795,12 +4895,13 @@ def main_menu():
                 f"{Colors.GREEN}[1]{Colors.ENDC} 🟢 Direct Tunnel Setup (IR -> KH)",
                 f"{Colors.GREEN}[2]{Colors.ENDC} 🔁 Reverse Tunnel Setup (KH -> IR)",
                 f"{Colors.CYAN}[3]{Colors.ENDC} 🔄 Update Binary",
-                f"{Colors.CYAN}[4]{Colors.ENDC} 🗑️  Uninstall",
-                f"{Colors.CYAN}[5]{Colors.ENDC} 📊 Monitor / Logs / Service Control",
-                f"{Colors.CYAN}[6]{Colors.ENDC} 🧩 Multi Tunnel Management",
-                f"{Colors.CYAN}[7]{Colors.ENDC} ⚙️ Linux Optimization",
-                f"{Colors.CYAN}[8]{Colors.ENDC} 🌐 Direct Connectivity Test (iperf3)",
-                f"{Colors.CYAN}[9]{Colors.ENDC} 🧷 Install nodelay-manager alias",
+                f"{Colors.CYAN}[4]{Colors.ENDC} 📊 Monitor / Logs / Service Control",
+                f"{Colors.CYAN}[5]{Colors.ENDC} 🧩 Multi Tunnel Management",
+                f"{Colors.CYAN}[6]{Colors.ENDC} ⚙️ Linux Optimization",
+                f"{Colors.CYAN}[7]{Colors.ENDC} 🌐 Direct Connectivity Test (iperf3)",
+                f"{Colors.CYAN}[8]{Colors.ENDC} 🧷 Install nodelay-manager alias",
+                f"{Colors.CYAN}[9]{Colors.ENDC} ⬆️ Update nodelay-manager script",
+                f"{Colors.CYAN}[10]{Colors.ENDC} 🗑️  Uninstall",
                 f"{Colors.WARNING}[0]{Colors.ENDC} 🚪 Exit",
             ],
             color=Colors.CYAN,
@@ -4829,28 +4930,32 @@ def main_menu():
                 input("\nPress Enter to continue...")
 
         elif choice == "4":
-            uninstall_everything()
-            input("\nPress Enter to continue...")
-
-        elif choice == "5":
             check_root()
             service_control_menu()
 
-        elif choice == "6":
+        elif choice == "5":
             check_root()
             multi_tunnel_menu()
 
-        elif choice == "7":
+        elif choice == "6":
             check_root()
             maybe_apply_linux_network_tuning()
             input("\nPress Enter to continue...")
 
-        elif choice == "8":
+        elif choice == "7":
             check_root()
             direct_connectivity_test_menu()
 
-        elif choice == "9":
+        elif choice == "8":
             install_manager_alias()
+            input("\nPress Enter to continue...")
+
+        elif choice == "9":
+            update_manager_script()
+            input("\nPress Enter to continue...")
+
+        elif choice == "10":
+            uninstall_everything()
             input("\nPress Enter to continue...")
 
         elif choice == "0":
@@ -4869,10 +4974,16 @@ def handle_cli_args():
         install_manager_alias()
         return True
 
+    if arg in {"--update-manager", "update-manager"}:
+        update_manager_script()
+        return True
+
     if arg in {"-h", "--help", "help"}:
         print("Usage:")
         print(f"  {os.path.basename(__file__)} --install-manager")
         print(f"      Install command alias at {MANAGER_ALIAS_PATH}")
+        print(f"  {os.path.basename(__file__)} --update-manager")
+        print("      Fetch and replace this script with the latest deploy.py")
         print(f"  {os.path.basename(__file__)}")
         print("      Launch interactive manager menu")
         return True
