@@ -75,6 +75,7 @@ SYSTEMD_RUNTIME_ENV = {
     "NODELAY_MEM_HOUSEKEEPER_MIN_HEAP": "512MiB",
 }
 DEFAULT_SERVICE_RESTART_MINUTES = 0
+DEFAULT_SERVICE_RESTART_SECONDS = 3
 DEFAULT_SERVICE_RUNTIME_MAX_MINUTES = 0
 
 # DER prefixes for extracting raw x25519 keys (last 32 bytes are key material)
@@ -409,18 +410,8 @@ def parse_service_restart_minutes(service_name, fallback=0):
 
 
 def prompt_service_restart_minutes(default_minutes=0):
-    default_minutes = normalize_service_restart_minutes(default_minutes, 0)
-    while True:
-        raw = input_default("Auto-restart delay in minutes (0 = disabled)", str(default_minutes)).strip()
-        try:
-            value = int(raw)
-        except ValueError:
-            print_error("Please enter an integer >= 0.")
-            continue
-        if value < 0:
-            print_error("Please enter an integer >= 0.")
-            continue
-        return value
+    _ = normalize_service_restart_minutes(default_minutes, 0)
+    return DEFAULT_SERVICE_RESTART_MINUTES
 
 
 def normalize_service_runtime_max_minutes(value, default=0):
@@ -4578,12 +4569,10 @@ def generate_client_config(protocol_config, tuning, obfuscation_cfg, config_file
 
 
 def render_service_restart_lines(restart_minutes):
-    restart_minutes = normalize_service_restart_minutes(
+    _ = normalize_service_restart_minutes(
         restart_minutes, DEFAULT_SERVICE_RESTART_MINUTES
     )
-    if restart_minutes <= 0:
-        return "Restart=always"
-    return f"Restart=always\nRestartSec={restart_minutes}m"
+    return f"Restart=always\nRestartSec={DEFAULT_SERVICE_RESTART_SECONDS}"
 
 
 def render_service_runtime_max_lines(runtime_max_minutes):
@@ -4604,11 +4593,7 @@ def create_service(role, instance="default", restart_minutes=0, runtime_max_minu
     )
     restart_lines = render_service_restart_lines(restart_minutes)
     runtime_max_lines = render_service_runtime_max_lines(runtime_max_minutes)
-    restart_label = (
-        "disabled"
-        if restart_minutes == 0
-        else f"{restart_minutes} minute(s)"
-    )
+    restart_label = f"always ({DEFAULT_SERVICE_RESTART_SECONDS}s)"
     runtime_max_label = (
         "disabled"
         if runtime_max_minutes == 0
@@ -4853,7 +4838,7 @@ def edit_service_instance(service_name):
             f"Profile:     {protocol_cfg.get('profile', 'balanced')}",
             f"Obfuscation: {'enabled' if obfuscation_cfg.get('enabled') else 'disabled'}",
             (
-                f"AutoRestart: {normalize_service_restart_minutes(protocol_cfg.get('service_restart_minutes', 0), 0)} min (0=off)"
+                f"AutoRestart: always ({DEFAULT_SERVICE_RESTART_SECONDS}s)"
             ),
             (
                 f"RuntimeMax: {normalize_service_runtime_max_minutes(protocol_cfg.get('service_runtime_max_minutes', 0), 0)} min (0=off)"
@@ -4882,7 +4867,7 @@ def edit_service_instance(service_name):
                     "4. Edit port mappings",
                     "5. Edit advanced tuning",
                     "6. Edit license ID",
-                    "7. Edit service restart/runtime max",
+                    "7. Edit service runtime max",
                     "8. Save changes and restart service",
                     "0. Cancel",
                 ]
@@ -4893,7 +4878,7 @@ def edit_service_instance(service_name):
                     "4. Edit port mappings",
                     "5. Edit advanced tuning",
                     "6. Edit license ID",
-                    "7. Edit service restart/runtime max",
+                    "7. Edit service runtime max",
                     "8. Save changes and restart service",
                     "0. Cancel",
                 ]
@@ -4903,7 +4888,7 @@ def edit_service_instance(service_name):
                 [
                     "4. Edit advanced tuning",
                     "5. Edit license ID",
-                    "6. Edit service restart/runtime max",
+                    "6. Edit service runtime max",
                     "7. Save changes and restart service",
                     "0. Cancel",
                 ]
@@ -4974,9 +4959,6 @@ def edit_service_instance(service_name):
         elif (choice == "6" and role == "server") or (choice == "6" and client_direct_mode) or (choice == "5" and role == "client" and not client_direct_mode):
             protocol_cfg["license"] = prompt_license_id()
         elif (choice == "7" and role == "server") or (choice == "7" and client_direct_mode) or (choice == "6" and role == "client" and not client_direct_mode):
-            protocol_cfg["service_restart_minutes"] = prompt_service_restart_minutes(
-                default_minutes=protocol_cfg.get("service_restart_minutes", 0)
-            )
             protocol_cfg["service_runtime_max_minutes"] = prompt_service_runtime_max_minutes(
                 default_minutes=protocol_cfg.get("service_runtime_max_minutes", 0)
             )
