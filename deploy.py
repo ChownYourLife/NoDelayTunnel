@@ -66,12 +66,13 @@ IPERF_EXCELLENT_MBPS = 200.0
 IPERF_POOR_MBPS = 100.0
 MSS_CLAMP_DEFAULT = 1300
 SYSTEMD_RUNTIME_ENV = {
-    "GODEBUG": "madvdontneed=1",
-    "GOMEMLIMIT": "512MiB",
+    "GOMEMLIMIT": "1GiB",
     "NODELAY_MEM_HOUSEKEEPER": "1",
-    "NODELAY_MEM_HOUSEKEEPER_INTERVAL": "30s",
-    "NODELAY_MEM_HOUSEKEEPER_MIN_HEAP": "256MiB",
+    "NODELAY_MEM_HOUSEKEEPER_INTERVAL": "300s",
+    "NODELAY_MEM_HOUSEKEEPER_MIN_HEAP": "512MiB",
 }
+DEFAULT_SERVICE_RESTART_MINUTES = 0
+DEFAULT_SERVICE_RUNTIME_MAX_MINUTES = 0
 
 # DER prefixes for extracting raw x25519 keys (last 32 bytes are key material)
 X25519_PRIVATE_DER_PREFIX = bytes.fromhex("302e020100300506032b656e04220420")
@@ -352,6 +353,150 @@ def print_services_status():
         print(f"{service}.service")
         print(f"  active:  {active}")
         print(f"  enabled: {enabled}")
+
+
+def normalize_service_restart_minutes(value, default=0):
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        minutes = int(default)
+    if minutes < 0:
+        minutes = int(default)
+    return minutes
+
+
+def parse_service_restart_minutes(service_name, fallback=0):
+    fallback_minutes = normalize_service_restart_minutes(fallback, 0)
+    service_path = service_file_path(service_name)
+    content = ""
+
+    if os.path.exists(service_path):
+        with open(service_path, "r") as f:
+            content = f.read()
+    else:
+        quoted = shlex.quote(f"{service_name}.service")
+        rc, stdout, _ = run_command_output(f"systemctl cat {quoted}")
+        if rc == 0:
+            content = stdout
+
+    if not content:
+        return fallback_minutes
+
+    restart_match = re.search(r"(?im)^Restart\s*=\s*([^\n#;]+)", content)
+    if restart_match:
+        restart_mode = restart_match.group(1).strip().lower()
+        if restart_mode in {"no", "off", "false", "never"}:
+            return 0
+
+    sec_match = re.search(r"(?im)^RestartSec\s*=\s*([^\n#;]+)", content)
+    if not sec_match:
+        return fallback_minutes
+
+    token = sec_match.group(1).strip().lower()
+    min_match = re.fullmatch(r"(\d+)\s*(?:m|min|minute|minutes)", token)
+    if min_match:
+        return int(min_match.group(1))
+
+    sec_value_match = re.fullmatch(r"(\d+)\s*(?:s|sec|second|seconds)?", token)
+    if sec_value_match:
+        seconds = int(sec_value_match.group(1))
+        return 0 if seconds <= 0 else max(1, (seconds + 59) // 60)
+
+    return fallback_minutes
+
+
+def prompt_service_restart_minutes(default_minutes=0):
+    default_minutes = normalize_service_restart_minutes(default_minutes, 0)
+    while True:
+        raw = input_default("Auto-restart delay in minutes (0 = disabled)", str(default_minutes)).strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            print_error("Please enter an integer >= 0.")
+            continue
+        if value < 0:
+            print_error("Please enter an integer >= 0.")
+            continue
+        return value
+
+
+def normalize_service_runtime_max_minutes(value, default=0):
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        minutes = int(default)
+    if minutes < 0:
+        minutes = int(default)
+    return minutes
+
+
+def _parse_time_value_to_seconds(raw):
+    token = str(raw or "").strip().lower()
+    if token in {"", "infinity", "infinite", "inf", "0", "0s"}:
+        return 0
+
+    m = re.fullmatch(r"(\d+)\s*(?:s|sec|second|seconds)?", token)
+    if m:
+        return int(m.group(1))
+
+    m = re.fullmatch(r"(\d+)\s*(?:m|min|minute|minutes)", token)
+    if m:
+        return int(m.group(1)) * 60
+
+    m = re.fullmatch(r"(\d+)\s*(?:h|hr|hour|hours)", token)
+    if m:
+        return int(m.group(1)) * 3600
+
+    m = re.fullmatch(r"(\d+)\s*(?:d|day|days)", token)
+    if m:
+        return int(m.group(1)) * 86400
+
+    return None
+
+
+def parse_service_runtime_max_minutes(service_name, fallback=0):
+    fallback_minutes = normalize_service_runtime_max_minutes(fallback, 0)
+    service_path = service_file_path(service_name)
+    content = ""
+
+    if os.path.exists(service_path):
+        with open(service_path, "r") as f:
+            content = f.read()
+    else:
+        quoted = shlex.quote(f"{service_name}.service")
+        rc, stdout, _ = run_command_output(f"systemctl cat {quoted}")
+        if rc == 0:
+            content = stdout
+
+    if not content:
+        return fallback_minutes
+
+    match = re.search(r"(?im)^RuntimeMaxSec\s*=\s*([^\n#;]+)", content)
+    if not match:
+        return fallback_minutes
+
+    seconds = _parse_time_value_to_seconds(match.group(1))
+    if seconds is None:
+        return fallback_minutes
+    if seconds <= 0:
+        return 0
+    return max(1, (seconds + 59) // 60)
+
+
+def prompt_service_runtime_max_minutes(default_minutes=0):
+    default_minutes = normalize_service_runtime_max_minutes(default_minutes, 0)
+    while True:
+        raw = input_default("Runtime max in minutes (0 = disabled)", str(default_minutes)).strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            print_error("Please enter an integer >= 0.")
+            continue
+        if value < 0:
+            print_error("Please enter an integer >= 0.")
+            continue
+        return value
+
 
 def check_root():
     if os.geteuid() != 0:
@@ -2833,6 +2978,13 @@ def load_instance_runtime_settings(role, instance):
     config_path = os.path.join(CONFIG_DIR, build_config_filename(role, instance))
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config not found: {config_path}")
+    service_name = build_service_name(role, instance)
+    service_restart_minutes = parse_service_restart_minutes(
+        service_name, fallback=DEFAULT_SERVICE_RESTART_MINUTES
+    )
+    service_runtime_max_minutes = parse_service_runtime_max_minutes(
+        service_name, fallback=DEFAULT_SERVICE_RUNTIME_MAX_MINUTES
+    )
 
     with open(config_path, "r") as f:
         parsed = parse_simple_yaml(f.read())
@@ -2925,6 +3077,8 @@ def load_instance_runtime_settings(role, instance):
             "generated_private_key": "",
             "reality_key_generated": False,
             "license": license_id,
+            "service_restart_minutes": service_restart_minutes,
+            "service_runtime_max_minutes": service_runtime_max_minutes,
             "profile": profile,
         }
         mappings = (
@@ -3025,6 +3179,8 @@ def load_instance_runtime_settings(role, instance):
             "generated_private_key": "",
             "reality_key_generated": False,
             "license": license_id,
+            "service_restart_minutes": service_restart_minutes,
+            "service_runtime_max_minutes": service_runtime_max_minutes,
             "profile": profile,
         }
         mappings = client.get("mappings", [])
@@ -4168,7 +4324,43 @@ def generate_client_config(protocol_config, tuning, obfuscation_cfg, config_file
     return config_path
 
 
-def create_service(role, instance="default"):
+def render_service_restart_lines(restart_minutes):
+    restart_minutes = normalize_service_restart_minutes(
+        restart_minutes, DEFAULT_SERVICE_RESTART_MINUTES
+    )
+    if restart_minutes <= 0:
+        return "Restart=no"
+    return f"Restart=always\nRestartSec={restart_minutes}m"
+
+
+def render_service_runtime_max_lines(runtime_max_minutes):
+    runtime_max_minutes = normalize_service_runtime_max_minutes(
+        runtime_max_minutes, DEFAULT_SERVICE_RUNTIME_MAX_MINUTES
+    )
+    if runtime_max_minutes <= 0:
+        return "RuntimeMaxSec=infinity"
+    return f"RuntimeMaxSec={runtime_max_minutes * 60}"
+
+
+def create_service(role, instance="default", restart_minutes=0, runtime_max_minutes=0):
+    restart_minutes = normalize_service_restart_minutes(
+        restart_minutes, DEFAULT_SERVICE_RESTART_MINUTES
+    )
+    runtime_max_minutes = normalize_service_runtime_max_minutes(
+        runtime_max_minutes, DEFAULT_SERVICE_RUNTIME_MAX_MINUTES
+    )
+    restart_lines = render_service_restart_lines(restart_minutes)
+    runtime_max_lines = render_service_runtime_max_lines(runtime_max_minutes)
+    restart_label = (
+        "disabled"
+        if restart_minutes == 0
+        else f"{restart_minutes} minute(s)"
+    )
+    runtime_max_label = (
+        "disabled"
+        if runtime_max_minutes == 0
+        else f"{runtime_max_minutes} minute(s)"
+    )
     profile = SERVICE_PROFILES[role]
     service_name = build_service_name(role, instance)
     service_path = service_file_path(service_name)
@@ -4188,8 +4380,8 @@ Type=simple
 User=root
 {env_lines}
 ExecStart={exec_start}
-Restart=always
-RestartSec=3
+{restart_lines}
+{runtime_max_lines}
 KillMode=control-group
 TimeoutStopSec=8s
 KillSignal=SIGTERM
@@ -4206,7 +4398,10 @@ WantedBy=multi-user.target
     run_command("systemctl daemon-reload")
     run_command(f"systemctl enable {service_name}")
     run_command(f"systemctl restart {service_name}")
-    print_success(f"✅ Systemd service installed and started: {service_name}.service")
+    print_success(
+        f"✅ Systemd service installed and started: {service_name}.service "
+        f"(auto-restart: {restart_label}, runtime-max: {runtime_max_label})"
+    )
 
 
 def stop_service_fast(service_name, grace_seconds=5.0):
@@ -4404,6 +4599,12 @@ def edit_service_instance(service_name):
             f"TunnelMode:  {protocol_cfg.get('tunnel_mode', 'reverse')}",
             f"Profile:     {protocol_cfg.get('profile', 'balanced')}",
             f"Obfuscation: {'enabled' if obfuscation_cfg.get('enabled') else 'disabled'}",
+            (
+                f"AutoRestart: {normalize_service_restart_minutes(protocol_cfg.get('service_restart_minutes', 0), 0)} min (0=off)"
+            ),
+            (
+                f"RuntimeMax: {normalize_service_runtime_max_minutes(protocol_cfg.get('service_runtime_max_minutes', 0), 0)} min (0=off)"
+            ),
         ]
         if role == "server":
             menu_lines.append(f"Mappings:    {len(protocol_cfg.get('mappings', []))}")
@@ -4428,7 +4629,8 @@ def edit_service_instance(service_name):
                     "4. Edit port mappings",
                     "5. Edit advanced tuning",
                     "6. Edit license ID",
-                    "7. Save changes and restart service",
+                    "7. Edit service restart/runtime max",
+                    "8. Save changes and restart service",
                     "0. Cancel",
                 ]
             )
@@ -4438,7 +4640,8 @@ def edit_service_instance(service_name):
                     "4. Edit port mappings",
                     "5. Edit advanced tuning",
                     "6. Edit license ID",
-                    "7. Save changes and restart service",
+                    "7. Edit service restart/runtime max",
+                    "8. Save changes and restart service",
                     "0. Cancel",
                 ]
             )
@@ -4447,7 +4650,8 @@ def edit_service_instance(service_name):
                 [
                     "4. Edit advanced tuning",
                     "5. Edit license ID",
-                    "6. Save changes and restart service",
+                    "6. Edit service restart/runtime max",
+                    "7. Save changes and restart service",
                     "0. Cancel",
                 ]
             )
@@ -4485,6 +4689,14 @@ def edit_service_instance(service_name):
                 )
             protocol_cfg["profile"] = protocol_cfg.get("profile", loaded["protocol_config"].get("profile", "balanced"))
             protocol_cfg["license"] = protocol_cfg.get("license", loaded["protocol_config"].get("license", ""))
+            protocol_cfg["service_restart_minutes"] = normalize_service_restart_minutes(
+                protocol_cfg.get("service_restart_minutes", loaded["protocol_config"].get("service_restart_minutes", 0)),
+                loaded["protocol_config"].get("service_restart_minutes", 0),
+            )
+            protocol_cfg["service_runtime_max_minutes"] = normalize_service_runtime_max_minutes(
+                protocol_cfg.get("service_runtime_max_minutes", loaded["protocol_config"].get("service_runtime_max_minutes", 0)),
+                loaded["protocol_config"].get("service_runtime_max_minutes", 0),
+            )
         elif choice == "2":
             protocol_cfg["profile"] = select_config_profile(
                 default_profile=protocol_cfg.get("profile", "balanced")
@@ -4509,7 +4721,18 @@ def edit_service_instance(service_name):
         elif (choice == "6" and role == "server") or (choice == "6" and client_direct_mode) or (choice == "5" and role == "client" and not client_direct_mode):
             protocol_cfg["license"] = prompt_license_id()
         elif (choice == "7" and role == "server") or (choice == "7" and client_direct_mode) or (choice == "6" and role == "client" and not client_direct_mode):
+            protocol_cfg["service_restart_minutes"] = prompt_service_restart_minutes(
+                default_minutes=protocol_cfg.get("service_restart_minutes", 0)
+            )
+            protocol_cfg["service_runtime_max_minutes"] = prompt_service_runtime_max_minutes(
+                default_minutes=protocol_cfg.get("service_runtime_max_minutes", 0)
+            )
+        elif (choice == "8" and role == "server") or (choice == "8" and client_direct_mode) or (choice == "7" and role == "client" and not client_direct_mode):
             config_file = build_config_filename(role, instance)
+            restart_minutes = protocol_cfg.get("service_restart_minutes", DEFAULT_SERVICE_RESTART_MINUTES)
+            runtime_max_minutes = protocol_cfg.get(
+                "service_runtime_max_minutes", DEFAULT_SERVICE_RUNTIME_MAX_MINUTES
+            )
             if role == "server":
                 generate_config(
                     protocol_cfg,
@@ -4526,18 +4749,12 @@ def edit_service_instance(service_name):
                     config_file,
                     explicit_tuning=explicit_tuning,
                 )
-            run_command("systemctl daemon-reload", check=False)
-            unit = f"{service_name}.service"
-            if run_command(f"systemctl restart {shlex.quote(unit)}", check=False):
-                active_rc, _, _ = run_command_output(
-                    f"systemctl is-active {shlex.quote(unit)}"
-                )
-                if active_rc == 0:
-                    print_success(f"✅ Saved and restarted {unit}")
-                else:
-                    print_error(f"❌ Config saved, but {unit} is not active after restart.")
-            else:
-                print_error(f"❌ Config saved, but failed to restart {unit}")
+            create_service(
+                role,
+                instance,
+                restart_minutes=restart_minutes,
+                runtime_max_minutes=runtime_max_minutes,
+            )
             return
         elif choice == "0":
             print_info("Edit cancelled.")
@@ -4670,6 +4887,12 @@ def install_server_flow(
     deployment_mode = select_deployment_mode()
     tuning = configure_tuning("server", deployment_mode)
     obfuscation_cfg = select_obfuscation_profile()
+    cfg["service_restart_minutes"] = prompt_service_restart_minutes(
+        default_minutes=DEFAULT_SERVICE_RESTART_MINUTES
+    )
+    cfg["service_runtime_max_minutes"] = prompt_service_runtime_max_minutes(
+        default_minutes=DEFAULT_SERVICE_RUNTIME_MAX_MINUTES
+    )
     if collect_mappings:
         cfg["mappings"] = prompt_server_mappings(
             fixed_mode=mapping_mode,
@@ -4686,7 +4909,12 @@ def install_server_flow(
         config_file,
         explicit_tuning=(deployment_mode == "advanced"),
     )
-    create_service("server", instance)
+    create_service(
+        "server",
+        instance,
+        restart_minutes=cfg.get("service_restart_minutes", 0),
+        runtime_max_minutes=cfg.get("service_runtime_max_minutes", 0),
+    )
     maybe_apply_linux_network_tuning()
 
     all_listens = collect_render_endpoints("server", cfg)
@@ -4755,6 +4983,12 @@ def install_client_flow(
     deployment_mode = select_deployment_mode()
     tuning = configure_tuning("client", deployment_mode)
     obfuscation_cfg = select_obfuscation_profile()
+    cfg["service_restart_minutes"] = prompt_service_restart_minutes(
+        default_minutes=DEFAULT_SERVICE_RESTART_MINUTES
+    )
+    cfg["service_runtime_max_minutes"] = prompt_service_runtime_max_minutes(
+        default_minutes=DEFAULT_SERVICE_RUNTIME_MAX_MINUTES
+    )
     cfg["server_addr"] = server_addr
     if collect_mappings:
         cfg["mappings"] = prompt_server_mappings(
@@ -4772,7 +5006,12 @@ def install_client_flow(
         config_file,
         explicit_tuning=(deployment_mode == "advanced"),
     )
-    create_service("client", instance)
+    create_service(
+        "client",
+        instance,
+        restart_minutes=cfg.get("service_restart_minutes", 0),
+        runtime_max_minutes=cfg.get("service_runtime_max_minutes", 0),
+    )
     maybe_apply_linux_network_tuning()
 
     all_servers = collect_render_endpoints("client", cfg)
