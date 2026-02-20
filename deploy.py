@@ -4329,7 +4329,7 @@ def render_service_restart_lines(restart_minutes):
         restart_minutes, DEFAULT_SERVICE_RESTART_MINUTES
     )
     if restart_minutes <= 0:
-        return "Restart=no"
+        return "Restart=always"
     return f"Restart=always\nRestartSec={restart_minutes}m"
 
 
