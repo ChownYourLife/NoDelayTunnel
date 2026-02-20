@@ -23,7 +23,7 @@ BINARY_NAME = "nodelay"
 INSTALL_DIR = "/usr/local/bin"
 MANAGER_ALIAS_NAME = "nodelay-manager"
 MANAGER_ALIAS_PATH = os.path.join(INSTALL_DIR, MANAGER_ALIAS_NAME)
-MANAGER_UPDATE_RAW_MAIN = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/deploy.py"
+MANAGER_UPDATE_RAW_MAIN = "https://raw.githubusercontent.com/ChownYourLife/NoDelayTunnel/refs/heads/main/deploy.py"
 MANAGER_UPDATE_TIMEOUT = 20
 CONFIG_DIR = "/etc/nodelay"
 SERVER_SERVICE_NAME = "nodelay-server"
@@ -549,41 +549,22 @@ def update_manager_script():
 
     print_header("⬆️ Updating nodelay-manager Script")
 
-    release = get_latest_release()
-    candidate_urls = []
-    latest_tag = ""
-    if isinstance(release, dict):
-        latest_tag = str(release.get("tag_name", "")).strip()
-        if latest_tag:
-            candidate_urls.append(
-                f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/{latest_tag}/deploy.py"
-            )
-    candidate_urls.append(MANAGER_UPDATE_RAW_MAIN)
-
     fetched_text = ""
-    fetched_from = ""
-    errors_seen = []
+    fetched_from = MANAGER_UPDATE_RAW_MAIN
 
-    for url in candidate_urls:
-        try:
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "nodelay-manager-updater"},
-            )
-            with urllib.request.urlopen(req, timeout=MANAGER_UPDATE_TIMEOUT) as resp:
-                body = resp.read().decode("utf-8")
-            if "def main_menu(" not in body or "NoDelay" not in body:
-                raise ValueError("downloaded file does not look like deploy.py")
-            fetched_text = body
-            fetched_from = url
-            break
-        except Exception as exc:
-            errors_seen.append(f"{url}: {exc}")
-
-    if not fetched_text:
+    try:
+        req = urllib.request.Request(
+            MANAGER_UPDATE_RAW_MAIN,
+            headers={"User-Agent": "nodelay-manager-updater"},
+        )
+        with urllib.request.urlopen(req, timeout=MANAGER_UPDATE_TIMEOUT) as resp:
+            body = resp.read().decode("utf-8")
+        if "def main_menu(" not in body or "NoDelay" not in body:
+            raise ValueError("downloaded file does not look like deploy.py")
+        fetched_text = body
+    except Exception as exc:
         print_error("Failed to download latest deploy.py")
-        for item in errors_seen:
-            print_error(item)
+        print_error(f"{MANAGER_UPDATE_RAW_MAIN}: {exc}")
         return False
 
     try:
@@ -627,14 +608,11 @@ def update_manager_script():
         return False
 
     print_success("Updated nodelay-manager script successfully.")
-    if latest_tag:
-        print_info(f"Release tag: {latest_tag}")
     print_info(f"Downloaded from: {fetched_from}")
     print_info(f"Backup: {backup_path}")
 
     install_manager_alias()
     return True
-
 def set_sysctl_conf_managed_block(setting_lines):
     existing_lines = []
     if os.path.exists(SYSCTL_CONF_PATH):
