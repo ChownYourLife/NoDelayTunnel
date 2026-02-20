@@ -1373,8 +1373,6 @@ def direct_connectivity_test_menu(default_host=""):
                 continue
 
             duration = prompt_int("Test duration per port (seconds)", IPERF_TEST_DEFAULT_DURATION)
-            if duration < 3:
-                duration = 3
             streams = prompt_int("Parallel streams", IPERF_TEST_DEFAULT_STREAMS)
             if streams < 1:
                 streams = 1
