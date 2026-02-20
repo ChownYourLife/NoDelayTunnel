@@ -1257,8 +1257,18 @@ def run_multi_port_client_benchmark(target_host, ports, duration, streams):
         )
         if result is None:
             failed.append((int(port), err))
+            print_error(f"[{index}/{total}] port={int(port)} failed: {err}")
             continue
+
         results.append(result)
+        print_success(
+            f"[{index}/{total}] port={result['port']} "
+            f"score={result['score_mbps']:.2f} Mbps "
+            f"down={result['downlink_mbps']:.2f} Mbps "
+            f"up={result['uplink_mbps']:.2f} Mbps "
+            f"retrans(up/down)={result['retransmits_up']}/{result['retransmits_down']} "
+            f"quality={result['quality']}"
+        )
 
     if not results:
         print_error("All port tests failed.")
