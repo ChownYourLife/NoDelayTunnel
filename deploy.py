@@ -59,6 +59,9 @@ TUNING_SECTIONS = ["smux", "tcp", "udp", "kcp", "quic", "reconnect"]
 IPERF_TEST_DEFAULT_PORT = 9777
 IPERF_TEST_DEFAULT_DURATION = 8
 IPERF_TEST_DEFAULT_STREAMS = 8
+IPERF_MULTI_PORT_TARGET_COUNT = 100
+IPERF_MULTI_PORT_TOP_COUNT = 5
+IPERF_MULTI_PORT_REQUIRED = [443, 80, 9999, 2053, 2095, 2086]
 # iperf3 controls TCP segment size via MSS; set to 1300 for tunnel-path testing.
 IPERF_TEST_MSS = 1300
 IPERF_GOOD_MBPS = 150.0
@@ -984,6 +987,28 @@ def run_iperf3_json(command_args):
     return payload, ""
 
 
+def parse_port_list_csv(raw):
+    seen = set()
+    ports = []
+    invalid = []
+    for token in str(raw or "").split(","):
+        part = token.strip()
+        if not part:
+            continue
+        if not part.isdigit():
+            invalid.append(part)
+            continue
+        port = int(part)
+        if port < 1 or port > 65535:
+            invalid.append(part)
+            continue
+        if port in seen:
+            continue
+        seen.add(port)
+        ports.append(port)
+    return ports, invalid
+
+
 def extract_iperf_summary(payload):
     end = payload.get("end", {}) if isinstance(payload, dict) else {}
     sent_bps = float(end.get("sum_sent", {}).get("bits_per_second", 0.0) or 0.0)
@@ -1021,15 +1046,7 @@ def evaluate_connectivity_quality(uplink_mbps, downlink_mbps):
     )
 
 
-def run_direct_connectivity_benchmark(target_host, port, duration, streams):
-    if not ensure_iperf3_installed():
-        return None
-
-    print_header("🌐 Direct Connectivity Benchmark (iperf3)")
-    print_info(
-        f"Target={target_host}:{port} | Duration={duration}s | Streams={streams} | MSS={IPERF_TEST_MSS} | Mode=direct (no tunnel)"
-    )
-
+def run_direct_connectivity_measurement(target_host, port, duration, streams):
     base_cmd = [
         "iperf3",
         "-c",
@@ -1045,30 +1062,52 @@ def run_direct_connectivity_benchmark(target_host, port, duration, streams):
         "-J",
     ]
 
-    print_info("Running downlink test (remote -> local)...")
     down_payload, down_err = run_iperf3_json(base_cmd + ["-R"])
     if down_payload is None:
-        print_error(f"Downlink test failed: {down_err}")
-        print_info(
-            "Ensure remote iperf3 server is running: `iperf3 -s -p "
-            f"{port}`"
-        )
-        return None
+        return None, f"Downlink test failed: {down_err}"
 
-    print_info("Running uplink test (local -> remote)...")
     up_payload, up_err = run_iperf3_json(base_cmd)
     if up_payload is None:
-        print_error(f"Uplink test failed: {up_err}")
-        print_info(
-            "Ensure remote iperf3 server is running: `iperf3 -s -p "
-            f"{port}`"
-        )
-        return None
+        return None, f"Uplink test failed: {up_err}"
 
     down = extract_iperf_summary(down_payload)
     up = extract_iperf_summary(up_payload)
     down_mbps = down["effective_mbps"]
     up_mbps = up["effective_mbps"]
+    quality, _ = evaluate_connectivity_quality(up_mbps, down_mbps)
+
+    return {
+        "port": int(port),
+        "downlink_mbps": down_mbps,
+        "uplink_mbps": up_mbps,
+        "score_mbps": min(up_mbps, down_mbps),
+        "quality": quality,
+        "retransmits_up": up["retransmits"],
+        "retransmits_down": down["retransmits"],
+    }, ""
+
+
+def run_direct_connectivity_benchmark(target_host, port, duration, streams):
+    if not ensure_iperf3_installed():
+        return None
+
+    print_header("🌐 Direct Connectivity Benchmark (iperf3)")
+    print_info(
+        f"Target={target_host}:{port} | Duration={duration}s | Streams={streams} | MSS={IPERF_TEST_MSS} | Mode=direct (no tunnel)"
+    )
+
+    print_info("Running downlink + uplink test...")
+    result, err = run_direct_connectivity_measurement(target_host, int(port), int(duration), int(streams))
+    if result is None:
+        print_error(err)
+        print_info(
+            "Ensure remote iperf3 server is running: `iperf3 -s -p "
+            f"{port}`"
+        )
+        return None
+
+    down_mbps = result["downlink_mbps"]
+    up_mbps = result["uplink_mbps"]
 
     quality, verdict = evaluate_connectivity_quality(up_mbps, down_mbps)
     quality_label = {
@@ -1083,15 +1122,195 @@ def run_direct_connectivity_benchmark(target_host, port, duration, streams):
     print(f"Uplink   (local -> remote): {Colors.BOLD}{up_mbps:.2f} Mbps{Colors.ENDC}")
     print(
         f"Retransmits (uplink/downlink sender): "
-        f"{Colors.BOLD}{up['retransmits']}/{down['retransmits']}{Colors.ENDC}"
+        f"{Colors.BOLD}{result['retransmits_up']}/{result['retransmits_down']}{Colors.ENDC}"
     )
     print(f"Quality: {quality_label}")
     print_info(verdict)
     return {
+        "port": int(port),
         "downlink_mbps": down_mbps,
         "uplink_mbps": up_mbps,
         "quality": quality,
     }
+
+
+def build_multi_port_candidate_list(target_count):
+    target = max(int(target_count), len(IPERF_MULTI_PORT_REQUIRED))
+    ports = []
+    seen = set()
+    for port in IPERF_MULTI_PORT_REQUIRED:
+        if 1 <= int(port) <= 65535 and port not in seen:
+            seen.add(port)
+            ports.append(int(port))
+    while len(ports) < target:
+        port = random.randint(1024, 65535)
+        if port in seen:
+            continue
+        seen.add(port)
+        ports.append(port)
+    return ports
+
+
+def start_iperf3_server_on_port(port):
+    proc = subprocess.Popen(
+        ["iperf3", "-s", "-p", str(int(port))],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(0.08)
+    if proc.poll() is None:
+        return proc
+    return None
+
+
+def stop_iperf3_servers(server_procs):
+    for _, proc in server_procs:
+        if proc is None:
+            continue
+        if proc.poll() is not None:
+            continue
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    for _, proc in server_procs:
+        if proc is None:
+            continue
+        if proc.poll() is not None:
+            continue
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def run_multi_port_server_mode():
+    if not ensure_iperf3_installed():
+        return
+
+    target_count = IPERF_MULTI_PORT_TARGET_COUNT
+    initial_candidates = build_multi_port_candidate_list(target_count)
+    started = []
+    failed_count = 0
+    attempted = set()
+    required_failed = []
+
+    def try_start(port):
+        nonlocal failed_count
+        p = int(port)
+        if p in attempted:
+            return False
+        attempted.add(p)
+        proc = start_iperf3_server_on_port(p)
+        if proc is None:
+            failed_count += 1
+            return False
+        started.append((p, proc))
+        return True
+
+    for p in initial_candidates:
+        if len(started) >= target_count:
+            break
+        ok = try_start(p)
+        if (p in IPERF_MULTI_PORT_REQUIRED) and not ok:
+            required_failed.append(p)
+
+    refill_guard = 0
+    while len(started) < target_count and refill_guard < 10000:
+        refill_guard += 1
+        p = random.randint(1024, 65535)
+        try_start(p)
+
+    started_ports = [port for port, _ in started]
+    if not started_ports:
+        print_error("Failed to start any iperf3 server port.")
+        return
+
+    print_success(
+        f"Started iperf3 server listeners on {len(started_ports)} ports "
+        f"(failed attempts={failed_count})."
+    )
+    if required_failed:
+        print_error(
+            "Could not bind required ports: " + ",".join(str(p) for p in required_failed)
+        )
+    csv_ports = ",".join(str(p) for p in started_ports)
+    print_header("📋 Port List For Client")
+    print(csv_ports)
+    print_info("Copy the exact comma-separated list to the client benchmark mode.")
+    print_info("Press Ctrl+C to stop all started iperf3 servers.")
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_iperf3_servers(started)
+        print_info("Stopped all started iperf3 server listeners.")
+
+
+def run_multi_port_client_benchmark(target_host, ports, duration, streams):
+    if not ensure_iperf3_installed():
+        return None
+    if not ports:
+        print_error("Port list is empty.")
+        return None
+
+    total = len(ports)
+    print_header("🌐 Multi-Port Direct Connectivity Benchmark")
+    print_info(
+        f"Target={target_host} | Ports={total} | Duration={duration}s | "
+        f"Streams={streams} | MSS={IPERF_TEST_MSS}"
+    )
+
+    results = []
+    failed = []
+    for index, port in enumerate(ports, start=1):
+        print_info(f"[{index}/{total}] Testing {target_host}:{port} ...")
+        result, err = run_direct_connectivity_measurement(
+            target_host,
+            int(port),
+            int(duration),
+            int(streams),
+        )
+        if result is None:
+            failed.append((int(port), err))
+            continue
+        results.append(result)
+
+    if not results:
+        print_error("All port tests failed.")
+        if failed:
+            print_info(f"First error: {failed[0][0]} -> {failed[0][1]}")
+        return None
+
+    ranked = sorted(
+        results,
+        key=lambda x: (x.get("score_mbps", 0.0), x.get("downlink_mbps", 0.0), x.get("uplink_mbps", 0.0)),
+        reverse=True,
+    )
+    top_count = min(IPERF_MULTI_PORT_TOP_COUNT, len(ranked))
+
+    print_header(f"🏆 Top {top_count} Ports")
+    for idx, row in enumerate(ranked[:top_count], start=1):
+        print(
+            f"{idx}. port={row['port']} "
+            f"score={row['score_mbps']:.2f} Mbps "
+            f"down={row['downlink_mbps']:.2f} Mbps "
+            f"up={row['uplink_mbps']:.2f} Mbps "
+            f"quality={row['quality']}"
+        )
+
+    print_info(f"Successful tests: {len(results)}/{total}")
+    if failed:
+        print_info(f"Failed tests: {len(failed)} (showing up to 10 ports)")
+        print_info(",".join(str(p) for p, _ in failed[:10]))
+
+    return ranked
 
 
 def direct_connectivity_test_menu(default_host=""):
@@ -1113,17 +1332,35 @@ def direct_connectivity_test_menu(default_host=""):
             if not ensure_iperf3_installed():
                 input("\nPress Enter to continue...")
                 continue
-            port = prompt_int("Listen Port", IPERF_TEST_DEFAULT_PORT)
-            while port < 1 or port > 65535:
-                print_error("Port must be between 1 and 65535.")
-                port = prompt_int("Listen Port", IPERF_TEST_DEFAULT_PORT)
-            print_info(
-                f"Starting iperf3 server on :{port} (Ctrl+C to stop)..."
+            print_menu(
+                "🖥️ iperf3 Server Mode",
+                [
+                    "1. Single-port server",
+                    f"2. Multi-port server ({IPERF_MULTI_PORT_TARGET_COUNT} ports, includes common ports)",
+                    "0. Back",
+                ],
+                color=Colors.CYAN,
+                min_width=64,
             )
-            try:
-                run_command_stream(f"iperf3 -s -p {int(port)}")
-            except KeyboardInterrupt:
-                pass
+            server_mode = input("Select mode: ").strip()
+            if server_mode == "0":
+                continue
+            if server_mode == "1":
+                port = prompt_int("Listen Port", IPERF_TEST_DEFAULT_PORT)
+                while port < 1 or port > 65535:
+                    print_error("Port must be between 1 and 65535.")
+                    port = prompt_int("Listen Port", IPERF_TEST_DEFAULT_PORT)
+                print_info(
+                    f"Starting iperf3 server on :{port} (Ctrl+C to stop)..."
+                )
+                try:
+                    run_command_stream(f"iperf3 -s -p {int(port)}")
+                except KeyboardInterrupt:
+                    pass
+            elif server_mode == "2":
+                run_multi_port_server_mode()
+            else:
+                print_error("Invalid mode.")
             input("\nPress Enter to continue...")
             continue
         if choice == "2":
@@ -1132,17 +1369,47 @@ def direct_connectivity_test_menu(default_host=""):
             while not target_host:
                 print_error("Remote host is required.")
                 target_host = input_default("Remote server host/IP", host_seed).strip()
-            port = prompt_int("Remote iperf3 port", IPERF_TEST_DEFAULT_PORT)
-            while port < 1 or port > 65535:
-                print_error("Port must be between 1 and 65535.")
-                port = prompt_int("Remote iperf3 port", IPERF_TEST_DEFAULT_PORT)
-            duration = prompt_int("Test duration (seconds)", IPERF_TEST_DEFAULT_DURATION)
+
+            print_menu(
+                "🧪 Client Benchmark Mode",
+                [
+                    "1. Single-port benchmark",
+                    f"2. Multi-port benchmark (rank top {IPERF_MULTI_PORT_TOP_COUNT})",
+                    "0. Back",
+                ],
+                color=Colors.CYAN,
+                min_width=60,
+            )
+            client_mode = input("Select mode: ").strip()
+            if client_mode == "0":
+                continue
+
+            duration = prompt_int("Test duration per port (seconds)", IPERF_TEST_DEFAULT_DURATION)
             if duration < 3:
                 duration = 3
             streams = prompt_int("Parallel streams", IPERF_TEST_DEFAULT_STREAMS)
             if streams < 1:
                 streams = 1
-            run_direct_connectivity_benchmark(target_host, int(port), int(duration), int(streams))
+
+            if client_mode == "1":
+                port = prompt_int("Remote iperf3 port", IPERF_TEST_DEFAULT_PORT)
+                while port < 1 or port > 65535:
+                    print_error("Port must be between 1 and 65535.")
+                    port = prompt_int("Remote iperf3 port", IPERF_TEST_DEFAULT_PORT)
+                run_direct_connectivity_benchmark(target_host, int(port), int(duration), int(streams))
+            elif client_mode == "2":
+                csv_default = ",".join(str(p) for p in IPERF_MULTI_PORT_REQUIRED)
+                csv_raw = input_default("Remote iperf3 ports (comma separated)", csv_default).strip()
+                ports, invalid = parse_port_list_csv(csv_raw)
+                if invalid:
+                    print_error(f"Ignoring invalid entries: {', '.join(invalid)}")
+                if not ports:
+                    print_error("No valid ports provided.")
+                    input("\nPress Enter to continue...")
+                    continue
+                run_multi_port_client_benchmark(target_host, ports, int(duration), int(streams))
+            else:
+                print_error("Invalid mode.")
             input("\nPress Enter to continue...")
             continue
         print_error("Invalid choice.")
