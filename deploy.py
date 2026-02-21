@@ -53,8 +53,8 @@ ROLE_LABELS = {
     "client": "Kharej Server",
 }
 
-DEFAULT_IRAN_PORT = 9999
-DEFAULT_KHAREJ_PORT = 9999
+DEFAULT_IRAN_PORT = 443
+DEFAULT_KHAREJ_PORT = 443
 TUNING_SECTIONS = ["smux", "tcp", "udp", "kcp", "quic", "reconnect"]
 IPERF_TEST_DEFAULT_PORT = 9777
 IPERF_TEST_DEFAULT_DURATION = 8
@@ -67,7 +67,7 @@ IPERF_TEST_MSS = 1300
 IPERF_GOOD_MBPS = 150.0
 IPERF_EXCELLENT_MBPS = 200.0
 IPERF_POOR_MBPS = 100.0
-MSS_CLAMP_DEFAULT = 1300
+MSS_CLAMP_DEFAULT = 0
 SYSTEMD_RUNTIME_ENV = {
     "GOMEMLIMIT": "1GiB",
     "NODELAY_MEM_HOUSEKEEPER": "1",
@@ -646,21 +646,12 @@ def set_sysctl_conf_managed_block(setting_lines):
 
 
 def apply_mss_clamp_rules(mss=MSS_CLAMP_DEFAULT):
-    try:
-        mss = int(mss)
-    except (TypeError, ValueError):
-        mss = MSS_CLAMP_DEFAULT
-    if mss < 1200:
-        mss = 1200
-    if mss > 1460:
-        mss = 1460
-
     tools = [tool for tool in ("iptables", "ip6tables") if shutil.which(tool)]
     if not tools:
         print_info("Skipping MSS clamp: iptables/ip6tables not found.")
         return False
 
-    rule = f"-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss}"
+    rule = "-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
     any_ok = False
     for tool in tools:
         for chain in ("OUTPUT", "FORWARD"):
@@ -671,27 +662,18 @@ def apply_mss_clamp_rules(mss=MSS_CLAMP_DEFAULT):
             added = run_command(f"{tool} -t mangle -A {chain} {rule}", check=False)
             any_ok = any_ok or added
     if any_ok:
-        print_success(f"Applied MSS clamp rule (TCP SYN MSS={mss}).")
+        print_success("Applied MSS clamp rule (TCP SYN clamp-to-pmtu).")
     else:
         print_info("MSS clamp rules were not applied (check firewall backend/permissions).")
     return any_ok
 
 
 def remove_mss_clamp_rules(mss=MSS_CLAMP_DEFAULT):
-    try:
-        mss = int(mss)
-    except (TypeError, ValueError):
-        mss = MSS_CLAMP_DEFAULT
-    if mss < 1200:
-        mss = 1200
-    if mss > 1460:
-        mss = 1460
-
     tools = [tool for tool in ("iptables", "ip6tables") if shutil.which(tool)]
     if not tools:
         return False
 
-    rule = f"-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss {mss}"
+    rule = "-p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
     removed_any = False
     for tool in tools:
         for chain in ("OUTPUT", "FORWARD"):
@@ -1998,7 +1980,7 @@ def prompt_server_names(default_values=None):
     else:
         seed = str(default_values or "").strip()
     if not seed:
-        seed = "www.microsoft.com,microsoft.com"
+        seed = "www.zoomg.ir,zoomg.ir"
     while True:
         names = parse_csv(
             input_default(
@@ -2343,7 +2325,7 @@ def normalize_endpoint_reality_config(
     base = fallback if isinstance(fallback, dict) else {}
     dest = str(raw.get("dest", base.get("dest", ""))).strip()
     if default_dest_when_empty and not dest:
-        dest = "www.microsoft.com:443"
+        dest = ""
     server_names = normalize_server_names_list(
         raw.get("server_names", base.get("server_names", []))
     )
@@ -2440,7 +2422,7 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
     endpoints = deep_copy(existing) if isinstance(existing, list) else []
     default_reality_cfg = normalize_endpoint_reality_config(
         {
-            "dest": defaults.get("dest", "www.microsoft.com:443"),
+            "dest": defaults.get("dest", ""),
             "server_names": defaults.get("server_names", []),
             "short_id": defaults.get("short_id", ""),
             "private_key": defaults.get("private_key", ""),
@@ -2585,7 +2567,7 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
             )
             reality_cfg["dest"] = input_default(
                 "Dest (real target site:port)",
-                default_reality_cfg.get("dest", "www.microsoft.com:443") or "www.microsoft.com:443",
+                default_reality_cfg.get("dest", "") or "",
             ).strip()
             if role == "server":
                 (
@@ -2672,6 +2654,117 @@ def prompt_network_mtu(default=0):
             return mtu
         print_error("Path MTU must be 0 or between 576 and 9000.")
 
+
+DNS_MODE_OPTIONS = [
+    ("system", "System Resolver"),
+    ("doh_dot_strict", "DoH + DoT Strict (Recommended)"),
+    ("doh_strict", "DoH Strict"),
+    ("dot_strict", "DoT Strict"),
+]
+
+
+def normalize_dns_mode(value, default="doh_dot_strict"):
+    raw = str(value or "").strip().lower()
+    allowed = {item[0] for item in DNS_MODE_OPTIONS}
+    if raw in allowed:
+        return raw
+    return default
+
+
+def normalize_dns_list(values, default_list):
+    if isinstance(values, str):
+        values = [item.strip() for item in values.split(",") if item.strip()]
+    elif isinstance(values, list):
+        values = [str(item).strip() for item in values if str(item).strip()]
+    else:
+        values = []
+    if not values:
+        values = list(default_list)
+    seen = set()
+    cleaned = []
+    for item in values:
+        if item in seen:
+            continue
+        seen.add(item)
+        cleaned.append(item)
+    return cleaned
+
+
+def normalize_dns_config(cfg, default=None):
+    if not isinstance(default, dict):
+        default = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    out = {
+        "mode": normalize_dns_mode(cfg.get("mode", default.get("mode", "doh_dot_strict")), "doh_dot_strict"),
+        "doh_endpoints": normalize_dns_list(
+            cfg.get("doh_endpoints", default.get("doh_endpoints", [])),
+            ["https://1.1.1.1/dns-query", "https://dns.google/dns-query"],
+        ),
+        "dot_servers": normalize_dns_list(
+            cfg.get("dot_servers", default.get("dot_servers", [])),
+            ["1.1.1.1:853", "8.8.8.8:853"],
+        ),
+        "query_timeout": str(cfg.get("query_timeout", default.get("query_timeout", "3s")) or "3s").strip() or "3s",
+        "cache_ttl": str(cfg.get("cache_ttl", default.get("cache_ttl", "2m")) or "2m").strip() or "2m",
+        "max_inflight": 256,
+    }
+    try:
+        out["max_inflight"] = int(cfg.get("max_inflight", default.get("max_inflight", 256)) or 256)
+    except (TypeError, ValueError):
+        out["max_inflight"] = 256
+    if out["max_inflight"] <= 0:
+        out["max_inflight"] = 256
+    return out
+
+
+def prompt_csv_list(prompt, default_values):
+    default_csv = ", ".join(default_values)
+    raw = input_default(prompt, default_csv).strip()
+    if not raw:
+        return list(default_values)
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def prompt_dns_settings(defaults=None):
+    current = normalize_dns_config(defaults or {}, {})
+    current_mode = current["mode"]
+    default_index = 1
+    for idx, (mode_key, _) in enumerate(DNS_MODE_OPTIONS, start=1):
+        if mode_key == current_mode:
+            default_index = idx
+            break
+
+    lines = []
+    for idx, (mode_key, label) in enumerate(DNS_MODE_OPTIONS, start=1):
+        suffix = " (current)" if mode_key == current_mode else ""
+        lines.append(f"{idx}. {label}{suffix}")
+    print_menu("🌐 Secure DNS Mode", lines, color=Colors.CYAN, min_width=56)
+
+    while True:
+        choice = input_default(f"DNS mode [1-{len(DNS_MODE_OPTIONS)}]", default_index).strip()
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(DNS_MODE_OPTIONS):
+                current["mode"] = DNS_MODE_OPTIONS[idx - 1][0]
+                break
+        print_error("Invalid choice.")
+
+    if current["mode"] in {"doh_dot_strict", "doh_strict"}:
+        current["doh_endpoints"] = normalize_dns_list(
+            prompt_csv_list("DoH endpoints (comma-separated)", current["doh_endpoints"]),
+            current["doh_endpoints"],
+        )
+    if current["mode"] in {"doh_dot_strict", "dot_strict"}:
+        current["dot_servers"] = normalize_dns_list(
+            prompt_csv_list("DoT servers (comma-separated)", current["dot_servers"]),
+            current["dot_servers"],
+        )
+
+    current["query_timeout"] = input_default("DNS query timeout", current["query_timeout"]).strip() or current["query_timeout"]
+    current["cache_ttl"] = input_default("DNS cache TTL", current["cache_ttl"]).strip() or current["cache_ttl"]
+    current["max_inflight"] = max(1, prompt_int("DNS max inflight queries", current["max_inflight"]))
+    return current
 
 def normalize_mimicry_transport_mode(value, default="websocket"):
     raw = str(value or "").strip().lower()
@@ -2773,9 +2866,15 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
         "port": str(DEFAULT_IRAN_PORT),
         "path": "/tunnel",
         "network_mtu": 0,
+        "network_dns": normalize_dns_config({}, {}),
+        "utls_strict_profile_match": True,
         "mux_type": "smux",
         "mimicry_preset_region": "mixed",
         "mimicry_transport_mode": "websocket",
+        "mimicry_auth_secret": "",
+        "mimicry_auth_window_seconds": 60,
+        "mimicry_basic_auth_user": "",
+        "mimicry_basic_auth_pass": "",
         "pool_size": 3,
         "connection_strategy": "parallel",
         "additional_endpoints": [],
@@ -2784,7 +2883,7 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
         "psk": "",
         "sni": "",
         "insecure_skip_verify": False,
-        "dest": "www.microsoft.com:443",
+        "dest": "",
         "server_names": [],
         "short_id": "",
         "private_key": "",
@@ -2804,24 +2903,37 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
             return str(default_value)
         return input_default("Port", default_value)
 
-    if role == "server":
-        config["psk"] = input_default(
-            "PSK (shared secret, leave empty to disable)",
-            config.get("psk") or generate_uuid(),
-        )
+    current_psk = str(config.get("psk", "")).strip()
+    disable_default = "y" if not current_psk else "n"
+    disable_encryption = input_default(
+        "Disable Encryption (PSK)? (Y/n)",
+        disable_default,
+    ).strip().lower()
+    if disable_encryption in {"", "y", "yes"}:
+        config["psk"] = ""
     else:
-        while True:
+        if role == "server":
             config["psk"] = input_default(
-                "PSK (must match server, leave empty if disabled on server)",
-                config.get("psk", ""),
+                "PSK (shared secret)",
+                current_psk or generate_uuid(),
             ).strip()
-            if config["psk"]:
-                break
-            confirm_empty = input_default(
-                "Client PSK is empty. Continue only if server PSK is disabled (y/N)", "n"
-            ).strip().lower()
-            if confirm_empty in {"y", "yes"}:
-                break
+            while not config["psk"]:
+                print_error("PSK cannot be empty when encryption is enabled.")
+                config["psk"] = input_default(
+                    "PSK (shared secret)",
+                    generate_uuid(),
+                ).strip()
+        else:
+            while True:
+                config["psk"] = input_default(
+                    "PSK (must match server)",
+                    current_psk,
+                ).strip()
+                if config["psk"]:
+                    break
+                print_error("PSK cannot be empty when encryption is enabled.")
+
+    if role != "server":
         try:
             default_pool_size = int(config.get("pool_size", 3))
         except (TypeError, ValueError):
@@ -2921,6 +3033,53 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
             config.get("mimicry_transport_mode", "websocket"),
             allow_http3=True,
         )
+        enable_probe_guard = input_default(
+            "Enable Mimicry Anti-Probe Auth Headers? (y/N)",
+            "y" if str(config.get("mimicry_auth_secret", "")).strip() else "n",
+        ).strip().lower()
+        if enable_probe_guard in {"y", "yes"}:
+            config["mimicry_auth_secret"] = input_default(
+                "Mimicry Auth Secret (must match on both sides)",
+                str(config.get("mimicry_auth_secret", "")).strip() or generate_uuid(),
+            ).strip()
+            while not config["mimicry_auth_secret"]:
+                print_error("Mimicry Auth Secret cannot be empty when enabled.")
+                config["mimicry_auth_secret"] = input_default(
+                    "Mimicry Auth Secret (must match on both sides)",
+                    generate_uuid(),
+                ).strip()
+            config["mimicry_auth_window_seconds"] = max(
+                10,
+                prompt_int(
+                    "Mimicry Auth Time Window (seconds)",
+                    int(config.get("mimicry_auth_window_seconds", 60) or 60),
+                ),
+            )
+        else:
+            config["mimicry_auth_secret"] = ""
+            config["mimicry_auth_window_seconds"] = 60
+
+        config["mimicry_basic_auth_user"] = input_default(
+            "Mimicry Basic Auth Username",
+            str(config.get("mimicry_basic_auth_user", "")).strip() or "ndclient",
+        ).strip()
+        while not config["mimicry_basic_auth_user"]:
+            print_error("Mimicry Basic Auth username cannot be empty.")
+            config["mimicry_basic_auth_user"] = input_default(
+                "Mimicry Basic Auth Username",
+                "ndclient",
+            ).strip()
+
+        config["mimicry_basic_auth_pass"] = input_default(
+            "Mimicry Basic Auth Password",
+            str(config.get("mimicry_basic_auth_pass", "")).strip() or generate_uuid(),
+        ).strip()
+        while not config["mimicry_basic_auth_pass"]:
+            print_error("Mimicry Basic Auth password cannot be empty.")
+            config["mimicry_basic_auth_pass"] = input_default(
+                "Mimicry Basic Auth Password",
+                generate_uuid(),
+            ).strip()
         if role == "server":
             keep_current = input_default("Keep current certificate files? (Y/n)", "y").strip().lower()
             if keep_current in {"y", "yes"} and config.get("cert") and config.get("key"):
@@ -2949,6 +3108,53 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
             config.get("mimicry_transport_mode", "websocket"),
             allow_http3=False,
         )
+        enable_probe_guard = input_default(
+            "Enable Mimicry Anti-Probe Auth Headers? (y/N)",
+            "y" if str(config.get("mimicry_auth_secret", "")).strip() else "n",
+        ).strip().lower()
+        if enable_probe_guard in {"y", "yes"}:
+            config["mimicry_auth_secret"] = input_default(
+                "Mimicry Auth Secret (must match on both sides)",
+                str(config.get("mimicry_auth_secret", "")).strip() or generate_uuid(),
+            ).strip()
+            while not config["mimicry_auth_secret"]:
+                print_error("Mimicry Auth Secret cannot be empty when enabled.")
+                config["mimicry_auth_secret"] = input_default(
+                    "Mimicry Auth Secret (must match on both sides)",
+                    generate_uuid(),
+                ).strip()
+            config["mimicry_auth_window_seconds"] = max(
+                10,
+                prompt_int(
+                    "Mimicry Auth Time Window (seconds)",
+                    int(config.get("mimicry_auth_window_seconds", 60) or 60),
+                ),
+            )
+        else:
+            config["mimicry_auth_secret"] = ""
+            config["mimicry_auth_window_seconds"] = 60
+
+        config["mimicry_basic_auth_user"] = input_default(
+            "Mimicry Basic Auth Username",
+            str(config.get("mimicry_basic_auth_user", "")).strip() or "ndclient",
+        ).strip()
+        while not config["mimicry_basic_auth_user"]:
+            print_error("Mimicry Basic Auth username cannot be empty.")
+            config["mimicry_basic_auth_user"] = input_default(
+                "Mimicry Basic Auth Username",
+                "ndclient",
+            ).strip()
+
+        config["mimicry_basic_auth_pass"] = input_default(
+            "Mimicry Basic Auth Password",
+            str(config.get("mimicry_basic_auth_pass", "")).strip() or generate_uuid(),
+        ).strip()
+        while not config["mimicry_basic_auth_pass"]:
+            print_error("Mimicry Basic Auth password cannot be empty.")
+            config["mimicry_basic_auth_pass"] = input_default(
+                "Mimicry Basic Auth Password",
+                generate_uuid(),
+            ).strip()
         config["sni"] = ""
         config["insecure_skip_verify"] = False
 
@@ -2958,8 +3164,8 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
         config["server_names"] = prompt_server_names(config.get("server_names", []))
         config["short_id"] = prompt_short_id(config.get("short_id", ""), role=role)
         config["dest"] = input_default(
-            "Dest (real target site:port)",
-            config.get("dest", "www.microsoft.com:443") or "www.microsoft.com:443",
+            "Dest (camouflage upstream for probes, optional host:port)",
+            config.get("dest", "") or "",
         ).strip()
         if role == "server":
             (
@@ -2984,6 +3190,11 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True):
         print_info("Returning to protocol selection menu...")
         return menu_protocol(role, server_addr=server_addr, defaults=config, prompt_port=prompt_port)
     config["network_mtu"] = prompt_network_mtu(config.get("network_mtu", 0))
+    config["network_dns"] = prompt_dns_settings(config.get("network_dns", {}))
+    config["utls_strict_profile_match"] = parse_bool(
+        input_default("Force uTLS/HTTP profile coherence? (Y/n)", "y" if config.get("utls_strict_profile_match", True) else "n"),
+        True,
+    )
 
     return config
 
@@ -3247,6 +3458,9 @@ def load_instance_runtime_settings(role, instance):
     license_id = str(parsed.get("license", ""))
     network_cfg = parsed.get("network", {}) if isinstance(parsed.get("network"), dict) else {}
     network_mtu = normalize_network_mtu(network_cfg.get("mtu", 0), 0)
+    network_dns = normalize_dns_config(network_cfg.get("dns", {}), {})
+    utls_cfg = parsed.get("utls", {}) if isinstance(parsed.get("utls"), dict) else {}
+    utls_strict_profile_match = bool(utls_cfg.get("strict_profile_match", True))
     http_mimicry_cfg = (
         parsed.get("http_mimicry", {}) if isinstance(parsed.get("http_mimicry"), dict) else {}
     )
@@ -3257,6 +3471,15 @@ def load_instance_runtime_settings(role, instance):
         http_mimicry_cfg.get("transport_mode", "websocket"),
         "websocket",
     )
+    mimicry_auth_secret = str(http_mimicry_cfg.get("auth_secret", "")).strip()
+    mimicry_basic_auth_user = str(http_mimicry_cfg.get("basic_auth_user", "")).strip()
+    mimicry_basic_auth_pass = str(http_mimicry_cfg.get("basic_auth_pass", "")).strip()
+    try:
+        mimicry_auth_window_seconds = int(http_mimicry_cfg.get("auth_window_seconds", 60) or 60)
+    except (TypeError, ValueError):
+        mimicry_auth_window_seconds = 60
+    if mimicry_auth_window_seconds <= 0:
+        mimicry_auth_window_seconds = 60
 
     if role == "server":
         server_cfg = parsed.get("server", {}) if isinstance(parsed.get("server"), dict) else {}
@@ -3306,14 +3529,20 @@ def load_instance_runtime_settings(role, instance):
             "listen_host": parse_host_from_address(primary_listen.get("address", ":8443"), ""),
             "path": str(primary_listen.get("path", "/tunnel")),
             "network_mtu": network_mtu,
+            "network_dns": deep_copy(network_dns),
+            "utls_strict_profile_match": utls_strict_profile_match,
             "mux_type": mux_type,
             "mimicry_preset_region": mimicry_preset_region,
             "mimicry_transport_mode": mimicry_transport_mode,
+            "mimicry_auth_secret": mimicry_auth_secret,
+            "mimicry_auth_window_seconds": mimicry_auth_window_seconds,
+            "mimicry_basic_auth_user": mimicry_basic_auth_user,
+            "mimicry_basic_auth_pass": mimicry_basic_auth_pass,
             "additional_endpoints": deep_copy(normalized_listens[1:]),
             "cert": str(tls_cfg.get("cert_file", "")),
             "key": str(tls_cfg.get("key_file", "")),
             "psk": psk,
-            "dest": str(primary_reality.get("dest", "www.microsoft.com:443")),
+            "dest": str(primary_reality.get("dest", "")),
             "server_names": primary_reality.get("server_names", []),
             "short_id": str(primary_reality.get("short_id", "")),
             "private_key": str(primary_reality.get("private_key", "")),
@@ -3406,16 +3635,22 @@ def load_instance_runtime_settings(role, instance):
             ),
             "path": str(primary_server.get("path", "/tunnel")),
             "network_mtu": network_mtu,
+            "network_dns": deep_copy(network_dns),
+            "utls_strict_profile_match": utls_strict_profile_match,
             "mux_type": mux_type,
             "mimicry_preset_region": mimicry_preset_region,
             "mimicry_transport_mode": mimicry_transport_mode,
+            "mimicry_auth_secret": mimicry_auth_secret,
+            "mimicry_auth_window_seconds": mimicry_auth_window_seconds,
+            "mimicry_basic_auth_user": mimicry_basic_auth_user,
+            "mimicry_basic_auth_pass": mimicry_basic_auth_pass,
             "additional_endpoints": deep_copy(normalized_servers[1:]),
             "cert": "",
             "key": "",
             "psk": psk,
             "sni": str(tls_cfg.get("server_name", "")),
             "insecure_skip_verify": bool(tls_cfg.get("insecure_skip_verify", False)),
-            "dest": str(primary_reality.get("dest", "www.microsoft.com:443")),
+            "dest": str(primary_reality.get("dest", "")),
             "server_names": primary_reality.get("server_names", []),
             "short_id": str(primary_reality.get("short_id", "")),
             "private_key": "",
@@ -3675,7 +3910,7 @@ def base_tuning(role):
             "conn_limit": 5000,
             "copy_buffer": 262144,
             "target_dial_pool": 2,
-            "max_seg": 1300,
+            "max_seg": 0,
             "auto_tune": True,
         },
         "udp": {
@@ -3764,7 +3999,7 @@ def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
 
     combined_profiles = {
         "zoomg_articles": {
-            "path": primary_path,
+            "path": "/",
             "browser": "chrome",
             "fake_host": "www.zoomg.ir",
             "cookie_enabled": True,
@@ -3855,45 +4090,86 @@ def build_http_mimicry_profiles(primary_path, preset_region="mixed"):
             "chunked_encoding": False,
             "custom_headers": {
                 "Referer": "https://developer.mozilla.org/",
-                "Sec-Fetch-Site": "none",
-                "Pragma": "no-cache",
+                "Sec-Fetch-Site": "same-origin",
+                "Cache-Control": "max-age=0",
             },
         },
         "linode_docs": {
             "path": "/docs/",
-            "browser": "firefox",
+            "browser": "chrome",
             "fake_host": "www.linode.com",
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
-                "Referer": "https://www.linode.com/",
-                "Sec-Fetch-Site": "none",
+                "Referer": "https://www.linode.com/docs/",
+                "Sec-Fetch-Site": "same-origin",
                 "Cache-Control": "max-age=0",
             },
         },
         "gnu_manuals": {
             "path": "/software/",
-            "browser": "chrome",
+            "browser": "firefox",
             "fake_host": "www.gnu.org",
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
-                "Referer": "https://www.gnu.org/",
+                "Referer": "https://www.gnu.org/software/",
                 "Sec-Fetch-Site": "same-origin",
-                "Connection": "keep-alive",
+                "Cache-Control": "max-age=0",
+            },
+        },
+        "primary_path_fallback": {
+            "path": primary_path,
+            "browser": "chrome",
+            "fake_host": "www.zoomg.ir",
+            "cookie_enabled": True,
+            "chunked_encoding": False,
+            "custom_headers": {
+                "Referer": "https://www.zoomg.ir/",
+                "Sec-Fetch-Site": "same-origin",
+                "Cache-Control": "max-age=0",
             },
         },
     }
 
-    return combined_profiles
+    iran_profile_names = {
+        "zoomg_articles",
+        "virgool_read",
+        "hamyarwp_blog",
+        "rasaneh3_feed",
+        "mizbanfa_docs",
+    }
+
+    ordered_names = list(combined_profiles.keys())
+    if preset_region == "iran":
+        selected_names = [name for name in ordered_names if name in iran_profile_names]
+    elif preset_region == "foreign":
+        selected_names = [name for name in ordered_names if name not in iran_profile_names]
+    else:
+        selected_names = ordered_names
+
+    if not selected_names:
+        selected_names = ["zoomg_articles", "primary_path_fallback"]
+
+    return {name: combined_profiles[name] for name in selected_names}
 
 
 def render_http_mimicry_lines(protocol_config, http_path, enabled=False):
-    preset_region = "mixed"
+    preset_region = normalize_mimicry_preset_region(protocol_config.get("mimicry_preset_region", "mixed"), "mixed")
     mimicry_transport_mode = normalize_mimicry_transport_mode(
         protocol_config.get("mimicry_transport_mode", "websocket"),
         "websocket",
     )
+    mimicry_auth_secret = str(protocol_config.get("mimicry_auth_secret", "")).strip()
+    mimicry_basic_auth_user = str(protocol_config.get("mimicry_basic_auth_user", "")).strip()
+    mimicry_basic_auth_pass = str(protocol_config.get("mimicry_basic_auth_pass", "")).strip()
+    try:
+        mimicry_auth_window_seconds = int(protocol_config.get("mimicry_auth_window_seconds", 60) or 60)
+    except (TypeError, ValueError):
+        mimicry_auth_window_seconds = 60
+    if mimicry_auth_window_seconds <= 0:
+        mimicry_auth_window_seconds = 60
+
     profiles = build_http_mimicry_profiles(http_path, preset_region)
     primary_profile = next(iter(profiles.values()))
     lines = [
@@ -3904,12 +4180,17 @@ def render_http_mimicry_lines(protocol_config, http_path, enabled=False):
         f"  path: {yaml_scalar(http_path)}",
         f"  browser: {yaml_scalar(primary_profile['browser'])}",
         f"  fake_host: {yaml_scalar(primary_profile['fake_host'])}",
+        f"  auth_secret: {yaml_scalar(mimicry_auth_secret)}",
+        f"  auth_window_seconds: {yaml_scalar(mimicry_auth_window_seconds)}",
+        f"  basic_auth_user: {yaml_scalar(mimicry_basic_auth_user)}",
+        f"  basic_auth_pass: {yaml_scalar(mimicry_basic_auth_pass)}",
         f"  cookie_enabled: {yaml_scalar(primary_profile['cookie_enabled'])}",
         f"  chunked_encoding: {yaml_scalar(primary_profile['chunked_encoding'])}",
         "  custom_headers:",
     ]
     for hk, hv in primary_profile["custom_headers"].items():
         lines.append(f"    {hk}: {yaml_scalar(hv)}")
+
     lines.append("  profiles:")
     for name, profile in profiles.items():
         lines.append(f"    {name}:")
@@ -3922,7 +4203,6 @@ def render_http_mimicry_lines(protocol_config, http_path, enabled=False):
         for hk, hv in profile["custom_headers"].items():
             lines.append(f"        {hk}: {yaml_scalar(hv)}")
     return lines
-
 
 def resolve_ws_url(protocol_config, address, path):
     if protocol_config["type"] == "ws":
@@ -3938,7 +4218,7 @@ def build_primary_endpoint_reality(role, protocol_config, endpoint_type=""):
     cfg = protocol_config if isinstance(protocol_config, dict) else {}
     return normalize_endpoint_reality_config(
         {
-            "dest": cfg.get("dest", "www.microsoft.com:443"),
+            "dest": cfg.get("dest", ""),
             "server_names": cfg.get("server_names", []),
             "short_id": cfg.get("short_id", ""),
             "private_key": cfg.get("private_key", ""),
@@ -4171,6 +4451,8 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
     all_listens = build_all_endpoints_for_render("server", protocol_config, primary_endpoint)
     mimicry_enabled, http_path = resolve_http_mimicry_state(protocol_config, all_listens)
     network_mtu = normalize_network_mtu(protocol_config.get("network_mtu", 0), 0)
+    network_dns = normalize_dns_config(protocol_config.get("network_dns", {}), {})
+    utls_strict_profile_match = bool(protocol_config.get("utls_strict_profile_match", True))
     reality_enabled = any(
         normalize_endpoint_type(ep.get("type", "tcp"), "tcp") == "reality"
         for ep in all_listens
@@ -4189,7 +4471,7 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
         reality_cfg_source,
         role="server",
         fallback={
-            "dest": protocol_config.get("dest", "www.microsoft.com:443"),
+            "dest": protocol_config.get("dest", ""),
             "server_names": protocol_config.get("server_names", []),
             "short_id": protocol_config.get("short_id", ""),
             "private_key": protocol_config.get("private_key", ""),
@@ -4197,7 +4479,7 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
         },
         default_dest_when_empty=reality_enabled,
     )
-    reality_dest = reality_cfg.get("dest", "www.microsoft.com:443")
+    reality_dest = reality_cfg.get("dest", "")
     reality_server_names = reality_cfg.get("server_names", [])
     reality_short_id = reality_cfg.get("short_id", "")
     reality_private_key = reality_cfg.get("private_key", "")
@@ -4277,6 +4559,13 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
             "",
             "network:",
             f"  mtu: {yaml_scalar(network_mtu)}",
+            "  dns:",
+            f"    mode: {yaml_scalar(network_dns['mode'])}",
+            f"    doh_endpoints: {json.dumps(network_dns['doh_endpoints'])}",
+            f"    dot_servers: {json.dumps(network_dns['dot_servers'])}",
+            f"    query_timeout: {yaml_scalar(network_dns['query_timeout'])}",
+            f"    cache_ttl: {yaml_scalar(network_dns['cache_ttl'])}",
+            f"    max_inflight: {yaml_scalar(network_dns['max_inflight'])}",
             "",
             "security:",
             '  token: ""',
@@ -4320,6 +4609,7 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
             "utls:",
             "  enabled: false",
             '  fingerprint: "chrome"',
+            f"  strict_profile_match: {yaml_scalar(utls_strict_profile_match)}",
             "",
             "reality:",
             f"  enabled: {yaml_scalar(reality_enabled)}",
@@ -4343,6 +4633,8 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
     all_servers = build_all_endpoints_for_render("client", protocol_config, primary_endpoint)
     mimicry_enabled, http_path = resolve_http_mimicry_state(protocol_config, all_servers)
     network_mtu = normalize_network_mtu(protocol_config.get("network_mtu", 0), 0)
+    network_dns = normalize_dns_config(protocol_config.get("network_dns", {}), {})
+    utls_strict_profile_match = bool(protocol_config.get("utls_strict_profile_match", True))
     connection_strategy = normalize_connection_strategy(
         protocol_config.get("connection_strategy", "parallel"),
         "parallel",
@@ -4365,7 +4657,7 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         reality_cfg_source,
         role="client",
         fallback={
-            "dest": protocol_config.get("dest", "www.microsoft.com:443"),
+            "dest": protocol_config.get("dest", ""),
             "server_names": protocol_config.get("server_names", []),
             "short_id": protocol_config.get("short_id", ""),
             "private_key": "",
@@ -4373,7 +4665,7 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         },
         default_dest_when_empty=reality_enabled,
     )
-    reality_dest = reality_cfg.get("dest", "www.microsoft.com:443")
+    reality_dest = reality_cfg.get("dest", "")
     reality_server_names = reality_cfg.get("server_names", [])
     reality_short_id = reality_cfg.get("short_id", "")
     reality_public_key = reality_cfg.get("public_key", "")
@@ -4453,9 +4745,16 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         f"  keepalive_period: {yaml_scalar(tuning['quic']['keepalive_period'])}",
         "",
         "network:",
-        f"  mtu: {yaml_scalar(network_mtu)}",
-        "",
-        "security:",
+            f"  mtu: {yaml_scalar(network_mtu)}",
+            "  dns:",
+            f"    mode: {yaml_scalar(network_dns['mode'])}",
+            f"    doh_endpoints: {json.dumps(network_dns['doh_endpoints'])}",
+            f"    dot_servers: {json.dumps(network_dns['dot_servers'])}",
+            f"    query_timeout: {yaml_scalar(network_dns['query_timeout'])}",
+            f"    cache_ttl: {yaml_scalar(network_dns['cache_ttl'])}",
+            f"    max_inflight: {yaml_scalar(network_dns['max_inflight'])}",
+            "",
+            "security:",
         '  token: ""',
         f"  psk: {yaml_scalar(protocol_config.get('psk', ''))}",
         '  auth_timeout: "10s"',
@@ -4497,6 +4796,7 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
             "utls:",
             "  enabled: true",
             '  fingerprint: "chrome"',
+            f"  strict_profile_match: {yaml_scalar(utls_strict_profile_match)}",
             "",
             "reality:",
             f"  enabled: {yaml_scalar(reality_enabled)}",
