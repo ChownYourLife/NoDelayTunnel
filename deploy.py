@@ -1406,6 +1406,28 @@ def ensure_binary():
     return download_binary()
 
 
+def ensure_axel_installed():
+    if shutil.which("axel"):
+        return True
+
+    print_info("axel not found; installing axel for accelerated download...")
+    install_cmds = [
+        "apt-get update -y && apt-get install -y axel",
+        "apt-get install -y axel",
+        "dnf install -y axel",
+        "yum install -y axel",
+        "apk add --no-cache axel",
+        "pacman -Sy --noconfirm axel",
+    ]
+    for cmd in install_cmds:
+        if command_succeeds(cmd) and shutil.which("axel"):
+            print_success("axel installed successfully.")
+            return True
+
+    print_error("Failed to install axel automatically.")
+    return False
+
+
 def download_binary():
     print_header("🔽 Downloading NoDelay Binary")
     release = get_latest_release()
@@ -1418,10 +1440,26 @@ def download_binary():
         f"https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest/download/{BINARY_NAME}"
     )
 
-    print_info(f"Downloading: {download_url}")
+    if not ensure_axel_installed():
+        return False
+
+    print_info(f"Downloading with axel: {download_url}")
+    temp_path = "/tmp/nodelay_dl"
     try:
-        temp_path = "/tmp/nodelay_dl"
-        urllib.request.urlretrieve(download_url, temp_path)
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+    except OSError:
+        pass
+
+    axel_cmd = f"axel -a -n 16 -o {shlex.quote(temp_path)} {shlex.quote(download_url)}"
+    if not command_succeeds(axel_cmd):
+        print_error("❌ Download failed with axel.")
+        return False
+
+    try:
+        if not os.path.exists(temp_path) or os.path.getsize(temp_path) <= 0:
+            print_error("❌ Download failed: downloaded file is empty or missing.")
+            return False
         os.chmod(temp_path, 0o755)
         shutil.move(temp_path, os.path.join(INSTALL_DIR, BINARY_NAME))
         print_success("✅ Download complete.")
@@ -3246,6 +3284,7 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
 
 
 PROFILE_PRESETS = [
+    "maximum-performance (No auto tuning, Not ram/cpu efficient. ensure setting max runtime minutes)",
     "high-load",
     "performance",
     "latency",
