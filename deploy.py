@@ -3284,7 +3284,6 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
 
 
 PROFILE_PRESETS = [
-    "maximum-performance (No auto tuning, Not ram/cpu efficient. ensure setting max runtime minutes)",
     "high-load",
     "performance",
     "latency",
