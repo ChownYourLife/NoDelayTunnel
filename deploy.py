@@ -67,6 +67,7 @@ IPERF_TEST_MSS = 1300
 IPERF_GOOD_MBPS = 150.0
 IPERF_EXCELLENT_MBPS = 200.0
 IPERF_POOR_MBPS = 100.0
+PORT_HOPPING_MAX_PORTS = 256
 MSS_CLAMP_DEFAULT = 0
 SYSTEMD_RUNTIME_ENV = {
     "GOMEMLIMIT": "1GiB",
@@ -2353,6 +2354,196 @@ def normalize_server_names_list(value):
     return out
 
 
+def normalize_port_hopping_mode(value, default="spread"):
+    raw = str(value or "").strip().lower()
+    if raw in {"", "spread"}:
+        return "spread"
+    return default
+
+
+def normalize_port_hopping_ports(value):
+    if isinstance(value, str):
+        ports, _ = parse_port_list_csv(value)
+        return ports
+    if not isinstance(value, list):
+        return []
+    seen = set()
+    out = []
+    for item in value:
+        try:
+            port = int(str(item).strip())
+        except (TypeError, ValueError):
+            continue
+        if port < 1 or port > 65535:
+            continue
+        if port in seen:
+            continue
+        seen.add(port)
+        out.append(port)
+    return out
+
+
+def normalize_port_hopping_cfg(value, fallback=None):
+    raw = value if isinstance(value, dict) else {}
+    base = fallback if isinstance(fallback, dict) else {}
+    mode = normalize_port_hopping_mode(raw.get("mode", base.get("mode", "spread")))
+    enabled_default = bool(base.get("enabled", False))
+    enabled = parse_bool(raw.get("enabled", enabled_default), enabled_default)
+    start_port = 0
+    end_port = 0
+    count = 0
+    try:
+        start_port = int(raw.get("start_port", base.get("start_port", 0)) or 0)
+    except (TypeError, ValueError):
+        start_port = 0
+    try:
+        end_port = int(raw.get("end_port", base.get("end_port", 0)) or 0)
+    except (TypeError, ValueError):
+        end_port = 0
+    try:
+        count = int(raw.get("count", base.get("count", 0)) or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if count < 0:
+        count = 0
+    ports = normalize_port_hopping_ports(raw.get("ports", base.get("ports", [])))
+    return {
+        "enabled": enabled,
+        "start_port": start_port,
+        "end_port": end_port,
+        "ports": ports,
+        "mode": mode,
+        "count": count,
+    }
+
+
+def has_port_hopping_cfg(cfg):
+    if not isinstance(cfg, dict):
+        return False
+    if bool(cfg.get("enabled", False)):
+        return True
+    if int(cfg.get("start_port", 0) or 0) != 0:
+        return True
+    if int(cfg.get("end_port", 0) or 0) != 0:
+        return True
+    if int(cfg.get("count", 0) or 0) > 0:
+        return True
+    return len(normalize_port_hopping_ports(cfg.get("ports", []))) > 0
+
+
+def resolved_port_hopping_ports(port_hopping_cfg, base_port):
+    cfg = normalize_port_hopping_cfg(port_hopping_cfg, {})
+    if not cfg["enabled"]:
+        return []
+    if base_port < 1 or base_port > 65535:
+        return []
+    seen = set()
+    out = []
+
+    def append_port(port):
+        if port < 1 or port > 65535:
+            return
+        if port in seen:
+            return
+        seen.add(port)
+        out.append(port)
+
+    append_port(base_port)
+    for port in cfg["ports"]:
+        append_port(port)
+
+    start_port = cfg["start_port"]
+    end_port = cfg["end_port"]
+    if start_port or end_port:
+        if (
+            start_port < 1
+            or start_port > 65535
+            or end_port < 1
+            or end_port > 65535
+            or start_port > end_port
+        ):
+            return []
+        for port in range(start_port, end_port + 1):
+            append_port(port)
+
+    if cfg["count"] > 0 and len(out) > cfg["count"]:
+        out = out[: cfg["count"]]
+    return out
+
+
+def prompt_port_hopping_for_endpoint(base_port, default_cfg=None):
+    cfg = normalize_port_hopping_cfg(default_cfg, {})
+    default_enabled = "y" if cfg["enabled"] else "n"
+    enable = parse_bool(
+        input_default("Enable Port Hopping for this endpoint? (y/N)", default_enabled),
+        cfg["enabled"],
+    )
+    if not enable:
+        return {
+            "enabled": False,
+            "start_port": 0,
+            "end_port": 0,
+            "ports": [],
+            "mode": "spread",
+            "count": 0,
+        }
+
+    while True:
+        use_range_default = "y" if (cfg["start_port"] > 0 or cfg["end_port"] > 0) else "n"
+        use_range = parse_bool(
+            input_default("Use port range for hopping? (y/N)", use_range_default),
+            cfg["start_port"] > 0 or cfg["end_port"] > 0,
+        )
+        start_port = 0
+        end_port = 0
+        if use_range:
+            start_port = prompt_int(
+                "Port Hopping range start_port",
+                cfg["start_port"] if cfg["start_port"] > 0 else base_port,
+            )
+            end_port = prompt_int(
+                "Port Hopping range end_port",
+                cfg["end_port"] if cfg["end_port"] > 0 else start_port,
+            )
+            if (
+                start_port < 1
+                or start_port > 65535
+                or end_port < 1
+                or end_port > 65535
+                or start_port > end_port
+            ):
+                print_error("Invalid range. start_port/end_port must be 1..65535 and start <= end.")
+                continue
+
+        ports_default = ",".join(str(p) for p in cfg["ports"])
+        ports_csv = input_default("Additional individual hop ports CSV (optional)", ports_default).strip()
+        ports, invalid = parse_port_list_csv(ports_csv)
+        if invalid:
+            print_error(f"Ignored invalid ports: {', '.join(invalid)}")
+
+        candidate_cfg = normalize_port_hopping_cfg(
+            {
+                "enabled": True,
+                "start_port": start_port,
+                "end_port": end_port,
+                "ports": ports,
+                "mode": "spread",
+                "count": cfg["count"],
+            }
+        )
+        resolved = resolved_port_hopping_ports(candidate_cfg, base_port)
+        if not resolved:
+            print_error("No valid hop ports resolved for this endpoint.")
+            continue
+        if len(resolved) > PORT_HOPPING_MAX_PORTS:
+            print_error(
+                f"Resolved {len(resolved)} ports; max allowed per endpoint is {PORT_HOPPING_MAX_PORTS}. Narrow range/list."
+            )
+            continue
+        print_info(f"Port hopping prepared with {len(resolved)} resolved ports (mode=spread).")
+        return candidate_cfg
+
+
 def normalize_endpoint_reality_config(
     value,
     role,
@@ -2390,6 +2581,7 @@ def normalize_transport_endpoint(
     fallback_address="",
     fallback_path="/tunnel",
     fallback_reality=None,
+    fallback_port_hopping=None,
 ):
     ep = endpoint if isinstance(endpoint, dict) else {}
     ep_type = normalize_endpoint_type(ep.get("type", fallback_type), normalize_endpoint_type(fallback_type))
@@ -2423,6 +2615,10 @@ def normalize_transport_endpoint(
         )
     else:
         reality_cfg = {}
+    port_hopping_cfg = normalize_port_hopping_cfg(
+        ep.get("port_hopping", {}),
+        fallback_port_hopping,
+    )
     return {
         "type": ep_type,
         "address": address,
@@ -2430,6 +2626,7 @@ def normalize_transport_endpoint(
         "path": path,
         "tls": tls_cfg,
         "reality": reality_cfg,
+        "port_hopping": port_hopping_cfg,
     }
 
 
@@ -2531,6 +2728,15 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
                 defaults.get("mimicry_transport_mode", "websocket"),
                 allow_http3=(ep_type == "httpsmimicry"),
             )
+        default_port_hopping_cfg = normalize_port_hopping_cfg(
+            defaults.get("port_hopping", {}),
+            {},
+        )
+        base_port_for_hop = parse_port_from_address(address, port_default)
+        port_hopping_cfg = prompt_port_hopping_for_endpoint(
+            base_port_for_hop,
+            default_cfg=default_port_hopping_cfg,
+        )
 
         tls_cfg = empty_tls_config()
         if endpoint_uses_tls(ep_type):
@@ -2632,6 +2838,7 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
                 "address": address,
                 "url": "",
                 "path": path,
+                "port_hopping": port_hopping_cfg,
                 "tls": tls_cfg,
                 "reality": reality_cfg,
             },
@@ -2640,6 +2847,7 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
             fallback_address=address,
             fallback_path=path,
             fallback_reality=default_reality_cfg,
+            fallback_port_hopping=default_port_hopping_cfg,
         )
         if role == "client" and ep_type in {"ws", "wss"}:
             endpoint["url"] = resolve_ws_url({"type": ep_type}, endpoint["address"], endpoint["path"])
@@ -2918,6 +3126,14 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         "pool_size": 3,
         "connection_strategy": "parallel",
         "additional_endpoints": [],
+        "port_hopping": {
+            "enabled": False,
+            "start_port": 0,
+            "end_port": 0,
+            "ports": [],
+            "mode": "spread",
+            "count": 0,
+        },
         "cert": "",
         "key": "",
         "psk": "",
@@ -2942,36 +3158,6 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         if role == "client" and not prompt_port:
             return str(default_value)
         return input_default("Port", default_value)
-
-    current_psk = str(config.get("psk", "")).strip()
-    disable_default = "y" if not current_psk else "n"
-    disable_encryption = input_default(
-        "Disable Encryption (PSK)? (Y/n)",
-        disable_default,
-    ).strip().lower()
-    if disable_encryption in {"", "y", "yes"}:
-        config["psk"] = ""
-    else:
-        if role == "server":
-            config["psk"] = input_default(
-                "PSK (shared secret)",
-                current_psk or generate_uuid(),
-            ).strip()
-            while not config["psk"]:
-                print_error("PSK cannot be empty when encryption is enabled.")
-                config["psk"] = input_default(
-                    "PSK (shared secret)",
-                    generate_uuid(),
-                ).strip()
-        else:
-            while True:
-                config["psk"] = input_default(
-                    "PSK (must match server)",
-                    current_psk,
-                ).strip()
-                if config["psk"]:
-                    break
-                print_error("PSK cannot be empty when encryption is enabled.")
 
     if role != "server":
         try:
@@ -3246,11 +3432,54 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
                 config["reality_key_generated"],
             ) = prompt_reality_private_key(config.get("private_key", ""))
         else:
-            (
-                config["public_key"],
+                (
+                    config["public_key"],
                 config["generated_private_key"],
                 config["reality_key_generated"],
             ) = prompt_reality_public_key(config.get("public_key", ""))
+
+    selected_transport = normalize_endpoint_type(config.get("type", "tcp"))
+    if endpoint_uses_tls(selected_transport):
+        current_psk = str(config.get("psk", "")).strip()
+        disable_default = "y" if not current_psk else "n"
+        disable_encryption = input_default(
+            "Disable Encryption (PSK)? (Y/n)",
+            disable_default,
+        ).strip().lower()
+        if disable_encryption in {"", "y", "yes"}:
+            config["psk"] = ""
+        else:
+            if role == "server":
+                config["psk"] = input_default(
+                    "PSK (shared secret)",
+                    current_psk or generate_uuid(),
+                ).strip()
+                while not config["psk"]:
+                    print_error("PSK cannot be empty when encryption is enabled.")
+                    config["psk"] = input_default(
+                        "PSK (shared secret)",
+                        generate_uuid(),
+                    ).strip()
+            else:
+                while True:
+                    config["psk"] = input_default(
+                        "PSK (must match server)",
+                        current_psk,
+                    ).strip()
+                    if config["psk"]:
+                        break
+                    print_error("PSK cannot be empty when encryption is enabled.")
+    else:
+        config["psk"] = ""
+
+    try:
+        primary_port = int(config.get("port", DEFAULT_IRAN_PORT))
+    except (TypeError, ValueError):
+        primary_port = DEFAULT_IRAN_PORT
+    config["port_hopping"] = prompt_port_hopping_for_endpoint(
+        primary_port,
+        default_cfg=config.get("port_hopping", {}),
+    )
 
     config["mux_type"] = prompt_mux_type(config.get("mux_type", "smux"))
     config["additional_endpoints"] = prompt_additional_transport_endpoints(
@@ -3571,6 +3800,10 @@ def load_instance_runtime_settings(role, instance):
 
     if role == "server":
         server_cfg = parsed.get("server", {}) if isinstance(parsed.get("server"), dict) else {}
+        legacy_port_hopping_cfg = normalize_port_hopping_cfg(
+            server_cfg.get("port_hopping", {}),
+            {},
+        )
         listen = server_cfg.get("listen", {}) if isinstance(server_cfg.get("listen"), dict) else {}
         listens = server_cfg.get("listens", [])
         if not isinstance(listens, list):
@@ -3602,8 +3835,21 @@ def load_instance_runtime_settings(role, instance):
             )
         if not normalized_listens:
             normalized_listens = [primary_fallback]
+        if (
+            normalized_listens
+            and has_port_hopping_cfg(legacy_port_hopping_cfg)
+            and not has_port_hopping_cfg(normalized_listens[0].get("port_hopping", {}))
+        ):
+            normalized_listens[0]["port_hopping"] = normalize_port_hopping_cfg(
+                legacy_port_hopping_cfg,
+                {},
+            )
         primary_listen = normalized_listens[0]
         tls_cfg = primary_listen.get("tls", {})
+        primary_port_hopping = normalize_port_hopping_cfg(
+            primary_listen.get("port_hopping", {}),
+            legacy_port_hopping_cfg,
+        )
         primary_reality = normalize_endpoint_reality_config(
             primary_listen.get("reality", {}),
             role="server",
@@ -3616,6 +3862,7 @@ def load_instance_runtime_settings(role, instance):
             "port": parse_port_from_address(primary_listen.get("address", ":8443"), 8443),
             "listen_host": parse_host_from_address(primary_listen.get("address", ":8443"), ""),
             "path": str(primary_listen.get("path", "/tunnel")),
+            "port_hopping": primary_port_hopping,
             "network_mtu": network_mtu,
             "network_dns": deep_copy(network_dns),
             "utls_strict_profile_match": utls_strict_profile_match,
@@ -3666,6 +3913,10 @@ def load_instance_runtime_settings(role, instance):
         protocol_cfg["mappings"] = cleaned_mappings
     else:
         client = parsed.get("client", {}) if isinstance(parsed.get("client"), dict) else {}
+        legacy_port_hopping_cfg = normalize_port_hopping_cfg(
+            client.get("port_hopping", {}),
+            {},
+        )
         server_ep = client.get("server", {}) if isinstance(client.get("server"), dict) else {}
         servers = client.get("servers", [])
         if not isinstance(servers, list):
@@ -3697,9 +3948,22 @@ def load_instance_runtime_settings(role, instance):
             )
         if not normalized_servers:
             normalized_servers = [primary_fallback]
+        if (
+            normalized_servers
+            and has_port_hopping_cfg(legacy_port_hopping_cfg)
+            and not has_port_hopping_cfg(normalized_servers[0].get("port_hopping", {}))
+        ):
+            normalized_servers[0]["port_hopping"] = normalize_port_hopping_cfg(
+                legacy_port_hopping_cfg,
+                {},
+            )
         primary_server = normalized_servers[0]
         primary_addr = derive_client_address_from_endpoint(primary_server, "127.0.0.1:8443")
         tls_cfg = primary_server.get("tls", {})
+        primary_port_hopping = normalize_port_hopping_cfg(
+            primary_server.get("port_hopping", {}),
+            legacy_port_hopping_cfg,
+        )
         primary_reality = normalize_endpoint_reality_config(
             primary_server.get("reality", {}),
             role="client",
@@ -3723,6 +3987,7 @@ def load_instance_runtime_settings(role, instance):
                 "parallel",
             ),
             "path": str(primary_server.get("path", "/tunnel")),
+            "port_hopping": primary_port_hopping,
             "network_mtu": network_mtu,
             "network_dns": deep_copy(network_dns),
             "utls_strict_profile_match": utls_strict_profile_match,
@@ -4329,12 +4594,14 @@ def build_server_primary_endpoint(protocol_config):
         address = f"{listen_host}:{protocol_config.get('port', 8443)}"
     else:
         address = f":{protocol_config.get('port', 8443)}"
+    port_hopping_cfg = normalize_port_hopping_cfg(protocol_config.get("port_hopping", {}), {})
     return normalize_transport_endpoint(
         {
             "type": endpoint_type,
             "address": address,
             "url": "",
             "path": path,
+            "port_hopping": port_hopping_cfg,
             "tls": {
                 "cert_file": protocol_config.get("cert", ""),
                 "key_file": protocol_config.get("key", ""),
@@ -4350,6 +4617,7 @@ def build_server_primary_endpoint(protocol_config):
         fallback_address=address,
         fallback_path=path,
         fallback_reality=build_primary_endpoint_reality("server", protocol_config, endpoint_type),
+        fallback_port_hopping=port_hopping_cfg,
     )
 
 
@@ -4362,12 +4630,14 @@ def build_client_primary_endpoint(protocol_config):
     url = ""
     if endpoint_type in {"ws", "wss"}:
         url = resolve_ws_url({"type": endpoint_type}, address, path)
+    port_hopping_cfg = normalize_port_hopping_cfg(protocol_config.get("port_hopping", {}), {})
     return normalize_transport_endpoint(
         {
             "type": endpoint_type,
             "address": address,
             "url": url,
             "path": path,
+            "port_hopping": port_hopping_cfg,
             "tls": {
                 "cert_file": "",
                 "key_file": "",
@@ -4383,6 +4653,7 @@ def build_client_primary_endpoint(protocol_config):
         fallback_address=address,
         fallback_path=path,
         fallback_reality=build_primary_endpoint_reality("client", protocol_config, endpoint_type),
+        fallback_port_hopping=port_hopping_cfg,
     )
 
 
@@ -4431,6 +4702,21 @@ def format_endpoint_summary(endpoint):
     return summary
 
 
+def render_port_hopping_lines(indent, port_hopping_cfg):
+    cfg = normalize_port_hopping_cfg(port_hopping_cfg, {})
+    if not has_port_hopping_cfg(cfg):
+        return []
+    return [
+        f"{indent}port_hopping:",
+        f"{indent}  enabled: {yaml_scalar(bool(cfg.get('enabled', False)))}",
+        f"{indent}  start_port: {yaml_scalar(int(cfg.get('start_port', 0) or 0))}",
+        f"{indent}  end_port: {yaml_scalar(int(cfg.get('end_port', 0) or 0))}",
+        f"{indent}  ports: {json.dumps(normalize_port_hopping_ports(cfg.get('ports', [])))}",
+        f"{indent}  mode: {yaml_scalar(normalize_port_hopping_mode(cfg.get('mode', 'spread')))}",
+        f"{indent}  count: {yaml_scalar(max(0, int(cfg.get('count', 0) or 0)))}",
+    ]
+
+
 def render_named_transport_endpoint_lines(
     indent,
     key_name,
@@ -4451,6 +4737,7 @@ def render_named_transport_endpoint_lines(
         f"{indent}  url: {yaml_scalar(endpoint.get('url', ''))}",
         f"{indent}  path: {yaml_scalar(endpoint.get('path', '/tunnel'))}",
     ]
+    lines.extend(render_port_hopping_lines(f"{indent}  ", endpoint.get("port_hopping", {})))
     if include_tls:
         lines.extend(
             [
@@ -4505,6 +4792,7 @@ def render_transport_endpoints_list_lines(
                 f"{indent}    path: {yaml_scalar(endpoint.get('path', '/tunnel'))}",
             ]
         )
+        lines.extend(render_port_hopping_lines(f"{indent}    ", endpoint.get("port_hopping", {})))
         if include_tls:
             lines.extend(
                 [
