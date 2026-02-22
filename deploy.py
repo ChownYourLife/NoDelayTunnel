@@ -2869,7 +2869,7 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
     return result
 
 
-def normalize_mimicry_preset_region(value, default="mixed"):
+def normalize_mimicry_preset_region(value, default="foreign"):
     raw = str(value or "").strip().lower()
     if raw in {"iran", "ir", "domestic"}:
         return "iran"
@@ -3123,13 +3123,13 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         "network_dns": normalize_dns_config({"mode": "system"}, {"mode": "system"}),
         "utls_strict_profile_match": True,
         "mux_type": "smux",
-        "mimicry_preset_region": "mixed",
+        "mimicry_preset_region": "foreign",
         "mimicry_profiles": {},
         "mimicry_transport_mode": "websocket",
         "mimicry_auth_secret": "",
         "mimicry_auth_window_seconds": 60,
-        "mimicry_basic_auth_user": "ndclient",
-        "mimicry_basic_auth_pass": "ndclient",
+        "mimicry_basic_auth_user": "",
+        "mimicry_basic_auth_pass": "",
         "pool_size": 3,
         "connection_strategy": "parallel",
         "additional_endpoints": [],
@@ -3143,7 +3143,9 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         },
         "cert": "",
         "key": "",
+        "token": "",
         "psk": "",
+        "allow_plaintext_framing": False,
         "sni": "",
         "insecure_skip_verify": False,
         "dest": "",
@@ -3160,17 +3162,86 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         for k, v in defaults.items():
             config[k] = v
 
+    path_was_provided = isinstance(defaults, dict) and str(defaults.get("path", "")).strip() != ""
+
     if not str(config.get("psk", "")).strip():
         if role == "server":
             config["psk"] = generate_uuid()
         else:
             config["psk"] = "replace-with-server-psk"
+    if not str(config.get("token", "")).strip():
+        config["token"] = generate_uuid()
 
     def prompt_or_keep_port(default_port):
         default_value = config.get("port", default_port)
         if role == "client" and not prompt_port:
             return str(default_value)
-        return input_default("Port", default_value)
+        return input_default("Tunnel Port", default_value)
+
+    def prompt_mimic_path(default_fallback="/api/v1/upload"):
+        current_path = str(config.get("path", "")).strip()
+        has_existing_path = path_was_provided and bool(current_path)
+        if role == "server":
+            default_path = normalize_path(current_path, default_fallback) if has_existing_path else f"/{generate_uuid()}"
+            selected = normalize_path(
+                input_default("Mimic Path", default_path),
+                default_path,
+            )
+            print_info("This is your server mimic path. Enter this exact value on the client.")
+            return selected
+
+        # Client side: never auto-generate a mimic path on fresh installs.
+        prompt = "Mimic Path (enter the server-generated path)"
+        if has_existing_path:
+            return normalize_path(input_default(prompt, normalize_path(current_path, default_fallback)), default_fallback)
+
+        while True:
+            entered = input_default(prompt, "").strip()
+            if entered:
+                return normalize_path(entered, default_fallback)
+            print_error("Mimic Path is required on client. Enter the exact path generated on server.")
+
+    def random_mimicry_basic_auth_defaults():
+        current_user = str(config.get("mimicry_basic_auth_user", "")).strip()
+        current_pass = str(config.get("mimicry_basic_auth_pass", "")).strip()
+        weak_users = {"", "ndclient", "admin", "user", "test"}
+        weak_passes = {"", "ndclient", "change-me", "password", "123456", "12345678"}
+
+        if role == "server":
+            if current_user.lower() in weak_users:
+                current_user = f"nd{generate_uuid().replace('-', '')[:10]}"
+            if current_pass.lower() in weak_passes:
+                current_pass = generate_uuid().replace("-", "")
+        else:
+            if current_user.lower() in weak_users:
+                current_user = f"nd{generate_uuid().replace('-', '')[:10]}"
+            if current_pass.lower() in weak_passes:
+                current_pass = generate_uuid().replace("-", "")
+        return current_user, current_pass
+
+    def prompt_mimicry_basic_auth():
+        default_user, default_pass = random_mimicry_basic_auth_defaults()
+        config["mimicry_basic_auth_user"] = input_default(
+            "Mimicry Basic Auth Username",
+            default_user,
+        ).strip()
+        while not config["mimicry_basic_auth_user"]:
+            print_error("Mimicry Basic Auth username cannot be empty.")
+            config["mimicry_basic_auth_user"] = input_default(
+                "Mimicry Basic Auth Username",
+                default_user,
+            ).strip()
+
+        config["mimicry_basic_auth_pass"] = input_default(
+            "Mimicry Basic Auth Password",
+            default_pass,
+        ).strip()
+        while not config["mimicry_basic_auth_pass"]:
+            print_error("Mimicry Basic Auth password cannot be empty.")
+            config["mimicry_basic_auth_pass"] = input_default(
+                "Mimicry Basic Auth Password",
+                default_pass,
+            ).strip()
 
     if role != "server":
         try:
@@ -3281,29 +3352,31 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
 
     elif choice == "7":
         config["type"] = "httpsmimicry"
+        config["allow_plaintext_framing"] = False
         config["port"] = prompt_or_keep_port(443)
-        config["path"] = normalize_path(
-            input_default("Mimic Path", config.get("path", "/api/v1/upload")), "/api/v1/upload"
-        )
-        config["mimicry_preset_region"] = "mixed"
+        config["path"] = prompt_mimic_path("/api/v1/upload")
+        config["mimicry_preset_region"] = "foreign"
         config["mimicry_transport_mode"] = prompt_mimicry_transport_mode(
             config.get("mimicry_transport_mode", "websocket"),
             allow_http3=True,
         )
         enable_probe_guard = input_default(
-            "Enable Mimicry Anti-Probe Auth Headers? (y/N)",
-            "y" if str(config.get("mimicry_auth_secret", "")).strip() else "n",
+            "Enable Mimicry Anti-Probe Auth Headers? (Y/n)",
+            "y",
         ).strip().lower()
         if enable_probe_guard in {"y", "yes"}:
+            auth_default = str(config.get("mimicry_auth_secret", "")).strip()
+            if not auth_default:
+                auth_default = generate_uuid()
             config["mimicry_auth_secret"] = input_default(
                 "Mimicry Auth Secret (must match on both sides)",
-                str(config.get("mimicry_auth_secret", "")).strip() or generate_uuid(),
+                auth_default,
             ).strip()
             while not config["mimicry_auth_secret"]:
                 print_error("Mimicry Auth Secret cannot be empty when enabled.")
                 config["mimicry_auth_secret"] = input_default(
                     "Mimicry Auth Secret (must match on both sides)",
-                    generate_uuid(),
+                    auth_default,
                 ).strip()
             config["mimicry_auth_window_seconds"] = max(
                 10,
@@ -3316,31 +3389,7 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
             config["mimicry_auth_secret"] = ""
             config["mimicry_auth_window_seconds"] = 60
 
-        if advanced_mode:
-            config["mimicry_basic_auth_user"] = input_default(
-                "Mimicry Basic Auth Username",
-                str(config.get("mimicry_basic_auth_user", "")).strip() or "ndclient",
-            ).strip()
-            while not config["mimicry_basic_auth_user"]:
-                print_error("Mimicry Basic Auth username cannot be empty.")
-                config["mimicry_basic_auth_user"] = input_default(
-                    "Mimicry Basic Auth Username",
-                    "ndclient",
-                ).strip()
-
-            config["mimicry_basic_auth_pass"] = input_default(
-                "Mimicry Basic Auth Password",
-                str(config.get("mimicry_basic_auth_pass", "")).strip() or "ndclient",
-            ).strip()
-            while not config["mimicry_basic_auth_pass"]:
-                print_error("Mimicry Basic Auth password cannot be empty.")
-                config["mimicry_basic_auth_pass"] = input_default(
-                    "Mimicry Basic Auth Password",
-                    "ndclient",
-                ).strip()
-        else:
-            config["mimicry_basic_auth_user"] = str(config.get("mimicry_basic_auth_user", "")).strip() or "ndclient"
-            config["mimicry_basic_auth_pass"] = str(config.get("mimicry_basic_auth_pass", "")).strip() or "ndclient"
+        prompt_mimicry_basic_auth()
         if role == "server":
             keep_current = input_default("Keep current certificate files? (Y/n)", "y").strip().lower()
             if keep_current in {"y", "yes"} and config.get("cert") and config.get("key"):
@@ -3365,30 +3414,47 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
             )
 
     elif choice == "8":
+        print_info("⚠️ HTTP Mimicry is plaintext and high-risk compared to HTTPS Mimicry.")
+        plaintext_confirm = input_default(
+            "Use HTTP Mimicry anyway? (type YES to continue)",
+            "no",
+        ).strip().lower()
+        if plaintext_confirm != "yes":
+            print_info("HTTP Mimicry selection cancelled. Choose protocol again.")
+            return menu_protocol(
+                role,
+                server_addr=server_addr,
+                defaults=config,
+                prompt_port=prompt_port,
+                deployment_mode=deployment_mode,
+            )
+
         config["type"] = "httpmimicry"
+        config["allow_plaintext_framing"] = True
         config["port"] = prompt_or_keep_port(80)
-        config["path"] = normalize_path(
-            input_default("Mimic Path", config.get("path", "/api/v1/upload")), "/api/v1/upload"
-        )
-        config["mimicry_preset_region"] = "mixed"
+        config["path"] = prompt_mimic_path("/api/v1/upload")
+        config["mimicry_preset_region"] = "foreign"
         config["mimicry_transport_mode"] = prompt_mimicry_transport_mode(
             config.get("mimicry_transport_mode", "websocket"),
             allow_http3=False,
         )
         enable_probe_guard = input_default(
-            "Enable Mimicry Anti-Probe Auth Headers? (y/N)",
-            "y" if str(config.get("mimicry_auth_secret", "")).strip() else "n",
+            "Enable Mimicry Anti-Probe Auth Headers? (Y/n)",
+            "y",
         ).strip().lower()
         if enable_probe_guard in {"y", "yes"}:
+            auth_default = str(config.get("mimicry_auth_secret", "")).strip()
+            if not auth_default:
+                auth_default = generate_uuid()
             config["mimicry_auth_secret"] = input_default(
                 "Mimicry Auth Secret (must match on both sides)",
-                str(config.get("mimicry_auth_secret", "")).strip() or generate_uuid(),
+                auth_default,
             ).strip()
             while not config["mimicry_auth_secret"]:
                 print_error("Mimicry Auth Secret cannot be empty when enabled.")
                 config["mimicry_auth_secret"] = input_default(
                     "Mimicry Auth Secret (must match on both sides)",
-                    generate_uuid(),
+                    auth_default,
                 ).strip()
             config["mimicry_auth_window_seconds"] = max(
                 10,
@@ -3401,36 +3467,13 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
             config["mimicry_auth_secret"] = ""
             config["mimicry_auth_window_seconds"] = 60
 
-        if advanced_mode:
-            config["mimicry_basic_auth_user"] = input_default(
-                "Mimicry Basic Auth Username",
-                str(config.get("mimicry_basic_auth_user", "")).strip() or "ndclient",
-            ).strip()
-            while not config["mimicry_basic_auth_user"]:
-                print_error("Mimicry Basic Auth username cannot be empty.")
-                config["mimicry_basic_auth_user"] = input_default(
-                    "Mimicry Basic Auth Username",
-                    "ndclient",
-                ).strip()
-
-            config["mimicry_basic_auth_pass"] = input_default(
-                "Mimicry Basic Auth Password",
-                str(config.get("mimicry_basic_auth_pass", "")).strip() or "ndclient",
-            ).strip()
-            while not config["mimicry_basic_auth_pass"]:
-                print_error("Mimicry Basic Auth password cannot be empty.")
-                config["mimicry_basic_auth_pass"] = input_default(
-                    "Mimicry Basic Auth Password",
-                    "ndclient",
-                ).strip()
-        else:
-            config["mimicry_basic_auth_user"] = str(config.get("mimicry_basic_auth_user", "")).strip() or "ndclient"
-            config["mimicry_basic_auth_pass"] = str(config.get("mimicry_basic_auth_pass", "")).strip() or "ndclient"
+        prompt_mimicry_basic_auth()
         config["sni"] = ""
         config["insecure_skip_verify"] = False
 
     elif choice == "9":
         config["type"] = "reality"
+        config["allow_plaintext_framing"] = False
         config["port"] = prompt_or_keep_port(443)
         config["server_names"] = prompt_server_names(config.get("server_names", []))
         config["short_id"] = prompt_short_id(config.get("short_id", ""), role=role)
@@ -3450,6 +3493,11 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
                 config["generated_private_key"],
                 config["reality_key_generated"],
             ) = prompt_reality_public_key(config.get("public_key", ""))
+
+    if str(config.get("type", "")).strip().lower() != "httpmimicry":
+        config["allow_plaintext_framing"] = False
+
+    using_mimicry = str(config.get("type", "")).strip().lower() in {"httpmimicry", "httpsmimicry"}
 
     current_psk = str(config.get("psk", "")).strip()
     disable_default = "y" if not current_psk else "n"
@@ -3480,6 +3528,35 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
                 if config["psk"]:
                     break
                 print_error("PSK cannot be empty when encryption is enabled.")
+    while using_mimicry and not str(config.get("psk", "")).strip():
+        print_error("PSK is required when mimicry transport is enabled.")
+        if role == "server":
+            config["psk"] = input_default("PSK (shared secret)", generate_uuid()).strip()
+        else:
+            config["psk"] = input_default("PSK (must match server)", "").strip()
+
+    while using_mimicry and not str(config.get("mimicry_auth_secret", "")).strip():
+        print_error("Mimicry Auth Secret is required when mimicry transport is enabled.")
+        default_secret = generate_uuid()
+        config["mimicry_auth_secret"] = input_default(
+            "Mimicry Auth Secret (must match on both sides)",
+            default_secret,
+        ).strip()
+
+    current_token = str(config.get("token", "")).strip()
+    token_default = current_token
+    if not token_default:
+        token_default = generate_uuid()
+    config["token"] = input_default(
+        "Security Token (must match on both sides)",
+        token_default,
+    ).strip()
+    while using_mimicry and not config["token"]:
+        print_error("Security Token cannot be empty when mimicry transport is enabled.")
+        config["token"] = input_default(
+            "Security Token (must match on both sides)",
+            token_default,
+        ).strip()
 
     try:
         primary_port = int(config.get("port", DEFAULT_IRAN_PORT))
@@ -3776,7 +3853,9 @@ def load_instance_runtime_settings(role, instance):
     profile = str(parsed.get("profile", "balanced"))
     tunnel_mode = str(parsed.get("tunnel_mode", "reverse")).strip().lower() or "reverse"
     security = parsed.get("security", {}) if isinstance(parsed.get("security"), dict) else {}
+    token = str(security.get("token", "")).strip()
     psk = str(security.get("psk", ""))
+    allow_plaintext_framing = bool(security.get("allow_plaintext_framing", False))
     license_id = str(parsed.get("license", ""))
     network_cfg = parsed.get("network", {}) if isinstance(parsed.get("network"), dict) else {}
     network_mtu = normalize_network_mtu(network_cfg.get("mtu", 0), 0)
@@ -3789,8 +3868,8 @@ def load_instance_runtime_settings(role, instance):
     mux_cfg = parsed.get("mux", {}) if isinstance(parsed.get("mux"), dict) else {}
     mux_type = normalize_mux_type(mux_cfg.get("type", "smux"), "smux")
     mimicry_preset_region = normalize_mimicry_preset_region(
-        http_mimicry_cfg.get("preset_region", "mixed"),
-        "mixed",
+        http_mimicry_cfg.get("preset_region", "foreign"),
+        "foreign",
     )
     mimicry_profiles = deep_copy(http_mimicry_cfg.get("profiles", {})) if isinstance(http_mimicry_cfg.get("profiles"), dict) else {}
     mimicry_transport_mode = normalize_mimicry_transport_mode(
@@ -3886,7 +3965,9 @@ def load_instance_runtime_settings(role, instance):
             "additional_endpoints": deep_copy(normalized_listens[1:]),
             "cert": str(tls_cfg.get("cert_file", "")),
             "key": str(tls_cfg.get("key_file", "")),
+            "token": token,
             "psk": psk,
+            "allow_plaintext_framing": allow_plaintext_framing,
             "dest": str(primary_reality.get("dest", "")),
             "server_names": primary_reality.get("server_names", []),
             "short_id": str(primary_reality.get("short_id", "")),
@@ -4011,7 +4092,9 @@ def load_instance_runtime_settings(role, instance):
             "additional_endpoints": deep_copy(normalized_servers[1:]),
             "cert": "",
             "key": "",
+            "token": token,
             "psk": psk,
+            "allow_plaintext_framing": allow_plaintext_framing,
             "sni": str(tls_cfg.get("server_name", "")),
             "insecure_skip_verify": bool(tls_cfg.get("insecure_skip_verify", False)),
             "dest": str(primary_reality.get("dest", "")),
@@ -4351,12 +4434,12 @@ def resolve_http_mimicry_state(protocol_config, endpoints):
     return False
 
 
-def build_http_mimicry_profiles(preset_region="mixed"):
-    preset_region = normalize_mimicry_preset_region(preset_region, "mixed")
+def build_http_mimicry_profiles(preset_region="foreign"):
+    preset_region = normalize_mimicry_preset_region(preset_region, "foreign")
 
     combined_profiles = {
         "zoomg_articles": {
-            "path": "/",
+            "path": "/news/",
             "browser": "chrome",
             "fake_host": "www.zoomg.ir",
             "cookie_enabled": True,
@@ -4368,7 +4451,7 @@ def build_http_mimicry_profiles(preset_region="mixed"):
             },
         },
         "virgool_read": {
-            "path": "/",
+            "path": "/mag/",
             "browser": "chrome",
             "fake_host": "virgool.io",
             "cookie_enabled": True,
@@ -4392,7 +4475,7 @@ def build_http_mimicry_profiles(preset_region="mixed"):
             },
         },
         "rasaneh3_feed": {
-            "path": "/",
+            "path": "/media/",
             "browser": "chrome",
             "fake_host": "www.rasanetv.com",
             "cookie_enabled": True,
@@ -4510,7 +4593,7 @@ def normalize_http_mimicry_profiles_for_render(raw_profiles):
         if not key:
             continue
         out[key] = {
-            "path": normalize_path(profile.get("path", "/"), "/"),
+            "path": normalize_path(profile.get("path", "/api/v1/upload"), "/api/v1/upload"),
             "browser": str(profile.get("browser", "chrome")).strip() or "chrome",
             "fake_host": str(profile.get("fake_host", "www.zoomg.ir")).strip() or "www.zoomg.ir",
             "cookie_enabled": bool(profile.get("cookie_enabled", True)),
@@ -4521,7 +4604,7 @@ def normalize_http_mimicry_profiles_for_render(raw_profiles):
 
 
 def render_http_mimicry_lines(protocol_config, enabled=False):
-    preset_region = normalize_mimicry_preset_region(protocol_config.get("mimicry_preset_region", "mixed"), "mixed")
+    preset_region = normalize_mimicry_preset_region(protocol_config.get("mimicry_preset_region", "foreign"), "foreign")
     mimicry_transport_mode = normalize_mimicry_transport_mode(
         protocol_config.get("mimicry_transport_mode", "websocket"),
         "websocket",
@@ -4956,9 +5039,10 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
             f"    max_inflight: {yaml_scalar(network_dns['max_inflight'])}",
             "",
             "security:",
-            '  token: ""',
+            f"  token: {yaml_scalar(protocol_config.get('token', ''))}",
             f"  psk: {yaml_scalar(protocol_config.get('psk', ''))}",
             '  auth_timeout: "10s"',
+            f"  allow_plaintext_framing: {yaml_scalar(bool(protocol_config.get('allow_plaintext_framing', False)))}",
             "  acl:",
             "    enabled: false",
             "    allow:",
@@ -5143,9 +5227,10 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
             f"    max_inflight: {yaml_scalar(network_dns['max_inflight'])}",
             "",
             "security:",
-        '  token: ""',
+        f"  token: {yaml_scalar(protocol_config.get('token', ''))}",
         f"  psk: {yaml_scalar(protocol_config.get('psk', ''))}",
         '  auth_timeout: "10s"',
+        f"  allow_plaintext_framing: {yaml_scalar(bool(protocol_config.get('allow_plaintext_framing', False)))}",
         "  acl:",
         "    enabled: false",
         "    allow:",
@@ -5854,6 +5939,10 @@ def install_server_flow(
     print(f"Config:   {Colors.BOLD}{config_path}{Colors.ENDC}")
     psk_text = cfg["psk"] if cfg["psk"] else "(disabled)"
     print(f"PSK:      {Colors.BOLD}{psk_text}{Colors.ENDC}")
+    print(f"Tunnel Port: {Colors.BOLD}{cfg.get('port')}{Colors.ENDC}")
+    if str(cfg.get("type", "")).strip().lower() in {"httpmimicry", "httpsmimicry"}:
+        print(f"Mimic Path: {Colors.BOLD}{cfg.get('path', '')}{Colors.ENDC}")
+        print("Note: Enter this exact Mimic Path on the client.")
     print(f"Listens:  {Colors.BOLD}{len(all_listens)} endpoint(s){Colors.ENDC}")
     for ep in all_listens:
         print(f"  - {format_endpoint_summary(ep)}")
@@ -5952,6 +6041,7 @@ def install_client_flow(
     print(f"Config:     {Colors.BOLD}{config_path}{Colors.ENDC}")
     print(f"Run command: {Colors.BOLD}nodelay client -c {config_path}{Colors.ENDC}")
     print(f"Profile:    {Colors.BOLD}{cfg['profile']}{Colors.ENDC}")
+    print(f"Tunnel Port: {Colors.BOLD}{cfg.get('port')}{Colors.ENDC}")
     print(f"Pool Size:  {Colors.BOLD}{cfg.get('pool_size', 3)}{Colors.ENDC}")
     print(f"Strategy:   {Colors.BOLD}{cfg.get('connection_strategy', 'parallel')}{Colors.ENDC}")
     print(f"Upstreams:  {Colors.BOLD}{len(all_servers)} endpoint(s){Colors.ENDC}")
