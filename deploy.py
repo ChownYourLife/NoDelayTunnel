@@ -3160,6 +3160,12 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         for k, v in defaults.items():
             config[k] = v
 
+    if not str(config.get("psk", "")).strip():
+        if role == "server":
+            config["psk"] = generate_uuid()
+        else:
+            config["psk"] = "replace-with-server-psk"
+
     def prompt_or_keep_port(default_port):
         default_value = config.get("port", default_port)
         if role == "client" and not prompt_port:
@@ -3439,45 +3445,41 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
                 config["reality_key_generated"],
             ) = prompt_reality_private_key(config.get("private_key", ""))
         else:
-                (
-                    config["public_key"],
+            (
+                config["public_key"],
                 config["generated_private_key"],
                 config["reality_key_generated"],
             ) = prompt_reality_public_key(config.get("public_key", ""))
 
-    selected_transport = normalize_endpoint_type(config.get("type", "tcp"))
-    if endpoint_uses_tls(selected_transport):
-        current_psk = str(config.get("psk", "")).strip()
-        disable_default = "y" if not current_psk else "n"
-        disable_encryption = input_default(
-            "Disable Encryption (PSK)? (Y/n)",
-            disable_default,
-        ).strip().lower()
-        if disable_encryption in {"", "y", "yes"}:
-            config["psk"] = ""
-        else:
-            if role == "server":
+    current_psk = str(config.get("psk", "")).strip()
+    disable_default = "y" if not current_psk else "n"
+    disable_encryption = input_default(
+        "Disable Encryption (PSK)? (Y/n)",
+        disable_default,
+    ).strip().lower()
+    if disable_encryption in {"", "y", "yes"}:
+        config["psk"] = ""
+    else:
+        if role == "server":
+            config["psk"] = input_default(
+                "PSK (shared secret)",
+                current_psk or generate_uuid(),
+            ).strip()
+            while not config["psk"]:
+                print_error("PSK cannot be empty when encryption is enabled.")
                 config["psk"] = input_default(
                     "PSK (shared secret)",
-                    current_psk or generate_uuid(),
+                    generate_uuid(),
                 ).strip()
-                while not config["psk"]:
-                    print_error("PSK cannot be empty when encryption is enabled.")
-                    config["psk"] = input_default(
-                        "PSK (shared secret)",
-                        generate_uuid(),
-                    ).strip()
-            else:
-                while True:
-                    config["psk"] = input_default(
-                        "PSK (must match server)",
-                        current_psk,
-                    ).strip()
-                    if config["psk"]:
-                        break
-                    print_error("PSK cannot be empty when encryption is enabled.")
-    else:
-        config["psk"] = ""
+        else:
+            while True:
+                config["psk"] = input_default(
+                    "PSK (must match server)",
+                    current_psk,
+                ).strip()
+                if config["psk"]:
+                    break
+                print_error("PSK cannot be empty when encryption is enabled.")
 
     try:
         primary_port = int(config.get("port", DEFAULT_IRAN_PORT))
