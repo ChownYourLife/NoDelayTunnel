@@ -2673,6 +2673,13 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
             return endpoints
         endpoints = []
 
+    if role == "client":
+        print_info("Default topology is single-link: 1 Kharej client -> 1 Iran server endpoint.")
+        print_info("Add extra upstream endpoints only for special failover/load scenarios.")
+    else:
+        print_info("Default topology is a single server listen endpoint.")
+        print_info("Add extra listen endpoints only for special failover/load scenarios.")
+
     prompt = "Add additional upstream endpoints? (y/N)" if role == "client" else "Add additional listen endpoints? (y/N)"
     add_more = input_default(prompt, "n").strip().lower()
     if add_more not in {"y", "yes"}:
