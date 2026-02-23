@@ -4779,7 +4779,74 @@ def format_endpoint_summary(endpoint):
     return summary
 
 
+def normalize_host_candidate(value):
+    host = str(value or "").strip()
+    if host.startswith("[") and host.endswith("]") and len(host) > 2:
+        host = host[1:-1].strip()
+    return host
+
+
+def is_wildcard_host(host):
+    candidate = normalize_host_candidate(host).lower()
+    return candidate in {"", "0.0.0.0", "::", "*"}
+
+
+def detect_public_ip_best_effort(timeout_seconds=2):
+    endpoints = [
+        "https://api64.ipify.org",
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com",
+    ]
+    for url in endpoints:
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "NoDelayTunnel/1.0"},
+            )
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                raw = response.read(128).decode("utf-8", errors="ignore").strip()
+        except Exception:
+            continue
+        candidate = raw.splitlines()[0].strip() if raw else ""
+        if not candidate:
+            continue
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        return candidate
+    return ""
+
+
+def resolve_server_address_for_client_summary(cfg):
+    all_eps = collect_render_endpoints("server", cfg)
+
+    listen_host = normalize_host_candidate(cfg.get("listen_host", ""))
+    if not is_wildcard_host(listen_host):
+        return listen_host, all_eps
+
+    for ep in all_eps:
+        if not isinstance(ep, dict):
+            continue
+        host = normalize_host_candidate(parse_host_from_address(ep.get("address", ""), ""))
+        if not is_wildcard_host(host):
+            return host, all_eps
+
+    public_ip = detect_public_ip_best_effort()
+    if public_ip:
+        return public_ip, all_eps
+
+    _, local_ip_raw, _ = run_command_output("hostname -I 2>/dev/null | awk '{print $1}'")
+    local_ip = normalize_host_candidate(local_ip_raw)
+    if not is_wildcard_host(local_ip):
+        return local_ip, all_eps
+
+    return "<SERVER_PUBLIC_IP_OR_DOMAIN>", all_eps
+
+
 def build_client_setup_lines_for_server_summary(cfg):
+    server_address, all_eps = resolve_server_address_for_client_summary(cfg)
     ep_type = normalize_endpoint_type(cfg.get("type", "tcp"), "tcp")
     tunnel_mode = str(cfg.get("tunnel_mode", "reverse")).strip().lower() or "reverse"
     token_text = str(cfg.get("token", "")).strip() or "(empty)"
@@ -4791,7 +4858,7 @@ def build_client_setup_lines_for_server_summary(cfg):
         mimicry_auth_window_seconds = 60
 
     lines = [
-        "Server Address: <SERVER_PUBLIC_IP_OR_DOMAIN>",
+        f"Server Address: {server_address}",
         f"Tunnel Mode: {tunnel_mode}",
         f"Transport Type: {ep_type}",
         f"Tunnel Port: {cfg.get('port')}",
@@ -4838,7 +4905,6 @@ def build_client_setup_lines_for_server_summary(cfg):
     extra_eps = cfg.get("additional_endpoints", [])
     if isinstance(extra_eps, list) and extra_eps:
         lines.append(f"Additional Endpoints: {len(extra_eps)}")
-        all_eps = collect_render_endpoints("server", cfg)
         for i, ep in enumerate(all_eps[1:], start=1):
             lines.append(f"  [{i}] {format_endpoint_summary(ep)}")
 
