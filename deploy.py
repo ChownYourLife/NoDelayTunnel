@@ -3414,21 +3414,6 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
             )
 
     elif choice == "8":
-        print_info("⚠️ HTTP Mimicry is plaintext and high-risk compared to HTTPS Mimicry.")
-        plaintext_confirm = input_default(
-            "Use HTTP Mimicry anyway? (type YES to continue)",
-            "no",
-        ).strip().lower()
-        if plaintext_confirm != "yes":
-            print_info("HTTP Mimicry selection cancelled. Choose protocol again.")
-            return menu_protocol(
-                role,
-                server_addr=server_addr,
-                defaults=config,
-                prompt_port=prompt_port,
-                deployment_mode=deployment_mode,
-            )
-
         config["type"] = "httpmimicry"
         config["allow_plaintext_framing"] = True
         config["port"] = prompt_or_keep_port(80)
