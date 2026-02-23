@@ -1468,25 +1468,25 @@ def ensure_binary():
     return download_binary()
 
 
-def ensure_axel_installed():
-    if shutil.which("axel"):
+def ensure_wget_installed():
+    if shutil.which("wget"):
         return True
 
-    print_info("axel not found; installing axel for accelerated download...")
+    print_info("wget not found; installing wget for download...")
     install_cmds = [
-        "apt-get update -y && apt-get install -y axel",
-        "apt-get install -y axel",
-        "dnf install -y axel",
-        "yum install -y axel",
-        "apk add --no-cache axel",
-        "pacman -Sy --noconfirm axel",
+        "apt-get update -y && apt-get install -y wget",
+        "apt-get install -y wget",
+        "dnf install -y wget",
+        "yum install -y wget",
+        "apk add --no-cache wget",
+        "pacman -Sy --noconfirm wget",
     ]
     for cmd in install_cmds:
-        if command_succeeds(cmd) and shutil.which("axel"):
-            print_success("axel installed successfully.")
+        if command_succeeds(cmd) and shutil.which("wget"):
+            print_success("wget installed successfully.")
             return True
 
-    print_error("Failed to install axel automatically.")
+    print_error("Failed to install wget automatically.")
     return False
 
 
@@ -1502,10 +1502,10 @@ def download_binary():
         f"https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest/download/{BINARY_NAME}"
     )
 
-    if not ensure_axel_installed():
+    if not ensure_wget_installed():
         return False
 
-    print_info(f"Downloading with axel: {download_url}")
+    print_info(f"Downloading with wget: {download_url}")
     temp_path = "/tmp/nodelay_dl"
     try:
         if os.path.exists(temp_path):
@@ -1513,9 +1513,9 @@ def download_binary():
     except OSError:
         pass
 
-    axel_cmd = f"axel -a -n 16 -o {shlex.quote(temp_path)} {shlex.quote(download_url)}"
-    if not command_succeeds(axel_cmd):
-        print_error("❌ Download failed with axel.")
+    wget_cmd = f"wget --tries=3 --timeout=30 -O {shlex.quote(temp_path)} {shlex.quote(download_url)}"
+    if not command_succeeds(wget_cmd):
+        print_error("❌ Download failed with wget.")
         return False
 
     try:
@@ -3150,9 +3150,16 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
         else:
             path = seed_path
         if ep_type in {"httpmimicry", "httpsmimicry"}:
+            default_mode = defaults.get(
+                "mimicry_transport_mode",
+                "http2" if ep_type == "httpmimicry" else "websocket",
+            )
+            if ep_type == "httpmimicry" and normalize_mimicry_transport_mode(default_mode, "websocket") == "websocket":
+                default_mode = "http2"
             defaults["mimicry_transport_mode"] = prompt_mimicry_transport_mode(
-                defaults.get("mimicry_transport_mode", "websocket"),
+                default_mode,
                 allow_http3=(ep_type == "httpsmimicry"),
+                prefer_http2_first=(ep_type == "httpmimicry"),
             )
         default_port_hopping_cfg = normalize_port_hopping_cfg(
             defaults.get("port_hopping", {}),
@@ -3449,21 +3456,32 @@ def normalize_mimicry_transport_mode(value, default="websocket"):
     return default
 
 
-def prompt_mimicry_transport_mode(default="websocket", allow_http3=False):
-    normalized_default = normalize_mimicry_transport_mode(default, "websocket")
-    if allow_http3 and normalized_default == "http3":
-        default_choice = "3"
-    elif normalized_default == "http2":
-        default_choice = "2"
+def prompt_mimicry_transport_choices(allow_http3=False, prefer_http2_first=False):
+    if prefer_http2_first:
+        choices = [
+            ("1", "http2", f"HTTP/2 stream tunnel"),
+            ("2", "websocket", f"WebSocket ({Colors.BOLD}ws/wss{Colors.ENDC})"),
+        ]
     else:
-        default_choice = "1"
-    menu_lines = [
-        f"{Colors.GREEN}[1]{Colors.ENDC} WebSocket ({Colors.BOLD}ws/wss{Colors.ENDC})",
-        f"{Colors.GREEN}[2]{Colors.ENDC} HTTP/2 stream tunnel",
-    ]
+        choices = [
+            ("1", "websocket", f"WebSocket ({Colors.BOLD}ws/wss{Colors.ENDC})"),
+            ("2", "http2", f"HTTP/2 stream tunnel"),
+        ]
     if allow_http3:
-        menu_lines.append(f"{Colors.GREEN}[3]{Colors.ENDC} HTTP/3 (QUIC) stream tunnel")
-    max_choice = 3 if allow_http3 else 2
+        choices.append(("3", "http3", "HTTP/3 (QUIC) stream tunnel"))
+    return choices
+
+
+def prompt_mimicry_transport_mode(default="websocket", allow_http3=False, prefer_http2_first=False):
+    normalized_default = normalize_mimicry_transport_mode(default, "websocket")
+    choices = prompt_mimicry_transport_choices(
+        allow_http3=allow_http3,
+        prefer_http2_first=prefer_http2_first,
+    )
+    mode_to_choice = {mode: key for key, mode, _ in choices}
+    default_choice = mode_to_choice.get(normalized_default, choices[0][0])
+    menu_lines = [f"{Colors.GREEN}[{key}]{Colors.ENDC} {label}" for key, _, label in choices]
+    max_choice = len(choices)
     print_menu(
         "🎛️ Mimicry Transport Mode",
         menu_lines,
@@ -3472,12 +3490,9 @@ def prompt_mimicry_transport_mode(default="websocket", allow_http3=False):
     )
     while True:
         choice = input_default(f"Mode [1-{max_choice}]", default_choice).strip()
-        if choice == "1":
-            return "websocket"
-        if choice == "2":
-            return "http2"
-        if allow_http3 and choice == "3":
-            return "http3"
+        for key, mode, _ in choices:
+            if choice == key:
+                return mode
         print_error(f"Invalid choice. Pick 1..{max_choice}.")
 
 
@@ -3838,9 +3853,13 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         config["port"] = prompt_or_keep_port(80)
         config["path"] = prompt_mimic_path("/api/v1/upload")
         config["mimicry_preset_region"] = "foreign"
+        default_httpm_mode = str(config.get("mimicry_transport_mode", "")).strip()
+        if normalize_mimicry_transport_mode(default_httpm_mode, "websocket") == "websocket":
+            default_httpm_mode = "http2"
         config["mimicry_transport_mode"] = prompt_mimicry_transport_mode(
-            config.get("mimicry_transport_mode", "websocket"),
+            default_httpm_mode,
             allow_http3=False,
+            prefer_http2_first=True,
         )
         enable_probe_guard = input_default(
             "Enable Mimicry Anti-Probe Auth Headers? (Y/n)",
