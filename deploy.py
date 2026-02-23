@@ -10,6 +10,8 @@ import sys
 import tempfile
 import time
 import ipaddress
+import socket
+import ssl
 import unicodedata
 import urllib.parse
 import urllib.request
@@ -82,6 +84,65 @@ DEFAULT_SERVICE_RUNTIME_MAX_MINUTES = 0
 # DER prefixes for extracting raw x25519 keys (last 32 bytes are key material)
 X25519_PRIVATE_DER_PREFIX = bytes.fromhex("302e020100300506032b656e04220420")
 X25519_PUBLIC_DER_PREFIX = bytes.fromhex("302a300506032b656e032100")
+
+REALITY_SNI_COMMON_CANDIDATES = [
+    ("www.cloudflare.com", 100),
+    ("developers.cloudflare.com", 95),
+    ("cdnjs.cloudflare.com", 94),
+    ("support.microsoft.com", 94),
+    ("learn.microsoft.com", 93),
+    ("support.apple.com", 92),
+    ("www.wikipedia.org", 90),
+    ("stackoverflow.com", 88),
+    ("developer.mozilla.org", 88),
+    ("www.npmjs.com", 87),
+    ("pypi.org", 86),
+    ("docs.python.org", 85),
+    ("www.debian.org", 82),
+    ("packages.ubuntu.com", 81),
+    ("go.dev", 80),
+    ("www.gnu.org", 78),
+]
+
+REALITY_SNI_ASN_CANDIDATES = {
+    "AS13335": [
+        ("www.cloudflare.com", 100),
+        ("developers.cloudflare.com", 96),
+    ],
+    "AS15169": [
+        ("www.google.com", 98),
+        ("www.gstatic.com", 94),
+    ],
+    "AS8075": [
+        ("support.microsoft.com", 96),
+        ("learn.microsoft.com", 95),
+        ("www.microsoft.com", 93),
+    ],
+    "AS16509": [
+        ("aws.amazon.com", 95),
+        ("docs.aws.amazon.com", 94),
+    ],
+    "AS14618": [
+        ("aws.amazon.com", 95),
+        ("docs.aws.amazon.com", 94),
+    ],
+    "AS24940": [
+        ("www.hetzner.com", 72),
+        ("docs.hetzner.com", 70),
+    ],
+    "AS16276": [
+        ("www.ovhcloud.com", 72),
+        ("docs.ovh.com", 70),
+    ],
+    "AS14061": [
+        ("www.digitalocean.com", 74),
+        ("docs.digitalocean.com", 72),
+    ],
+    "AS20473": [
+        ("www.vultr.com", 72),
+        ("docs.vultr.com", 70),
+    ],
+}
 
 
 class Colors:
@@ -2013,13 +2074,221 @@ def prompt_short_id(default_value="", role="server"):
         print_error("Invalid Short ID. Use even-length hex with at least 16 characters.")
 
 
+def extract_host_no_port(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "://" in raw:
+        try:
+            parsed = urllib.parse.urlparse(raw)
+            host = (parsed.hostname or "").strip()
+            return host
+        except Exception:
+            pass
+    if raw.startswith("["):
+        end = raw.find("]")
+        if end > 0:
+            return raw[1:end].strip()
+    if ":" in raw and raw.count(":") == 1:
+        host, _, _ = raw.partition(":")
+        if host.strip():
+            return host.strip()
+    return raw
+
+
+def resolve_host_to_ip(value):
+    host = extract_host_no_port(value)
+    if not host:
+        return "", ""
+    try:
+        ipaddress.ip_address(host)
+        return host, host
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, 443, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except Exception:
+        return host, ""
+    ipv4 = ""
+    ipv6 = ""
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        ip = str(sockaddr[0]).strip()
+        if not ip:
+            continue
+        if ":" in ip and not ipv6:
+            ipv6 = ip
+        elif "." in ip and not ipv4:
+            ipv4 = ip
+    return host, ipv4 or ipv6
+
+
+def fetch_json_url(url, timeout=3):
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "NoDelayTunnel/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        return {}
+    return {}
+
+
+def normalize_asn(value):
+    raw = str(value or "").strip().upper()
+    if not raw:
+        return ""
+    m = re.search(r"AS\s*([0-9]+)", raw)
+    if m:
+        return f"AS{m.group(1)}"
+    if raw.isdigit():
+        return f"AS{raw}"
+    if raw.startswith("AS") and raw[2:].isdigit():
+        return raw
+    return ""
+
+
+def lookup_ip_asn(ip, cache=None):
+    ip = str(ip or "").strip()
+    if not ip:
+        return "", ""
+    if isinstance(cache, dict) and ip in cache:
+        return cache[ip]
+
+    providers = [
+        f"https://ipapi.co/{ip}/json/",
+        f"https://ipinfo.io/{ip}/json",
+    ]
+    asn = ""
+    org = ""
+    for endpoint in providers:
+        payload = fetch_json_url(endpoint, timeout=4)
+        if not payload:
+            continue
+        asn = normalize_asn(payload.get("asn") or payload.get("org") or payload.get("organization") or payload.get("org_name"))
+        org = str(payload.get("org") or payload.get("org_name") or payload.get("organization") or "").strip()
+        if asn:
+            break
+    result = (asn, org)
+    if isinstance(cache, dict):
+        cache[ip] = result
+    return result
+
+
+def detect_public_ip():
+    providers = [
+        "https://api.ipify.org?format=json",
+        "https://ifconfig.co/json",
+        "https://ipinfo.io/json",
+        "https://ipapi.co/json/",
+    ]
+    for endpoint in providers:
+        payload = fetch_json_url(endpoint, timeout=4)
+        if not payload:
+            continue
+        candidate = str(payload.get("ip") or payload.get("query") or "").strip()
+        if not candidate:
+            continue
+        try:
+            ipaddress.ip_address(candidate)
+            return candidate
+        except ValueError:
+            continue
+    return ""
+
+
+def tls_handshake_latency_ms(domain, timeout_seconds=3):
+    started = time.time()
+    try:
+        with socket.create_connection((domain, 443), timeout=timeout_seconds) as sock:
+            context = ssl.create_default_context()
+            with context.wrap_socket(sock, server_hostname=domain):
+                pass
+        return int(max(1, (time.time() - started) * 1000))
+    except Exception:
+        return None
+
+
+def find_best_reality_sni_candidates(server_host_or_ip, max_results=8):
+    target_host, server_ip = resolve_host_to_ip(server_host_or_ip)
+    if not server_ip:
+        return [], f"Could not resolve server host/IP: {server_host_or_ip}", {}
+
+    asn_cache = {}
+    server_asn, server_org = lookup_ip_asn(server_ip, asn_cache)
+
+    ordered = []
+    seen_domains = set()
+    if server_asn:
+        for domain, score in REALITY_SNI_ASN_CANDIDATES.get(server_asn, []):
+            d = str(domain).strip().lower()
+            if not d or d in seen_domains:
+                continue
+            seen_domains.add(d)
+            ordered.append((d, int(score)))
+    for domain, score in REALITY_SNI_COMMON_CANDIDATES:
+        d = str(domain).strip().lower()
+        if not d or d in seen_domains:
+            continue
+        seen_domains.add(d)
+        ordered.append((d, int(score)))
+
+    matches = []
+    for domain, base_score in ordered:
+        _, domain_ip = resolve_host_to_ip(domain)
+        if not domain_ip:
+            continue
+        domain_asn, _ = lookup_ip_asn(domain_ip, asn_cache)
+        latency = tls_handshake_latency_ms(domain)
+        if latency is None:
+            continue
+        same_asn = bool(server_asn) and bool(domain_asn) and (domain_asn == server_asn)
+        score = base_score + max(0, 120 - min(120, latency // 5))
+        if same_asn:
+            score += 80
+        matches.append({
+            "domain": domain,
+            "ip": domain_ip,
+            "asn": domain_asn or "unknown",
+            "same_asn": same_asn,
+            "latency_ms": latency,
+            "score": score,
+        })
+
+    matches.sort(key=lambda item: (-int(item.get("score", 0)), int(item.get("latency_ms", 99999))))
+    if max_results > 0:
+        matches = matches[:max_results]
+
+    same_asn_count = 0
+    for item in matches:
+        if bool(item.get("same_asn", False)):
+            same_asn_count += 1
+
+    meta = {
+        "server_host": target_host or server_host_or_ip,
+        "server_ip": server_ip,
+        "server_asn": server_asn or "unknown",
+        "server_org": server_org,
+        "same_asn_count": same_asn_count,
+        "used_cross_asn_fallback": bool(matches) and same_asn_count == 0,
+    }
+    if not matches:
+        return [], "No reachable REALITY SNI candidates found.", meta
+    return matches, "", meta
+
+
 def prompt_server_names(default_values=None):
     if isinstance(default_values, list):
         seed = ",".join([str(item).strip() for item in default_values if str(item).strip()])
     else:
         seed = str(default_values or "").strip()
     if not seed:
-        seed = "www.zoomg.ir,zoomg.ir"
+        seed = "cloudflare.com,www.cloudflare.com"
+
     while True:
         names = parse_csv(
             input_default(
@@ -2029,6 +2298,156 @@ def prompt_server_names(default_values=None):
         if names:
             return names
         print_error("At least one server name is required.")
+
+
+def installed_client_instances():
+    instances = []
+    seen = set()
+    for service in installed_services():
+        role, instance = parse_service_role_instance(service)
+        if role != "client" or not instance:
+            continue
+        if instance in seen:
+            continue
+        seen.add(instance)
+        instances.append(instance)
+    instances.sort(key=lambda item: (item != "default", item))
+    return instances
+
+
+def choose_client_instance_for_reality_sni():
+    instances = installed_client_instances()
+    if not instances:
+        return ""
+    if len(instances) == 1:
+        return instances[0]
+    print_menu(
+        "🌌 REALITY SNI Finder",
+        [f"{idx}. Tunnel Client instance: {name}" for idx, name in enumerate(instances, start=1)],
+        color=Colors.CYAN,
+        min_width=56,
+    )
+    while True:
+        raw = input(f"Select client instance [1-{len(instances)}]: ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(instances):
+            return instances[int(raw) - 1]
+        print_error("Invalid choice.")
+
+
+def suggest_reality_single_site_pair(domain):
+    host = str(domain or "").strip().lower()
+    if not host:
+        return []
+    if host.startswith("www.") and len(host) > 4:
+        return [host[4:], host]
+    if "." in host:
+        return [host, f"www.{host}"]
+    return [host]
+
+
+def find_best_reality_sni_main_menu():
+    instance = ""
+    server_target = ""
+    instances = installed_client_instances()
+
+    if instances:
+        use_instance = input_default(
+            "Use installed Tunnel Client config for server address? (Y/n)",
+            "y",
+        ).strip().lower()
+        if use_instance in {"", "y", "yes"}:
+            instance = choose_client_instance_for_reality_sni()
+            if instance:
+                try:
+                    loaded = load_instance_runtime_settings("client", instance)
+                    protocol_cfg = loaded.get("protocol_config", {}) if isinstance(loaded, dict) else {}
+                    server_target = str(protocol_cfg.get("server_addr", "")).strip()
+                except Exception as exc:
+                    print_error(f"Failed to load Tunnel Client instance '{instance}': {exc}")
+                    server_target = ""
+
+                if server_target:
+                    print_info(
+                        f"Using Tunnel Client instance '{instance}' with server address: {server_target}"
+                    )
+                else:
+                    print_error(
+                        f"Tunnel Client instance '{instance}' has no server address in config."
+                    )
+
+    if not server_target:
+        detected_ip = detect_public_ip()
+        if detected_ip:
+            server_target = input_default(
+                "Server IP/Domain (for ASN lookup)",
+                detected_ip,
+            ).strip()
+        else:
+            server_target = input_default(
+                "Server IP/Domain (for ASN lookup)",
+                "",
+            ).strip()
+        while not server_target:
+            print_error("Server IP/Domain is required.")
+            server_target = input_default(
+                "Server IP/Domain (for ASN lookup)",
+                detected_ip if detected_ip else "",
+            ).strip()
+
+    print_info("Finding best reachable REALITY SNI candidates (same-ASN preferred)...")
+    candidates, err_msg, meta = find_best_reality_sni_candidates(server_target, max_results=8)
+    if not candidates:
+        if meta:
+            print_error(
+                f"{err_msg} server={meta.get('server_ip', server_target)} asn={meta.get('server_asn', 'unknown')}"
+            )
+        else:
+            print_error(err_msg or "No suitable SNI candidates found.")
+        return
+
+    header_lines = [
+        f"Client Instance: {instance if instance else '(manual target)'}",
+        f"Server: {meta.get('server_host', server_target)} ({meta.get('server_ip', '')})",
+        f"ASN: {meta.get('server_asn', '')} {meta.get('server_org', '')}".strip(),
+        "Pick one or more suggestions (comma separated indexes).",
+    ]
+    choice_lines = []
+    for idx, item in enumerate(candidates, start=1):
+        asn_tag = "same-ASN" if bool(item.get("same_asn", False)) else "cross-ASN"
+        choice_lines.append(
+            f"{idx}. {item['domain']}  ({item['ip']} | {item['asn']} | {asn_tag} | {item['latency_ms']}ms)"
+        )
+    print_menu(
+        "✅ REALITY SNI Suggestions",
+        header_lines + choice_lines,
+        color=Colors.CYAN,
+        min_width=74,
+    )
+    if bool(meta.get("used_cross_asn_fallback", False)):
+        print_info("No same-ASN candidate was reachable; showing best cross-ASN options.")
+
+    default_pick = ",".join(str(i) for i in range(1, min(3, len(candidates)) + 1))
+    raw_pick = input_default("Select indexes", default_pick).strip()
+    indexes = []
+    for part in parse_csv(raw_pick):
+        if part.isdigit():
+            pos = int(part)
+            if 1 <= pos <= len(candidates):
+                indexes.append(pos)
+    dedup = []
+    for pos in indexes:
+        if pos not in dedup:
+            dedup.append(pos)
+    selected = [candidates[pos - 1]["domain"] for pos in dedup]
+    if not selected:
+        print_error("No valid indexes selected.")
+        return
+
+    print_success(f"Selected REALITY SNIs: {', '.join(selected)}")
+    print_info(f"Server Names (comma separated): {','.join(selected)}")
+    single_site_pair = suggest_reality_single_site_pair(selected[0])
+    if single_site_pair:
+        print_info(f"Single-site pair suggestion: {','.join(single_site_pair)}")
 
 
 def prompt_reality_private_key(default_key=""):
@@ -2810,7 +3229,7 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
                 default_dest_when_empty=True,
             )
             reality_cfg["server_names"] = prompt_server_names(
-                default_values=default_reality_cfg.get("server_names", [])
+                default_values=default_reality_cfg.get("server_names", []),
             )
             reality_cfg["short_id"] = prompt_short_id(
                 default_reality_cfg.get("short_id", ""),
@@ -3460,7 +3879,9 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         config["type"] = "reality"
         config["allow_plaintext_framing"] = False
         config["port"] = prompt_or_keep_port(443)
-        config["server_names"] = prompt_server_names(config.get("server_names", []))
+        config["server_names"] = prompt_server_names(
+            config.get("server_names", []),
+        )
         config["short_id"] = prompt_short_id(config.get("short_id", ""), role=role)
         config["dest"] = input_default(
             "Dest (camouflage upstream for probes, optional host:port)",
@@ -4483,62 +4904,86 @@ def build_http_mimicry_profiles(preset_region="foreign"):
                 "Pragma": "no-cache",
             },
         },
-        "f_droid_packages": {
-            "path": "/packages/",
-            "browser": "firefox",
-            "fake_host": "f-droid.org",
+        "github_explore": {
+            "path": "/explore",
+            "browser": "chrome",
+            "fake_host": "github.com",
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
-                "Referer": "https://f-droid.org/",
+                "Referer": "https://github.com/explore",
                 "Sec-Fetch-Site": "same-origin",
                 "Cache-Control": "max-age=0",
             },
         },
-        "archwiki_page": {
-            "path": "/title/Main_page",
-            "browser": "edge",
-            "fake_host": "wiki.archlinux.org",
+        "stackoverflow_questions": {
+            "path": "/questions",
+            "browser": "firefox",
+            "fake_host": "stackoverflow.com",
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
-                "Referer": "https://wiki.archlinux.org/",
+                "Referer": "https://stackoverflow.com/questions",
                 "Sec-Fetch-Site": "same-origin",
                 "Pragma": "no-cache",
             },
         },
-        "mdn_docs": {
-            "path": "/en-US/docs/Web",
-            "browser": "chrome",
-            "fake_host": "developer.mozilla.org",
+        "wikipedia_main": {
+            "path": "/wiki/Main_Page",
+            "browser": "edge",
+            "fake_host": "en.wikipedia.org",
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
-                "Referer": "https://developer.mozilla.org/",
+                "Referer": "https://en.wikipedia.org/wiki/Main_Page",
                 "Sec-Fetch-Site": "same-origin",
                 "Cache-Control": "max-age=0",
             },
         },
-        "linode_docs": {
-            "path": "/docs/",
+        "cloudflare_learning": {
+            "path": "/learning/",
             "browser": "chrome",
-            "fake_host": "www.linode.com",
+            "fake_host": "www.cloudflare.com",
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
-                "Referer": "https://www.linode.com/docs/",
+                "Referer": "https://www.cloudflare.com/learning/",
                 "Sec-Fetch-Site": "same-origin",
                 "Cache-Control": "max-age=0",
             },
         },
-        "gnu_manuals": {
-            "path": "/software/",
-            "browser": "firefox",
-            "fake_host": "www.gnu.org",
+        "microsoft_support": {
+            "path": "/en-us/",
+            "browser": "edge",
+            "fake_host": "support.microsoft.com",
             "cookie_enabled": True,
             "chunked_encoding": False,
             "custom_headers": {
-                "Referer": "https://www.gnu.org/software/",
+                "Referer": "https://support.microsoft.com/en-us/",
+                "Sec-Fetch-Site": "same-origin",
+                "Pragma": "no-cache",
+            },
+        },
+        "apple_support": {
+            "path": "/en-us",
+            "browser": "safari",
+            "fake_host": "support.apple.com",
+            "cookie_enabled": True,
+            "chunked_encoding": False,
+            "custom_headers": {
+                "Referer": "https://support.apple.com/en-us",
+                "Sec-Fetch-Site": "same-origin",
+                "Cache-Control": "max-age=0",
+            },
+        },
+        "npm_registry": {
+            "path": "/package/express",
+            "browser": "chrome",
+            "fake_host": "www.npmjs.com",
+            "cookie_enabled": True,
+            "chunked_encoding": False,
+            "custom_headers": {
+                "Referer": "https://www.npmjs.com/package/express",
                 "Sec-Fetch-Site": "same-origin",
                 "Cache-Control": "max-age=0",
             },
@@ -4562,7 +5007,7 @@ def build_http_mimicry_profiles(preset_region="foreign"):
         selected_names = ordered_names
 
     if not selected_names:
-        selected_names = ["zoomg_articles"]
+        selected_names = ["cloudflare_learning"] if preset_region == "foreign" else ["zoomg_articles"]
 
     return {name: combined_profiles[name] for name in selected_names}
 
@@ -4580,7 +5025,7 @@ def normalize_http_mimicry_profiles_for_render(raw_profiles):
         out[key] = {
             "path": normalize_path(profile.get("path", "/api/v1/upload"), "/api/v1/upload"),
             "browser": str(profile.get("browser", "chrome")).strip() or "chrome",
-            "fake_host": str(profile.get("fake_host", "www.zoomg.ir")).strip() or "www.zoomg.ir",
+            "fake_host": str(profile.get("fake_host", "www.cloudflare.com")).strip() or "www.cloudflare.com",
             "cookie_enabled": bool(profile.get("cookie_enabled", True)),
             "chunked_encoding": bool(profile.get("chunked_encoding", False)),
             "custom_headers": profile.get("custom_headers", {}) if isinstance(profile.get("custom_headers", {}), dict) else {},
@@ -6287,7 +6732,8 @@ def main_menu():
                 f"{Colors.CYAN}[7]{Colors.ENDC} 🌐 Direct Connectivity Test (iperf3)",
                 f"{Colors.CYAN}[8]{Colors.ENDC} 🧷 Install nodelay-manager alias",
                 f"{Colors.CYAN}[9]{Colors.ENDC} ⬆️ Update nodelay-manager script",
-                f"{Colors.CYAN}[10]{Colors.ENDC} 🗑️  Uninstall",
+                f"{Colors.CYAN}[10]{Colors.ENDC} 🌌 Find best REALITY SNI (Run on Tunnel Client)",
+                f"{Colors.CYAN}[11]{Colors.ENDC} 🗑️  Uninstall",
                 f"{Colors.WARNING}[0]{Colors.ENDC} 🚪 Exit",
             ],
             color=Colors.CYAN,
@@ -6341,6 +6787,11 @@ def main_menu():
             input("\nPress Enter to continue...")
 
         elif choice == "10":
+            check_root()
+            find_best_reality_sni_main_menu()
+            input("\nPress Enter to continue...")
+
+        elif choice == "11":
             uninstall_everything()
             input("\nPress Enter to continue...")
 
