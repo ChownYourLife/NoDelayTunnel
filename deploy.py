@@ -5938,7 +5938,9 @@ def install_server_flow(
     print(f"Location: {Colors.BOLD}{server_location_label}{Colors.ENDC}")
     print(f"Config:   {Colors.BOLD}{config_path}{Colors.ENDC}")
     psk_text = cfg["psk"] if cfg["psk"] else "(disabled)"
+    token_text = str(cfg.get("token", "")).strip() or "(empty)"
     print(f"PSK:      {Colors.BOLD}{psk_text}{Colors.ENDC}")
+    print(f"Security Token: {Colors.BOLD}{token_text}{Colors.ENDC}")
     print(f"Tunnel Port: {Colors.BOLD}{cfg.get('port')}{Colors.ENDC}")
     if str(cfg.get("type", "")).strip().lower() in {"httpmimicry", "httpsmimicry"}:
         print(f"Mimic Path: {Colors.BOLD}{cfg.get('path', '')}{Colors.ENDC}")
@@ -6041,6 +6043,8 @@ def install_client_flow(
     print(f"Config:     {Colors.BOLD}{config_path}{Colors.ENDC}")
     print(f"Run command: {Colors.BOLD}nodelay client -c {config_path}{Colors.ENDC}")
     print(f"Profile:    {Colors.BOLD}{cfg['profile']}{Colors.ENDC}")
+    token_text = str(cfg.get("token", "")).strip() or "(empty)"
+    print(f"Security Token: {Colors.BOLD}{token_text}{Colors.ENDC}")
     print(f"Tunnel Port: {Colors.BOLD}{cfg.get('port')}{Colors.ENDC}")
     print(f"Pool Size:  {Colors.BOLD}{cfg.get('pool_size', 3)}{Colors.ENDC}")
     print(f"Strategy:   {Colors.BOLD}{cfg.get('connection_strategy', 'parallel')}{Colors.ENDC}")
