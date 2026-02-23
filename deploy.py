@@ -4794,6 +4794,73 @@ def format_endpoint_summary(endpoint):
     return summary
 
 
+def build_client_setup_lines_for_server_summary(cfg):
+    ep_type = normalize_endpoint_type(cfg.get("type", "tcp"), "tcp")
+    tunnel_mode = str(cfg.get("tunnel_mode", "reverse")).strip().lower() or "reverse"
+    token_text = str(cfg.get("token", "")).strip() or "(empty)"
+    psk_text = str(cfg.get("psk", "")).strip() or "(disabled)"
+    path_text = str(cfg.get("path", "")).strip() or "/tunnel"
+    try:
+        mimicry_auth_window_seconds = int(cfg.get("mimicry_auth_window_seconds", 60) or 60)
+    except (TypeError, ValueError):
+        mimicry_auth_window_seconds = 60
+
+    lines = [
+        "Server Address: <SERVER_PUBLIC_IP_OR_DOMAIN>",
+        f"Tunnel Mode: {tunnel_mode}",
+        f"Transport Type: {ep_type}",
+        f"Tunnel Port: {cfg.get('port')}",
+        f"Security Token: {token_text}",
+        f"PSK: {psk_text}",
+    ]
+
+    if ep_type in {"ws", "wss"}:
+        lines.append(f"Path: {path_text}")
+
+    if ep_type in {"httpmimicry", "httpsmimicry"}:
+        lines.append(f"Mimic Path: {path_text}")
+        lines.append(
+            f"Mimicry Transport Mode: {normalize_mimicry_transport_mode(cfg.get('mimicry_transport_mode', 'websocket'), 'websocket')}"
+        )
+        lines.append(
+            f"Mimicry Auth Secret: {str(cfg.get('mimicry_auth_secret', '')).strip() or '(empty)'}"
+        )
+        lines.append(
+            f"Mimicry Auth Window: {mimicry_auth_window_seconds}s"
+        )
+        lines.append(
+            f"Mimicry Basic User: {str(cfg.get('mimicry_basic_auth_user', '')).strip() or '(empty)'}"
+        )
+        lines.append(
+            f"Mimicry Basic Pass: {str(cfg.get('mimicry_basic_auth_pass', '')).strip() or '(empty)'}"
+        )
+
+    if ep_type == "reality":
+        public_key = str(cfg.get("public_key", "")).strip()
+        private_key = str(cfg.get("private_key", "")).strip()
+        if not public_key and private_key:
+            public_key = derive_reality_public_key(private_key) or ""
+        lines.append(f"REALITY Public Key: {public_key or '(missing)'}")
+        lines.append(f"REALITY Short ID: {str(cfg.get('short_id', '')).strip() or '(empty)'}")
+        server_names = normalize_server_names_list(cfg.get("server_names", []))
+        lines.append(
+            f"REALITY Server Names: {', '.join(server_names) if server_names else '(empty)'}"
+        )
+
+    if endpoint_uses_tls(ep_type):
+        lines.append("TLS/SNI: set client SNI if your cert requires a hostname.")
+
+    extra_eps = cfg.get("additional_endpoints", [])
+    if isinstance(extra_eps, list) and extra_eps:
+        lines.append(f"Additional Endpoints: {len(extra_eps)}")
+        all_eps = collect_render_endpoints("server", cfg)
+        for i, ep in enumerate(all_eps[1:], start=1):
+            lines.append(f"  [{i}] {format_endpoint_summary(ep)}")
+
+    lines.append("Keep all shared secrets exactly the same on the client.")
+    return lines
+
+
 def render_port_hopping_lines(indent, port_hopping_cfg):
     cfg = normalize_port_hopping_cfg(port_hopping_cfg, {})
     if not has_port_hopping_cfg(cfg):
@@ -5957,6 +6024,12 @@ def install_server_flow(
         print(f"Private:  {Colors.BOLD}{cfg['private_key']}{Colors.ENDC}")
         if cfg.get("public_key"):
             print(f"Public:   {Colors.BOLD}{cfg['public_key']}{Colors.ENDC}")
+    print_menu(
+        "Client Setup Details",
+        build_client_setup_lines_for_server_summary(cfg),
+        color=Colors.CYAN,
+        min_width=68,
+    )
 
 
 def install_client_flow(
