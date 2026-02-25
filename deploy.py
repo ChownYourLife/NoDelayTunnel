@@ -58,6 +58,17 @@ ROLE_LABELS = {
 DEFAULT_IRAN_PORT = 443
 DEFAULT_KHAREJ_PORT = 443
 TUNING_SECTIONS = ["smux", "tcp", "udp", "kcp", "quic", "reconnect"]
+PING_KEEPALIVE_DEFAULTS = {
+    "enabled": False,
+    "interval": "1s",
+    "timeout": "2s",
+    "startup_delay": "3s",
+    "targets": [],
+    "server_targets": [],
+    "client_targets": [],
+}
+# Temporary kill-switch: keep ping keepalive disabled in deploy workflow.
+PING_KEEPALIVE_TEMP_DISABLED = True
 IPERF_TEST_DEFAULT_PORT = 9777
 IPERF_TEST_DEFAULT_DURATION = 8
 IPERF_TEST_DEFAULT_STREAMS = 8
@@ -72,11 +83,13 @@ IPERF_POOR_MBPS = 100.0
 PORT_HOPPING_MAX_PORTS = 256
 MSS_CLAMP_DEFAULT = 0
 SYSTEMD_RUNTIME_ENV = {
-    "GOMEMLIMIT": "1GiB",
     "NODELAY_MEM_HOUSEKEEPER": "1",
     "NODELAY_MEM_HOUSEKEEPER_INTERVAL": "300s",
-    "NODELAY_MEM_HOUSEKEEPER_MIN_HEAP": "512MiB",
 }
+SYSTEMD_RUNTIME_GOMEMLIMIT_FALLBACK = "1GiB"
+SYSTEMD_RUNTIME_MAX_HEAP_FALLBACK = "512MiB"
+MIN_DYNAMIC_MAX_HEAP_BYTES = 128 * 1024 * 1024
+MIN_DYNAMIC_GOMEMLIMIT_BYTES = 256 * 1024 * 1024
 DEFAULT_SERVICE_RESTART_MINUTES = 0
 DEFAULT_SERVICE_RESTART_SECONDS = 3
 DEFAULT_SERVICE_RUNTIME_MAX_MINUTES = 0
@@ -286,6 +299,53 @@ def command_succeeds(command):
         stderr=subprocess.DEVNULL,
     )
     return result.returncode == 0
+
+
+def detect_total_ram_bytes():
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if not line.startswith("MemTotal:"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    return int(parts[1]) * 1024
+                break
+    except Exception:
+        pass
+
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        phys_pages = int(os.sysconf("SC_PHYS_PAGES"))
+        if page_size > 0 and phys_pages > 0:
+            return page_size * phys_pages
+    except Exception:
+        pass
+
+    return 0
+
+
+def to_mib_env_value(size_bytes):
+    mib = int(size_bytes // (1024 * 1024))
+    if mib < 1:
+        mib = 1
+    return f"{mib}MiB"
+
+
+def build_dynamic_runtime_env():
+    env = deep_copy(SYSTEMD_RUNTIME_ENV)
+    total_ram = detect_total_ram_bytes()
+    if total_ram <= 0:
+        env["NODELAY_MEM_HOUSEKEEPER_MIN_HEAP"] = SYSTEMD_RUNTIME_MAX_HEAP_FALLBACK
+        env["GOMEMLIMIT"] = SYSTEMD_RUNTIME_GOMEMLIMIT_FALLBACK
+        return env
+
+    max_heap_bytes = max(MIN_DYNAMIC_MAX_HEAP_BYTES, total_ram // 2)
+    gomemlimit_bytes = max(MIN_DYNAMIC_GOMEMLIMIT_BYTES, (total_ram * 3) // 4)
+
+    env["NODELAY_MEM_HOUSEKEEPER_MIN_HEAP"] = to_mib_env_value(max_heap_bytes)
+    env["GOMEMLIMIT"] = to_mib_env_value(gomemlimit_bytes)
+    return env
 
 
 def service_file_path(service_name):
@@ -2618,6 +2678,93 @@ def prompt_server_mappings(
     return mappings
 
 
+def prompt_append_forward_port_mapping(
+    existing=None,
+    fixed_mode=None,
+    default_mode="reverse",
+    bind_side_label="This node",
+    target_side_label="Remote node",
+):
+    print_header("➕ Add Forward Port")
+    print_info("This appends a new mapping. Existing mappings are kept unchanged.")
+
+    mappings = []
+    if isinstance(existing, list):
+        mappings = deep_copy(existing)
+
+    next_index = len(mappings) + 1
+    name = input_default("Name", f"mapping-{next_index}")
+
+    default_mode = str(default_mode or "reverse").strip().lower()
+    if default_mode not in {"reverse", "direct"}:
+        default_mode = "reverse"
+
+    if fixed_mode in {"reverse", "direct"}:
+        mode = fixed_mode
+        print_info(
+            f"Mode is fixed to '{mode}'. "
+            f"Bind side: {bind_side_label} | Target side: {target_side_label}"
+        )
+    else:
+        while True:
+            mode = input_default("Mode (reverse/direct)", default_mode).strip().lower()
+            if mode in {"reverse", "direct"}:
+                break
+            print_error("Mode must be 'reverse' or 'direct'.")
+
+    default_protocol = "tcp"
+    if mappings:
+        prev_proto = str(mappings[-1].get("protocol", "tcp")).strip().lower()
+        if prev_proto in {"tcp", "udp"}:
+            default_protocol = prev_proto
+
+    while True:
+        protocol = input_default("Protocol (tcp/udp)", default_protocol).strip().lower()
+        if protocol in {"tcp", "udp"}:
+            break
+        print_error("Protocol must be 'tcp' or 'udp'.")
+
+    if mode == "reverse":
+        bind_default = 2200 if protocol == "tcp" else 15353
+        target_default = 22 if protocol == "tcp" else 53
+    else:
+        bind_default = 18080 if protocol == "tcp" else 15353
+        target_default = 80 if protocol == "tcp" else 53
+
+    for prev in reversed(mappings):
+        prev_mode = str(prev.get("mode", "")).strip().lower()
+        prev_protocol = str(prev.get("protocol", "")).strip().lower()
+        if prev_mode != mode or prev_protocol != protocol:
+            continue
+        _, bind_default = split_host_port(prev.get("bind", ""), bind_default)
+        _, target_default = split_host_port(prev.get("target", ""), target_default)
+        break
+
+    bind_port = prompt_int("Bind port (auto bind IP = 0.0.0.0)", bind_default)
+    while bind_port < 1 or bind_port > 65535:
+        print_error("Port must be between 1 and 65535.")
+        bind_port = prompt_int("Bind port (auto bind IP = 0.0.0.0)", bind_default)
+
+    target_port = prompt_int("Target port (auto target IP = 127.0.0.1)", target_default)
+    while target_port < 1 or target_port > 65535:
+        print_error("Port must be between 1 and 65535.")
+        target_port = prompt_int("Target port (auto target IP = 127.0.0.1)", target_default)
+
+    mappings.append(
+        {
+            "name": name,
+            "mode": mode,
+            "protocol": protocol,
+            "bind": f"0.0.0.0:{bind_port}",
+            "target": f"127.0.0.1:{target_port}",
+        }
+    )
+    print_success(
+        f"Added mapping: {name} | {mode} {protocol} | 0.0.0.0:{bind_port} -> 127.0.0.1:{target_port}"
+    )
+    return mappings
+
+
 def prompt_client_tls_settings(server_addr, default_sni="", default_skip_verify=True):
     sni_default = default_sni or server_addr
     sni = input_default("Server Name (SNI)", sni_default).strip()
@@ -3369,6 +3516,161 @@ def normalize_dns_list(values, default_list):
     return cleaned
 
 
+def normalize_ping_keepalive_targets(values):
+    if isinstance(values, str):
+        values = [item.strip() for item in values.split(",") if item.strip()]
+    elif isinstance(values, list):
+        values = [str(item).strip() for item in values if str(item).strip()]
+    else:
+        values = []
+    seen = set()
+    cleaned = []
+    for item in values:
+        target = str(item).strip().lower()
+        if target.startswith("[") and target.endswith("]") and len(target) > 2:
+            target = target[1:-1].strip().lower()
+        if not target:
+            continue
+        if target in seen:
+            continue
+        seen.add(target)
+        cleaned.append(target)
+    return cleaned
+
+
+def normalize_ping_keepalive_config(cfg, role="server"):
+    base = {
+        "enabled": bool(PING_KEEPALIVE_DEFAULTS["enabled"]),
+        "interval": str(PING_KEEPALIVE_DEFAULTS["interval"]),
+        "timeout": str(PING_KEEPALIVE_DEFAULTS["timeout"]),
+        "startup_delay": str(PING_KEEPALIVE_DEFAULTS["startup_delay"]),
+        "targets": list(PING_KEEPALIVE_DEFAULTS["targets"]),
+        "server_targets": list(PING_KEEPALIVE_DEFAULTS["server_targets"]),
+        "client_targets": list(PING_KEEPALIVE_DEFAULTS["client_targets"]),
+    }
+    if isinstance(cfg, dict):
+        base["enabled"] = bool(cfg.get("enabled", base["enabled"]))
+        base["interval"] = str(cfg.get("interval", base["interval"]) or base["interval"]).strip() or base["interval"]
+        base["timeout"] = str(cfg.get("timeout", base["timeout"]) or base["timeout"]).strip() or base["timeout"]
+        base["startup_delay"] = str(cfg.get("startup_delay", base["startup_delay"]) or base["startup_delay"]).strip() or base["startup_delay"]
+        base["targets"] = normalize_ping_keepalive_targets(cfg.get("targets", base["targets"]))
+        base["server_targets"] = normalize_ping_keepalive_targets(cfg.get("server_targets", base["server_targets"]))
+        base["client_targets"] = normalize_ping_keepalive_targets(cfg.get("client_targets", base["client_targets"]))
+    role_normalized = str(role or "").strip().lower()
+    if role_normalized not in {"server", "client"}:
+        role_normalized = "server"
+    if PING_KEEPALIVE_TEMP_DISABLED:
+        base["enabled"] = False
+        base["targets"] = []
+        base["server_targets"] = []
+        base["client_targets"] = []
+    return base
+
+
+def validate_ping_keepalive_peer_target(value):
+    target = str(value or "").strip().lower()
+    if not target:
+        return "", "Target is empty."
+    if "://" in target:
+        return "", "Enter host/IP only (without scheme)."
+    if any(ch in target for ch in "/?#"):
+        return "", "Enter host/IP only (without path/query)."
+    if target.startswith("[") and target.endswith("]") and len(target) > 2:
+        target = target[1:-1].strip().lower()
+    if not target:
+        return "", "Target is empty."
+    if ":" in target and target.count(":") == 1 and re.search(r":\d+$", target):
+        return "", "Do not include port; enter only IP/host."
+    try:
+        ipaddress.ip_address(target)
+        return target, ""
+    except ValueError:
+        pass
+    if ":" in target:
+        return "", "Invalid target."
+    if not re.fullmatch(r"[a-z0-9.-]+", target):
+        return "", "Target must be a valid IP/hostname."
+    if target.startswith("-") or target.endswith("-") or target.startswith(".") or target.endswith("."):
+        return "", "Target must be a valid IP/hostname."
+    return target, ""
+
+
+def resolve_ping_keepalive_targets(role, cfg):
+    current = normalize_ping_keepalive_config(cfg, role)
+    targets = list(current["targets"])
+    if str(role).strip().lower() == "server":
+        targets.extend(current["server_targets"])
+    elif str(role).strip().lower() == "client":
+        targets.extend(current["client_targets"])
+    return normalize_ping_keepalive_targets(targets)
+
+
+def prompt_ping_keepalive_settings(role, defaults=None, peer_hint=""):
+    if PING_KEEPALIVE_TEMP_DISABLED:
+        return normalize_ping_keepalive_config({}, role)
+
+    current = normalize_ping_keepalive_config(defaults, role)
+    role_normalized = str(role or "").strip().lower()
+    if role_normalized not in {"server", "client"}:
+        role_normalized = "server"
+    role_key = "server_targets" if role_normalized == "server" else "client_targets"
+
+    default_peer = ""
+    existing_effective = resolve_ping_keepalive_targets(role_normalized, current)
+    if existing_effective:
+        default_peer = existing_effective[0]
+    elif role_normalized == "client" and isinstance(defaults, dict):
+        default_peer = str(defaults.get("server_addr", "")).strip()
+    if not default_peer:
+        default_peer = str(peer_hint or "").strip()
+
+    if role_normalized == "client":
+        peer, err_msg = validate_ping_keepalive_peer_target(default_peer)
+        if err_msg:
+            print_info("Ping keepalive auto-setup skipped: destination host/IP is not valid.")
+            current["enabled"] = False
+            current["targets"] = []
+            current["server_targets"] = []
+            current["client_targets"] = []
+            return normalize_ping_keepalive_config(current, role_normalized)
+        current["enabled"] = True
+        current["targets"] = []
+        current["server_targets"] = []
+        current["client_targets"] = []
+        current[role_key] = [peer]
+        print_info(f"Ping keepalive auto target set to: {peer}")
+        return normalize_ping_keepalive_config(current, role_normalized)
+
+    print_header("🏓 Ping Keepalive")
+    print_info("Only peer IP/hostname is required. Leave empty to disable.")
+    if default_peer:
+        print_info(f"Current peer target: {default_peer}")
+
+    while True:
+        peer_raw = input_default(
+            "Peer server IP/hostname (blank = disable)",
+            default_peer,
+        ).strip()
+        if not peer_raw:
+            current["enabled"] = False
+            current["targets"] = []
+            current["server_targets"] = []
+            current["client_targets"] = []
+            return normalize_ping_keepalive_config(current, role_normalized)
+
+        peer, err_msg = validate_ping_keepalive_peer_target(peer_raw)
+        if err_msg:
+            print_error(err_msg)
+            continue
+
+        current["enabled"] = True
+        current["targets"] = []
+        current["server_targets"] = []
+        current["client_targets"] = []
+        current[role_key] = [peer]
+        return normalize_ping_keepalive_config(current, role_normalized)
+
+
 def normalize_dns_config(cfg, default=None):
     if not isinstance(default, dict):
         default = {}
@@ -3587,11 +3889,16 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         "generated_private_key": "",
         "reality_key_generated": False,
         "listen_host": "",
+        "ping_keepalive": normalize_ping_keepalive_config({}, role),
     }
 
     if isinstance(defaults, dict):
         for k, v in defaults.items():
             config[k] = v
+    config["ping_keepalive"] = normalize_ping_keepalive_config(
+        config.get("ping_keepalive", {}),
+        role,
+    )
 
     path_was_provided = isinstance(defaults, dict) and str(defaults.get("path", "")).strip() != ""
 
@@ -3932,6 +4239,11 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         input_default("Force uTLS/HTTP profile coherence? (Y/n)", "y" if config.get("utls_strict_profile_match", True) else "n"),
         True,
     )
+    config["ping_keepalive"] = prompt_ping_keepalive_settings(
+        role,
+        config.get("ping_keepalive", {}),
+        peer_hint=config.get("server_addr", ""),
+    )
 
     return config
 
@@ -4215,6 +4527,10 @@ def load_instance_runtime_settings(role, instance):
     )
     mimicry_basic_auth_user = str(http_mimicry_cfg.get("basic_auth_user", "")).strip()
     mimicry_basic_auth_pass = str(http_mimicry_cfg.get("basic_auth_pass", "")).strip()
+    ping_keepalive_cfg = normalize_ping_keepalive_config(
+        parsed.get("ping_keepalive", {}),
+        role,
+    )
 
     if role == "server":
         server_cfg = parsed.get("server", {}) if isinstance(parsed.get("server"), dict) else {}
@@ -4306,6 +4622,7 @@ def load_instance_runtime_settings(role, instance):
             "service_restart_minutes": service_restart_minutes,
             "service_runtime_max_minutes": service_runtime_max_minutes,
             "profile": profile,
+            "ping_keepalive": deep_copy(ping_keepalive_cfg),
         }
         mappings = (
             server_cfg.get("mappings", [])
@@ -4432,6 +4749,7 @@ def load_instance_runtime_settings(role, instance):
             "service_restart_minutes": service_restart_minutes,
             "service_runtime_max_minutes": service_runtime_max_minutes,
             "profile": profile,
+            "ping_keepalive": deep_copy(ping_keepalive_cfg),
         }
         mappings = client.get("mappings", [])
         if not isinstance(mappings, list):
@@ -4456,7 +4774,7 @@ def load_instance_runtime_settings(role, instance):
         for section in TUNING_SECTIONS
     )
 
-    tuning = deep_copy(base_tuning(role))
+    tuning = deep_copy(base_tuning(role, profile))
     for section in TUNING_SECTIONS:
         incoming = parsed.get(section, {})
         if not isinstance(incoming, dict):
@@ -4660,19 +4978,18 @@ def select_obfuscation_profile(default_key="speed"):
         print_error("Invalid choice.")
 
 
-def base_tuning(role):
-    smux_values = {
-        "version": 2,
-        "keepalive_enabled": True,
-        "keepalive_every": "5s",
-        "keepalive_timeout": "15s",
-        "max_frame_size": 32768,
-        # Keep buffers moderate so backpressure kicks in before long one-way stalls.
-        "max_receive_buffer": 4 * 1024 * 1024,
-        "max_stream_buffer": 1024 * 1024,
-    }
-    return {
-        "smux": smux_values,
+def base_tuning(role, profile="balanced"):
+    _ = role
+    tuning = {
+        "smux": {
+            "version": 2,
+            "keepalive_enabled": True,
+            "keepalive_every": "5s",
+            "keepalive_timeout": "15s",
+            "max_frame_size": 32768,
+            "max_receive_buffer": 4 * 1024 * 1024,
+            "max_stream_buffer": 1024 * 1024,
+        },
         "tcp": {
             "no_delay": True,
             "keepalive": "15s",
@@ -4715,9 +5032,52 @@ def base_tuning(role):
         },
     }
 
+    profile_key = str(profile or "balanced").strip().lower()
+    if profile_key in {"", "balanced"}:
+        tuning["smux"].update(
+            {
+                "max_frame_size": 65535,
+                "max_receive_buffer": 32 * 1024 * 1024,
+                "max_stream_buffer": 32 * 1024 * 1024,
+            }
+        )
+        tuning["tcp"].update(
+            {
+                "keepalive": "3s",
+                "read_buffer": 32 * 1024 * 1024,
+                "write_buffer": 32 * 1024 * 1024,
+                "conn_limit": 300,
+                "auto_tune": False,
+            }
+        )
+        tuning["udp"].update(
+            {
+                "read_buffer": 262144,
+                "write_buffer": 262144,
+                "session_idle_timeout": "90s",
+            }
+        )
+        tuning["kcp"].update(
+            {
+                "interval": 5,
+                "mtu": 1400,
+                "send_window": 256,
+                "recv_window": 256,
+            }
+        )
 
-def configure_tuning(role, deployment_mode):
-    tuning = json.loads(json.dumps(base_tuning(role)))
+    return tuning
+
+
+def profile_health_interval(profile_key):
+    profile = str(profile_key or "balanced").strip().lower()
+    if profile in {"", "balanced"}:
+        return "1s"
+    return "15s"
+
+
+def configure_tuning(role, deployment_mode, profile="balanced"):
+    tuning = json.loads(json.dumps(base_tuning(role, profile)))
     if deployment_mode != "advanced":
         return tuning
 
@@ -5415,6 +5775,11 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
     reality_short_id = reality_cfg.get("short_id", "")
     reality_private_key = reality_cfg.get("private_key", "")
     mux_type = normalize_mux_type(protocol_config.get("mux_type", "smux"), "smux")
+    health_interval = profile_health_interval(protocol_config.get("profile", "balanced"))
+    ping_keepalive_cfg = normalize_ping_keepalive_config(
+        protocol_config.get("ping_keepalive", {}),
+        "server",
+    )
     lines = [
         "mode: server",
         f"tunnel_mode: {yaml_scalar(protocol_config.get('tunnel_mode', 'reverse'))}",
@@ -5509,7 +5874,16 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
             "",
             "health:",
             "  enabled: true",
-            '  interval: "15s"',
+            f"  interval: {yaml_scalar(health_interval)}",
+            "",
+            "ping_keepalive:",
+            f"  enabled: {yaml_scalar(ping_keepalive_cfg['enabled'])}",
+            f"  interval: {yaml_scalar(ping_keepalive_cfg['interval'])}",
+            f"  timeout: {yaml_scalar(ping_keepalive_cfg['timeout'])}",
+            f"  startup_delay: {yaml_scalar(ping_keepalive_cfg['startup_delay'])}",
+            f"  targets: {json.dumps(ping_keepalive_cfg['targets'])}",
+            f"  server_targets: {json.dumps(ping_keepalive_cfg['server_targets'])}",
+            f"  client_targets: {json.dumps(ping_keepalive_cfg['client_targets'])}",
             "",
             "reconnect:",
             f"  min_delay: {yaml_scalar(tuning['reconnect']['min_delay'])}",
@@ -5607,6 +5981,11 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         pool_size = 3
     if pool_size < 1:
         pool_size = 1
+    health_interval = profile_health_interval(protocol_config.get("profile", "balanced"))
+    ping_keepalive_cfg = normalize_ping_keepalive_config(
+        protocol_config.get("ping_keepalive", {}),
+        "client",
+    )
     lines = [
         "mode: client",
         f"tunnel_mode: {yaml_scalar(protocol_config.get('tunnel_mode', 'reverse'))}",
@@ -5696,7 +6075,16 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         "",
         "health:",
         "  enabled: true",
-        '  interval: "15s"',
+        f"  interval: {yaml_scalar(health_interval)}",
+        "",
+        "ping_keepalive:",
+        f"  enabled: {yaml_scalar(ping_keepalive_cfg['enabled'])}",
+        f"  interval: {yaml_scalar(ping_keepalive_cfg['interval'])}",
+        f"  timeout: {yaml_scalar(ping_keepalive_cfg['timeout'])}",
+        f"  startup_delay: {yaml_scalar(ping_keepalive_cfg['startup_delay'])}",
+        f"  targets: {json.dumps(ping_keepalive_cfg['targets'])}",
+        f"  server_targets: {json.dumps(ping_keepalive_cfg['server_targets'])}",
+        f"  client_targets: {json.dumps(ping_keepalive_cfg['client_targets'])}",
         "",
         "reconnect:",
         f"  min_delay: {yaml_scalar(tuning['reconnect']['min_delay'])}",
@@ -5836,9 +6224,10 @@ def create_service(role, instance="default", restart_minutes=0, runtime_max_minu
     config_path = os.path.join(CONFIG_DIR, build_config_filename(role, instance))
     exec_start = f"{os.path.join(INSTALL_DIR, BINARY_NAME)} {profile['mode']} -c {config_path}"
     description = profile["description"] if instance == "default" else f"{profile['description']} [{instance}]"
+    runtime_env = build_dynamic_runtime_env()
     env_lines = "\n".join(
         f'Environment="{key}={value}"'
-        for key, value in SYSTEMD_RUNTIME_ENV.items()
+        for key, value in runtime_env.items()
     )
     content = f"""[Unit]
 Description={description}
@@ -5869,7 +6258,9 @@ WantedBy=multi-user.target
     run_command(f"systemctl restart {service_name}")
     print_success(
         f"✅ Systemd service installed and started: {service_name}.service "
-        f"(auto-restart: {restart_label}, runtime-max: {runtime_max_label})"
+        f"(auto-restart: {restart_label}, runtime-max: {runtime_max_label}, "
+        f"max-heap: {runtime_env.get('NODELAY_MEM_HOUSEKEEPER_MIN_HEAP')}, "
+        f"gomemlimit: {runtime_env.get('GOMEMLIMIT')})"
     )
 
 
@@ -6059,6 +6450,11 @@ def edit_service_instance(service_name):
             role == "client"
             and str(protocol_cfg.get("tunnel_mode", "reverse")).strip().lower() == "direct"
         )
+        ping_keepalive_cfg = normalize_ping_keepalive_config(
+            protocol_cfg.get("ping_keepalive", {}),
+            role,
+        )
+        effective_ping_targets = resolve_ping_keepalive_targets(role, ping_keepalive_cfg)
         menu_lines = [
             f"Role:        {role} ({role_display(role)})",
             f"Instance:    {instance}",
@@ -6068,6 +6464,10 @@ def edit_service_instance(service_name):
             f"TunnelMode:  {protocol_cfg.get('tunnel_mode', 'reverse')}",
             f"Profile:     {protocol_cfg.get('profile', 'balanced')}",
             f"Obfuscation: {'enabled' if obfuscation_cfg.get('enabled') else 'disabled'}",
+            (
+                f"PingKA:      {'enabled' if ping_keepalive_cfg.get('enabled') else 'disabled'} "
+                f"(targets={len(effective_ping_targets)}, interval={ping_keepalive_cfg.get('interval', '1s')})"
+            ),
             (
                 f"AutoRestart: always ({DEFAULT_SERVICE_RESTART_SECONDS}s)"
             ),
@@ -6088,39 +6488,46 @@ def edit_service_instance(service_name):
             menu_lines.append(f"Extra EPs:   {len(protocol_cfg.get('additional_endpoints', []))}")
             if client_direct_mode:
                 menu_lines.append(f"Mappings:    {len(protocol_cfg.get('mappings', []))}")
+
+        supports_mapping_edit = role == "server" or client_direct_mode
+        if supports_mapping_edit:
+            choice_edit_mappings = "4"
+            choice_add_forward = "5"
+            choice_edit_tuning = "6"
+            choice_edit_license = "7"
+            choice_edit_runtime = "8"
+            choice_save = "9"
+        else:
+            choice_edit_mappings = ""
+            choice_add_forward = ""
+            choice_edit_tuning = "4"
+            choice_edit_license = "5"
+            choice_edit_runtime = "6"
+            choice_save = "7"
+
         menu_lines.append("")
-        menu_lines.append("1. Edit protocol / listen port / transport settings")
+        menu_lines.append("1. Edit protocol / listen port / transport")
         menu_lines.append("2. Edit profile preset")
         menu_lines.append("3. Edit obfuscation preset")
-        if role == "server":
+        if supports_mapping_edit:
             menu_lines.extend(
                 [
-                    "4. Edit port mappings",
-                    "5. Edit advanced tuning",
-                    "6. Edit license ID",
-                    "7. Edit service runtime max",
-                    "8. Save changes and restart service",
-                    "0. Cancel",
-                ]
-            )
-        elif client_direct_mode:
-            menu_lines.extend(
-                [
-                    "4. Edit port mappings",
-                    "5. Edit advanced tuning",
-                    "6. Edit license ID",
-                    "7. Edit service runtime max",
-                    "8. Save changes and restart service",
+                    f"{choice_edit_mappings}. Edit port mappings",
+                    f"{choice_add_forward}. Add forward port (append only)",
+                    f"{choice_edit_tuning}. Edit advanced tuning",
+                    f"{choice_edit_license}. Edit license ID",
+                    f"{choice_edit_runtime}. Edit service runtime max",
+                    f"{choice_save}. Save changes and restart service",
                     "0. Cancel",
                 ]
             )
         else:
             menu_lines.extend(
                 [
-                    "4. Edit advanced tuning",
-                    "5. Edit license ID",
-                    "6. Edit service runtime max",
-                    "7. Save changes and restart service",
+                    f"{choice_edit_tuning}. Edit advanced tuning",
+                    f"{choice_edit_license}. Edit license ID",
+                    f"{choice_edit_runtime}. Edit service runtime max",
+                    f"{choice_save}. Save changes and restart service",
                     "0. Cancel",
                 ]
             )
@@ -6174,27 +6581,43 @@ def edit_service_instance(service_name):
         elif choice == "3":
             default_obf_key = match_obfuscation_preset_key(obfuscation_cfg)
             obfuscation_cfg = select_obfuscation_profile(default_key=default_obf_key)
-        elif choice == "4" and role == "server":
+        elif choice == choice_edit_mappings and role == "server":
             protocol_cfg["mappings"] = prompt_server_mappings(
                 existing=protocol_cfg.get("mappings", [])
             )
-        elif choice == "4" and client_direct_mode:
+        elif choice == choice_edit_mappings and client_direct_mode:
             protocol_cfg["mappings"] = prompt_server_mappings(
                 existing=protocol_cfg.get("mappings", []),
                 fixed_mode="direct",
                 bind_side_label="Client side",
                 target_side_label="Server side",
             )
-        elif (choice == "5" and role == "server") or (choice == "5" and client_direct_mode) or (choice == "4" and role == "client" and not client_direct_mode):
+        elif choice == choice_add_forward and role == "server":
+            tunnel_mode_hint = str(protocol_cfg.get("tunnel_mode", "reverse")).strip().lower()
+            default_mode = tunnel_mode_hint if tunnel_mode_hint in {"reverse", "direct"} else "reverse"
+            protocol_cfg["mappings"] = prompt_append_forward_port_mapping(
+                existing=protocol_cfg.get("mappings", []),
+                fixed_mode=None,
+                default_mode=default_mode,
+            )
+        elif choice == choice_add_forward and client_direct_mode:
+            protocol_cfg["mappings"] = prompt_append_forward_port_mapping(
+                existing=protocol_cfg.get("mappings", []),
+                fixed_mode="direct",
+                default_mode="direct",
+                bind_side_label="Client side",
+                target_side_label="Server side",
+            )
+        elif choice == choice_edit_tuning:
             tuning = configure_tuning_from_existing(tuning)
             explicit_tuning = True
-        elif (choice == "6" and role == "server") or (choice == "6" and client_direct_mode) or (choice == "5" and role == "client" and not client_direct_mode):
+        elif choice == choice_edit_license:
             protocol_cfg["license"] = prompt_license_id()
-        elif (choice == "7" and role == "server") or (choice == "7" and client_direct_mode) or (choice == "6" and role == "client" and not client_direct_mode):
+        elif choice == choice_edit_runtime:
             protocol_cfg["service_runtime_max_minutes"] = prompt_service_runtime_max_minutes(
                 default_minutes=protocol_cfg.get("service_runtime_max_minutes", 0)
             )
-        elif (choice == "8" and role == "server") or (choice == "8" and client_direct_mode) or (choice == "7" and role == "client" and not client_direct_mode):
+        elif choice == choice_save:
             config_file = build_config_filename(role, instance)
             restart_minutes = protocol_cfg.get("service_restart_minutes", DEFAULT_SERVICE_RESTART_MINUTES)
             runtime_max_minutes = protocol_cfg.get(
@@ -6356,7 +6779,7 @@ def install_server_flow(
     cfg["tunnel_mode"] = tunnel_mode
     cfg["license"] = prompt_license_id()
     cfg["profile"] = select_config_profile()
-    tuning = configure_tuning("server", deployment_mode)
+    tuning = configure_tuning("server", deployment_mode, cfg.get("profile", "balanced"))
     obfuscation_cfg = select_obfuscation_profile()
     cfg["service_restart_minutes"] = prompt_service_restart_minutes(
         default_minutes=DEFAULT_SERVICE_RESTART_MINUTES
@@ -6463,7 +6886,7 @@ def install_client_flow(
     cfg["tunnel_mode"] = tunnel_mode
     cfg["license"] = ""
     cfg["profile"] = select_config_profile()
-    tuning = configure_tuning("client", deployment_mode)
+    tuning = configure_tuning("client", deployment_mode, cfg.get("profile", "balanced"))
     obfuscation_cfg = select_obfuscation_profile()
     cfg["service_restart_minutes"] = prompt_service_restart_minutes(
         default_minutes=DEFAULT_SERVICE_RESTART_MINUTES
