@@ -2655,6 +2655,60 @@ def format_host_port(host, port):
     return f"{host}:{int(port)}"
 
 
+def normalize_mapping_mode(raw, default="reverse"):
+    value = str(raw or "").strip().lower()
+    if value in {"reverse", "direct"}:
+        return value
+    return str(default or "reverse").strip().lower() or "reverse"
+
+
+def normalize_mapping_protocol(raw, default="tcp"):
+    value = str(raw or "").strip().lower()
+    if value in {"", "tcp"}:
+        return "tcp"
+    if value == "udp":
+        return "udp"
+    if value in {"ipx", "ipip", "tun"}:
+        return "ipx"
+    if value in {"bip", "bgp"}:
+        return "bip"
+    fallback = str(default or "tcp").strip().lower() or "tcp"
+    return fallback
+
+
+def mapping_default_ports(mode, protocol):
+    mode = normalize_mapping_mode(mode, "reverse")
+    protocol = normalize_mapping_protocol(protocol, "tcp")
+    if protocol == "tcp":
+        if mode == "reverse":
+            return 2200, 22
+        return 18080, 80
+    if protocol == "udp":
+        return 15353, 53
+    if protocol == "bip":
+        return 179, 179
+    return None, None
+
+
+def mapping_default_endpoints(mode, protocol):
+    protocol = normalize_mapping_protocol(protocol, "tcp")
+    if protocol == "ipx":
+        return "ndtun0", "ndtun0"
+    bind_port, target_port = mapping_default_ports(mode, protocol)
+    if bind_port is None or target_port is None:
+        bind_port, target_port = 2200, 22
+    return f"0.0.0.0:{bind_port}", f"127.0.0.1:{target_port}"
+
+
+def is_valid_tun_interface_name(value):
+    name = str(value or "").strip()
+    if not name:
+        return False
+    if any(ch in name for ch in ("/", "\\", ":")):
+        return False
+    return True
+
+
 def prompt_server_mappings(
     existing=None,
     fixed_mode=None,
@@ -2696,34 +2750,52 @@ def prompt_server_mappings(
                 print_error("Mode must be 'reverse' or 'direct'.")
 
         while True:
-            protocol = input_default("Protocol (tcp/udp)", "tcp").strip().lower()
-            if protocol in {"tcp", "udp"}:
+            protocol = normalize_mapping_protocol(
+                input_default("Protocol (tcp/udp/ipx/tun/bip/bgp)", "tcp")
+            )
+            if protocol in {"tcp", "udp", "ipx", "bip"}:
                 break
-            print_error("Protocol must be 'tcp' or 'udp'.")
+            print_error("Protocol must be tcp, udp, ipx/tun, or bip/bgp.")
 
-        if mode == "reverse":
-            bind_default = 2200 if protocol == "tcp" else 15353
-            target_default = 22 if protocol == "tcp" else 53
+        if protocol == "ipx":
+            print_info(
+                "ipx/tun mapping uses Linux TUN interface names instead of host:port."
+            )
+            while True:
+                bind = input_default(
+                    "Local TUN interface (bind)", "ndtun0"
+                ).strip()
+                if is_valid_tun_interface_name(bind):
+                    break
+                print_error(
+                    "Interface name cannot be empty and cannot contain '/', '\\', or ':'."
+                )
+            while True:
+                target = input_default(
+                    "Remote TUN interface (target)", "ndtun0"
+                ).strip()
+                if is_valid_tun_interface_name(target):
+                    break
+                print_error(
+                    "Interface name cannot be empty and cannot contain '/', '\\', or ':'."
+                )
         else:
-            bind_default = 18080 if protocol == "tcp" else 15353
-            target_default = 80 if protocol == "tcp" else 53
-
-        bind_port = prompt_int("Bind port (auto bind IP = 0.0.0.0)", bind_default)
-        while bind_port < 1 or bind_port > 65535:
-            print_error("Port must be between 1 and 65535.")
+            bind_default, target_default = mapping_default_ports(mode, protocol)
             bind_port = prompt_int("Bind port (auto bind IP = 0.0.0.0)", bind_default)
+            while bind_port < 1 or bind_port > 65535:
+                print_error("Port must be between 1 and 65535.")
+                bind_port = prompt_int("Bind port (auto bind IP = 0.0.0.0)", bind_default)
 
-        target_port = prompt_int("Target port (target IP = 127.0.0.1)", target_default)
-        while target_port < 1 or target_port > 65535:
-            print_error("Port must be between 1 and 65535.")
             target_port = prompt_int("Target port (target IP = 127.0.0.1)", target_default)
+            while target_port < 1 or target_port > 65535:
+                print_error("Port must be between 1 and 65535.")
+                target_port = prompt_int("Target port (target IP = 127.0.0.1)", target_default)
+            bind = f"0.0.0.0:{bind_port}"
+            target = f"127.0.0.1:{target_port}"
 
         route_to = input_default(
             "Route to Kharej IP (blank = round-robin all clients)", ""
         ).strip()
-
-        bind = f"0.0.0.0:{bind_port}"
-        target = f"127.0.0.1:{target_port}"
 
         mapping = {
             "name": name,
@@ -5047,15 +5119,20 @@ def load_instance_runtime_settings(role, instance):
         for idx, m in enumerate(mappings, start=1):
             if not isinstance(m, dict):
                 continue
-            cleaned_mappings.append(
-                {
-                    "name": str(m.get("name", f"mapping-{idx}")),
-                    "mode": str(m.get("mode", "reverse")),
-                    "protocol": str(m.get("protocol", "tcp")),
-                    "bind": str(m.get("bind", "0.0.0.0:2200")),
-                    "target": str(m.get("target", "127.0.0.1:22")),
-                }
-            )
+            mode = normalize_mapping_mode(m.get("mode", "reverse"), "reverse")
+            protocol = normalize_mapping_protocol(m.get("protocol", "tcp"), "tcp")
+            default_bind, default_target = mapping_default_endpoints(mode, protocol)
+            entry = {
+                "name": str(m.get("name", f"mapping-{idx}")),
+                "mode": mode,
+                "protocol": protocol,
+                "bind": str(m.get("bind", default_bind)),
+                "target": str(m.get("target", default_target)),
+            }
+            route_to = str(m.get("route_to", "")).strip()
+            if route_to:
+                entry["route_to"] = route_to
+            cleaned_mappings.append(entry)
         protocol_cfg["mappings"] = cleaned_mappings
     else:
         client = parsed.get("client", {}) if isinstance(parsed.get("client"), dict) else {}
@@ -5188,15 +5265,20 @@ def load_instance_runtime_settings(role, instance):
         for idx, m in enumerate(mappings, start=1):
             if not isinstance(m, dict):
                 continue
-            cleaned_mappings.append(
-                {
-                    "name": str(m.get("name", f"mapping-{idx}")),
-                    "mode": str(m.get("mode", "direct")),
-                    "protocol": str(m.get("protocol", "tcp")),
-                    "bind": str(m.get("bind", "0.0.0.0:2200")),
-                    "target": str(m.get("target", "127.0.0.1:22")),
-                }
-            )
+            mode = normalize_mapping_mode(m.get("mode", "direct"), "direct")
+            protocol = normalize_mapping_protocol(m.get("protocol", "tcp"), "tcp")
+            default_bind, default_target = mapping_default_endpoints(mode, protocol)
+            entry = {
+                "name": str(m.get("name", f"mapping-{idx}")),
+                "mode": mode,
+                "protocol": protocol,
+                "bind": str(m.get("bind", default_bind)),
+                "target": str(m.get("target", default_target)),
+            }
+            route_to = str(m.get("route_to", "")).strip()
+            if route_to:
+                entry["route_to"] = route_to
+            cleaned_mappings.append(entry)
         protocol_cfg["mappings"] = cleaned_mappings
 
     explicit_tuning = any(
