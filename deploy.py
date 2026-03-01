@@ -4,6 +4,7 @@ import os
 import random
 import re
 import shlex
+import secrets
 import shutil
 import subprocess
 import sys
@@ -82,14 +83,54 @@ IPERF_EXCELLENT_MBPS = 200.0
 IPERF_POOR_MBPS = 100.0
 PORT_HOPPING_MAX_PORTS = 256
 MSS_CLAMP_DEFAULT = 0
-SYSTEMD_RUNTIME_ENV = {
-    "NODELAY_MEM_HOUSEKEEPER": "1",
-    "NODELAY_MEM_HOUSEKEEPER_INTERVAL": "300s",
+SYSTEMD_RUNTIME_ENV_STATIC = {
+    # Memory housekeeper is intentionally NOT enabled by default.
+    # GOMEMLIMIT (auto-detected at 75% of RAM) handles memory pressure via
+    # Go's GC pacer, which is adaptive and low-overhead.
+    # To enable the legacy housekeeper for debugging, set these manually:
+    #   NODELAY_MEM_HOUSEKEEPER=1
+    #   NODELAY_MEM_HOUSEKEEPER_INTERVAL=300s
+    #   NODELAY_MEM_HOUSEKEEPER_MIN_HEAP=512MiB
 }
-SYSTEMD_RUNTIME_GOMEMLIMIT_FALLBACK = "1GiB"
-SYSTEMD_RUNTIME_MAX_HEAP_FALLBACK = "512MiB"
-MIN_DYNAMIC_MAX_HEAP_BYTES = 128 * 1024 * 1024
-MIN_DYNAMIC_GOMEMLIMIT_BYTES = 256 * 1024 * 1024
+
+
+def detect_system_ram_bytes():
+    """Read total RAM from /proc/meminfo (Linux). Returns bytes or None."""
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024  # /proc/meminfo is in kB
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def compute_gomemlimit():
+    """Return GOMEMLIMIT string scaled to 75% of system RAM.
+
+    On a 4GB server → ~3GiB, on 1GB → ~768MiB.
+    Falls back to 1GiB if RAM detection fails.
+    Minimum floor of 256MiB to avoid starving goroutine stacks.
+    """
+    ram = detect_system_ram_bytes()
+    if ram is None or ram <= 0:
+        return "1GiB"
+    target = int(ram * 0.75)
+    floor = 256 * 1024 * 1024
+    if target < floor:
+        target = floor
+    mib = target // (1024 * 1024)
+    return f"{mib}MiB"
+
+
+def build_systemd_runtime_env():
+    """Build runtime env dict with auto-detected GOMEMLIMIT."""
+    env = dict(SYSTEMD_RUNTIME_ENV_STATIC)
+    env["GOMEMLIMIT"] = compute_gomemlimit()
+    return env
 DEFAULT_SERVICE_RESTART_MINUTES = 0
 DEFAULT_SERVICE_RESTART_SECONDS = 3
 DEFAULT_SERVICE_RUNTIME_MAX_MINUTES = 0
@@ -299,53 +340,6 @@ def command_succeeds(command):
         stderr=subprocess.DEVNULL,
     )
     return result.returncode == 0
-
-
-def detect_total_ram_bytes():
-    try:
-        with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if not line.startswith("MemTotal:"):
-                    continue
-                parts = line.split()
-                if len(parts) >= 2 and parts[1].isdigit():
-                    return int(parts[1]) * 1024
-                break
-    except Exception:
-        pass
-
-    try:
-        page_size = int(os.sysconf("SC_PAGE_SIZE"))
-        phys_pages = int(os.sysconf("SC_PHYS_PAGES"))
-        if page_size > 0 and phys_pages > 0:
-            return page_size * phys_pages
-    except Exception:
-        pass
-
-    return 0
-
-
-def to_mib_env_value(size_bytes):
-    mib = int(size_bytes // (1024 * 1024))
-    if mib < 1:
-        mib = 1
-    return f"{mib}MiB"
-
-
-def build_dynamic_runtime_env():
-    env = deep_copy(SYSTEMD_RUNTIME_ENV)
-    total_ram = detect_total_ram_bytes()
-    if total_ram <= 0:
-        env["NODELAY_MEM_HOUSEKEEPER_MIN_HEAP"] = SYSTEMD_RUNTIME_MAX_HEAP_FALLBACK
-        env["GOMEMLIMIT"] = SYSTEMD_RUNTIME_GOMEMLIMIT_FALLBACK
-        return env
-
-    max_heap_bytes = max(MIN_DYNAMIC_MAX_HEAP_BYTES, total_ram // 2)
-    gomemlimit_bytes = max(MIN_DYNAMIC_GOMEMLIMIT_BYTES, (total_ram * 3) // 4)
-
-    env["NODELAY_MEM_HOUSEKEEPER_MIN_HEAP"] = to_mib_env_value(max_heap_bytes)
-    env["GOMEMLIMIT"] = to_mib_env_value(gomemlimit_bytes)
-    return env
 
 
 def service_file_path(service_name):
@@ -814,61 +808,96 @@ def apply_linux_network_tuning(profile_key="balanced"):
         "balanced": {
             "title": "🚀 Linux Network Tuning (Balanced)",
             "sysctl": [
-                # Stable bidirectional throughput under mixed paths (recommended).
-                ("net.core.rmem_max", "16777216"),
-                ("net.core.wmem_max", "16777216"),
-                ("net.core.rmem_default", "262144"),
-                ("net.core.wmem_default", "262144"),
-                ("net.ipv4.tcp_rmem", "4096 131072 16777216"),
-                ("net.ipv4.tcp_wmem", "4096 131072 16777216"),
+                # ── Buffer sizes: raise defaults so upload doesn't starve ──
+                ("net.core.rmem_max", "16777216"),        # 16 MB max recv
+                ("net.core.wmem_max", "16777216"),        # 16 MB max send
+                ("net.core.rmem_default", "524288"),      # 512 KB default recv (was 256 KB)
+                ("net.core.wmem_default", "524288"),      # 512 KB default send (was 256 KB)
+                # tcp_rmem/wmem: min / default / max
+                # Default 512 KB prevents upload starvation on high-BDP links (Iran↔EU ≈ 100ms × 100 Mbps = 1.25 MB BDP)
+                ("net.ipv4.tcp_rmem", "4096 524288 16777216"),
+                ("net.ipv4.tcp_wmem", "4096 524288 16777216"),
+                # ── TCP features ──
                 ("net.ipv4.tcp_window_scaling", "1"),
                 ("net.ipv4.tcp_timestamps", "1"),
                 ("net.ipv4.tcp_sack", "1"),
+                # Prevent idle connections from resetting cwnd (kills upload bursts)
+                ("net.ipv4.tcp_slow_start_after_idle", "0"),
+                # Limit unsent buffer to let BBR pace properly (reduces upload bufferbloat)
+                ("net.ipv4.tcp_notsent_lowat", "131072"),
+                # ── Queue / backlog ──
                 ("net.core.netdev_max_backlog", "8192"),
                 ("net.core.somaxconn", "4096"),
-                ("net.ipv4.tcp_fastopen", "1"),
+                # TFO client+server (3) — reduces handshake RTT for upload initiation
+                ("net.ipv4.tcp_fastopen", "3"),
+                # ── MTU probing ──
                 ("net.ipv4.tcp_mtu_probing", "1"),
                 ("net.ipv4.tcp_base_mss", "1024"),
+                # ── Keepalive ──
                 ("net.ipv4.tcp_keepalive_time", "120"),
                 ("net.ipv4.tcp_keepalive_intvl", "10"),
                 ("net.ipv4.tcp_keepalive_probes", "3"),
-                ("net.ipv4.tcp_fin_timeout", "20"),
+                # ── Connection recycling ──
+                ("net.ipv4.tcp_fin_timeout", "15"),
+                ("net.ipv4.tcp_tw_reuse", "1"),
+                # Wider ephemeral port range for heavy multiplexed upload
+                ("net.ipv4.ip_local_port_range", "1024 65535"),
+                # ── High Concurrency Limits (Required for 50+ Users) ──
+                ("fs.file-max", "1048576"),
+                ("net.netfilter.nf_conntrack_max", "2000000"),
+                # ── IPv6 ──
                 ("net.ipv6.conf.all.disable_ipv6", "1"),
                 ("net.ipv6.conf.default.disable_ipv6", "1"),
                 ("net.ipv6.conf.lo.disable_ipv6", "1"),
             ],
             "congestion_control": "bbr",
-            "qdisc": "fq_codel",
+            # fq (not fq_codel) — BBR is designed for fq's pacing; fq_codel drops upload bursts
+            "qdisc": "fq",
         },
         "aggressive": {
             "title": "🚀 Linux Network Tuning (Aggressive)",
             "sysctl": [
-                # Higher throughput bias; keep it upload-safe for real-world speed tests.
-                ("net.core.rmem_max", "33554432"),
-                ("net.core.wmem_max", "33554432"),
-                ("net.core.rmem_default", "262144"),
-                ("net.core.wmem_default", "262144"),
-                ("net.ipv4.tcp_rmem", "4096 131072 33554432"),
-                ("net.ipv4.tcp_wmem", "4096 131072 33554432"),
+                # ── Buffer sizes: maximize for high-bandwidth links ──
+                ("net.core.rmem_max", "67108864"),        # 64 MB max recv
+                ("net.core.wmem_max", "67108864"),        # 64 MB max send
+                ("net.core.rmem_default", "1048576"),     # 1 MB default recv
+                ("net.core.wmem_default", "1048576"),     # 1 MB default send
+                # Default 1 MB prevents upload starvation even on 200ms+ RTT links
+                ("net.ipv4.tcp_rmem", "4096 1048576 67108864"),
+                ("net.ipv4.tcp_wmem", "4096 1048576 67108864"),
+                # ── TCP features ──
                 ("net.ipv4.tcp_window_scaling", "1"),
                 ("net.ipv4.tcp_timestamps", "1"),
                 ("net.ipv4.tcp_sack", "1"),
-                ("net.core.netdev_max_backlog", "16384"),
+                ("net.ipv4.tcp_slow_start_after_idle", "0"),
+                ("net.ipv4.tcp_notsent_lowat", "131072"),
+                # ── Queue / backlog ──
+                ("net.core.netdev_max_backlog", "32768"),
                 ("net.core.somaxconn", "8192"),
-                # Keep fastopen conservative to avoid middlebox/path quirks.
-                ("net.ipv4.tcp_fastopen", "1"),
+                ("net.ipv4.tcp_fastopen", "3"),
+                # ── MTU probing ──
                 ("net.ipv4.tcp_mtu_probing", "1"),
                 ("net.ipv4.tcp_base_mss", "1024"),
-                ("net.ipv4.tcp_keepalive_time", "120"),
-                ("net.ipv4.tcp_keepalive_intvl", "10"),
+                # ── Keepalive ──
+                ("net.ipv4.tcp_keepalive_time", "60"),
+                ("net.ipv4.tcp_keepalive_intvl", "5"),
                 ("net.ipv4.tcp_keepalive_probes", "3"),
-                ("net.ipv4.tcp_fin_timeout", "20"),
+                # ── Connection recycling ──
+                ("net.ipv4.tcp_fin_timeout", "10"),
+                ("net.ipv4.tcp_tw_reuse", "1"),
+                ("net.ipv4.ip_local_port_range", "1024 65535"),
+                # ── Memory pressure ──
+                ("net.ipv4.tcp_mem", "786432 1048576 1572864"),
+                # ── High Concurrency Limits (Required for 50+ Users) ──
+                ("fs.file-max", "1048576"),
+                ("net.netfilter.nf_conntrack_max", "2000000"),
+                # ── IPv6 ──
                 ("net.ipv6.conf.all.disable_ipv6", "1"),
                 ("net.ipv6.conf.default.disable_ipv6", "1"),
                 ("net.ipv6.conf.lo.disable_ipv6", "1"),
             ],
             "congestion_control": "bbr",
-            "qdisc": "fq_codel",
+            "qdisc": "fq",
         },
     }
     if profile not in tuning_profiles:
@@ -921,6 +950,17 @@ def apply_linux_network_tuning(profile_key="balanced"):
     else:
         print_error(f"Failed to persist sysctl settings to {SYSCTL_CONF_PATH}")
 
+    # Set Ulimits for File Descriptors
+    limits_conf_path = "/etc/security/limits.d/99-nodelay.conf"
+    limits_content = "* soft nofile 1048576\n* hard nofile 1048576\nroot soft nofile 1048576\nroot hard nofile 1048576\n"
+    try:
+        os.makedirs(os.path.dirname(limits_conf_path), exist_ok=True)
+        with open(limits_conf_path, "w") as f:
+            f.write(limits_content)
+        print_success(f"Set file descriptor limits in {limits_conf_path}")
+    except OSError as exc:
+        print_error(f"Could not set file limits in {limits_conf_path}: {exc}")
+
     run_command("sysctl --system", check=False)
     run_command("sysctl -p", check=False)
 
@@ -956,6 +996,14 @@ def restore_linux_network_defaults():
             return False
     else:
         print_info("No persisted NoDelay tuning file found.")
+
+    limits_conf_path = "/etc/security/limits.d/99-nodelay.conf"
+    if os.path.exists(limits_conf_path):
+        try:
+            os.remove(limits_conf_path)
+            print_success(f"Removed ulimits file: {limits_conf_path}")
+        except OSError:
+            pass
 
     if set_sysctl_conf_managed_block([]):
         print_success(f"Removed managed NoDelay block from {SYSCTL_CONF_PATH}")
@@ -2594,6 +2642,19 @@ def split_host_port(value, fallback_port):
     return host, port
 
 
+def format_host_port(host, port):
+    host = str(host or "").strip()
+    if not host:
+        host = "127.0.0.1"
+    try:
+        ip_obj = ipaddress.ip_address(host)
+        if ip_obj.version == 6:
+            return f"[{host}]:{int(port)}"
+    except ValueError:
+        pass
+    return f"{host}:{int(port)}"
+
+
 def prompt_server_mappings(
     existing=None,
     fixed_mode=None,
@@ -2608,7 +2669,7 @@ def prompt_server_mappings(
         )
     else:
         print_info(
-            "At least one mapping is required. You only enter ports; bind/target IPs are auto-filled."
+            "At least one mapping is required. Bind IP is auto-filled (0.0.0.0), target IP defaults to 127.0.0.1 unless you change it."
         )
     mappings = []
     if isinstance(existing, list):
@@ -2652,116 +2713,35 @@ def prompt_server_mappings(
             print_error("Port must be between 1 and 65535.")
             bind_port = prompt_int("Bind port (auto bind IP = 0.0.0.0)", bind_default)
 
-        target_port = prompt_int("Target port (auto target IP = 127.0.0.1)", target_default)
+        target_port = prompt_int("Target port (target IP = 127.0.0.1)", target_default)
         while target_port < 1 or target_port > 65535:
             print_error("Port must be between 1 and 65535.")
-            target_port = prompt_int("Target port (auto target IP = 127.0.0.1)", target_default)
+            target_port = prompt_int("Target port (target IP = 127.0.0.1)", target_default)
+
+        route_to = input_default(
+            "Route to Kharej IP (blank = round-robin all clients)", ""
+        ).strip()
 
         bind = f"0.0.0.0:{bind_port}"
         target = f"127.0.0.1:{target_port}"
 
-        mappings.append(
-            {
-                "name": name,
-                "mode": mode,
-                "protocol": protocol,
-                "bind": bind,
-                "target": target,
-            }
-        )
+        mapping = {
+            "name": name,
+            "mode": mode,
+            "protocol": protocol,
+            "bind": bind,
+            "target": target,
+        }
+        if route_to:
+            mapping["route_to"] = route_to
+
+        mappings.append(mapping)
 
         more = input_default("Add another mapping? (y/N)", "n").strip().lower()
         if more not in {"y", "yes"}:
             break
         index += 1
 
-    return mappings
-
-
-def prompt_append_forward_port_mapping(
-    existing=None,
-    fixed_mode=None,
-    default_mode="reverse",
-    bind_side_label="This node",
-    target_side_label="Remote node",
-):
-    print_header("➕ Add Forward Port")
-    print_info("This appends a new mapping. Existing mappings are kept unchanged.")
-
-    mappings = []
-    if isinstance(existing, list):
-        mappings = deep_copy(existing)
-
-    next_index = len(mappings) + 1
-    name = input_default("Name", f"mapping-{next_index}")
-
-    default_mode = str(default_mode or "reverse").strip().lower()
-    if default_mode not in {"reverse", "direct"}:
-        default_mode = "reverse"
-
-    if fixed_mode in {"reverse", "direct"}:
-        mode = fixed_mode
-        print_info(
-            f"Mode is fixed to '{mode}'. "
-            f"Bind side: {bind_side_label} | Target side: {target_side_label}"
-        )
-    else:
-        while True:
-            mode = input_default("Mode (reverse/direct)", default_mode).strip().lower()
-            if mode in {"reverse", "direct"}:
-                break
-            print_error("Mode must be 'reverse' or 'direct'.")
-
-    default_protocol = "tcp"
-    if mappings:
-        prev_proto = str(mappings[-1].get("protocol", "tcp")).strip().lower()
-        if prev_proto in {"tcp", "udp"}:
-            default_protocol = prev_proto
-
-    while True:
-        protocol = input_default("Protocol (tcp/udp)", default_protocol).strip().lower()
-        if protocol in {"tcp", "udp"}:
-            break
-        print_error("Protocol must be 'tcp' or 'udp'.")
-
-    if mode == "reverse":
-        bind_default = 2200 if protocol == "tcp" else 15353
-        target_default = 22 if protocol == "tcp" else 53
-    else:
-        bind_default = 18080 if protocol == "tcp" else 15353
-        target_default = 80 if protocol == "tcp" else 53
-
-    for prev in reversed(mappings):
-        prev_mode = str(prev.get("mode", "")).strip().lower()
-        prev_protocol = str(prev.get("protocol", "")).strip().lower()
-        if prev_mode != mode or prev_protocol != protocol:
-            continue
-        _, bind_default = split_host_port(prev.get("bind", ""), bind_default)
-        _, target_default = split_host_port(prev.get("target", ""), target_default)
-        break
-
-    bind_port = prompt_int("Bind port (auto bind IP = 0.0.0.0)", bind_default)
-    while bind_port < 1 or bind_port > 65535:
-        print_error("Port must be between 1 and 65535.")
-        bind_port = prompt_int("Bind port (auto bind IP = 0.0.0.0)", bind_default)
-
-    target_port = prompt_int("Target port (auto target IP = 127.0.0.1)", target_default)
-    while target_port < 1 or target_port > 65535:
-        print_error("Port must be between 1 and 65535.")
-        target_port = prompt_int("Target port (auto target IP = 127.0.0.1)", target_default)
-
-    mappings.append(
-        {
-            "name": name,
-            "mode": mode,
-            "protocol": protocol,
-            "bind": f"0.0.0.0:{bind_port}",
-            "target": f"127.0.0.1:{target_port}",
-        }
-    )
-    print_success(
-        f"Added mapping: {name} | {mode} {protocol} | 0.0.0.0:{bind_port} -> 127.0.0.1:{target_port}"
-    )
     return mappings
 
 
@@ -2786,6 +2766,8 @@ TRANSPORT_TYPE_OPTIONS = [
     ("7", "httpsmimicry", "🎭 HTTPS Mimicry"),
     ("8", "httpmimicry", "📄 HTTP Mimicry"),
     ("9", "reality", "🌌 REALITY"),
+    ("10", "phantom", "🛡️ Phantom (Stealth L3/L7 via Caddy)"),
+    ("11", "antifilter", "🔥 AntiFilter (Raw UDP + FEC + pcap)"),
 ]
 TRANSPORT_TYPE_INDEX_TO_NAME = {idx: name for idx, name, _ in TRANSPORT_TYPE_OPTIONS}
 TRANSPORT_TYPE_NAME_TO_INDEX = {name: idx for idx, name, _ in TRANSPORT_TYPE_OPTIONS}
@@ -2811,6 +2793,275 @@ def endpoint_supports_path(transport_type):
 
 def endpoint_uses_tls(transport_type):
     return normalize_endpoint_type(transport_type) in {"tls", "wss", "quic", "httpsmimicry"}
+
+
+def endpoint_needs_raw_cap(transport_type):
+    """Returns True if the transport requires CAP_NET_RAW (AF_PACKET / pcap)."""
+    return normalize_endpoint_type(transport_type) in {"phantom", "antifilter"}
+
+
+def ensure_caddy_installed():
+    """Install Caddy if not present (Debian/Ubuntu/RHEL)."""
+    if shutil.which("caddy"):
+        print_info("✅ Caddy already installed")
+        return True
+    print_info("📦 Installing Caddy...")
+    if os.path.exists("/etc/debian_version"):
+        run_command("apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl", check=False)
+        run_command(
+            "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key'"
+            " | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg",
+            check=False,
+        )
+        run_command(
+            "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt'"
+            " | tee /etc/apt/sources.list.d/caddy-stable.list",
+            check=False,
+        )
+        run_command("apt-get update && apt-get install -y caddy", check=False)
+    elif os.path.exists("/etc/redhat-release"):
+        run_command(
+            "dnf install -y 'dnf-command(copr)' && dnf copr enable -y @caddy/caddy && dnf install -y caddy",
+            check=False,
+        )
+    installed = shutil.which("caddy") is not None
+    if installed:
+        print_success("✅ Caddy installed successfully")
+    else:
+        print_error("❌ Failed to install Caddy. Please install manually: https://caddyserver.com/docs/install")
+    return installed
+
+
+def setup_caddy_for_phantom(domain, internal_port, ws_path):
+    """Install Caddy, generate Caddyfile, and start the service."""
+    if not ensure_caddy_installed():
+        return False
+    caddyfile = f"""{domain} {{
+    handle {ws_path} {{
+        reverse_proxy localhost:{internal_port}
+    }}
+    handle {{
+        root * /var/www/{domain}
+        file_server
+    }}
+}}"""
+    os.makedirs(f"/var/www/{domain}", exist_ok=True)
+    with open(f"/var/www/{domain}/index.html", "w") as f:
+        f.write("<html><body>Welcome</body></html>")
+    with open("/etc/caddy/Caddyfile", "w") as f:
+        f.write(caddyfile)
+    run_command("systemctl enable --now caddy", check=False)
+    run_command("systemctl reload caddy", check=False)
+    print_success(f"✅ Caddy configured: {domain} → ws_path={ws_path} → localhost:{internal_port}")
+    return True
+
+
+def maybe_setup_phantom_frontend(protocol_config):
+    endpoint_type = normalize_endpoint_type(protocol_config.get("type", "tcp"), "tcp")
+    if endpoint_type != "phantom":
+        return
+    phantom_cfg = normalize_phantom_config(
+        protocol_config.get("phantom", {}),
+        {"public_port": _normalize_port_value(protocol_config.get("port", 443), 443)},
+    )
+    domain = normalize_domain_name(phantom_cfg.get("domain", ""))
+    if not domain:
+        print_info("Phantom selected without domain; skipped automatic Caddy setup.")
+        return
+    if not is_valid_domain_name(domain):
+        print_error(f"Invalid Phantom domain '{domain}'. Skipped automatic Caddy setup.")
+        return
+    ws_path = normalize_path(phantom_cfg.get("ws_path", "/tunnel/stream"), "/tunnel/stream")
+    internal_port = _normalize_port_value(phantom_cfg.get("internal_port", 8443), 8443)
+    setup_caddy_for_phantom(domain, internal_port, ws_path)
+
+
+def _normalize_port_value(value, default):
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return int(default)
+    if port < 1:
+        return int(default)
+    if port > 65535:
+        return 65535
+    return port
+
+
+def normalize_phantom_config(cfg, default=None):
+    base = default if isinstance(default, dict) else {}
+    raw = cfg if isinstance(cfg, dict) else {}
+    ws_path = normalize_path(
+        raw.get("ws_path", base.get("ws_path", "/tunnel/stream")),
+        "/tunnel/stream",
+    )
+    return {
+        "domain": normalize_domain_name(
+            raw.get("domain", base.get("domain", ""))
+        ),
+        "interface": str(
+            raw.get("interface", base.get("interface", "eth0"))
+        ).strip()
+        or "eth0",
+        "ws_path": ws_path,
+        "psk": str(raw.get("psk", base.get("psk", ""))).strip(),
+        "internal_port": _normalize_port_value(
+            raw.get("internal_port", base.get("internal_port", 8443)),
+            8443,
+        ),
+        # Optional deploy-only metadata (runtime ignores unknown keys)
+        "public_port": _normalize_port_value(
+            raw.get("public_port", base.get("public_port", 443)),
+            443,
+        ),
+    }
+
+
+def normalize_antifilter_config(cfg, default=None):
+    base = default if isinstance(default, dict) else {}
+    raw = cfg if isinstance(cfg, dict) else {}
+    try:
+        data_shards = int(raw.get("data_shards", base.get("data_shards", 10)))
+    except (TypeError, ValueError):
+        data_shards = 10
+    if data_shards < 1:
+        data_shards = 1
+    try:
+        parity_shards = int(raw.get("parity_shards", base.get("parity_shards", 3)))
+    except (TypeError, ValueError):
+        parity_shards = 3
+    if parity_shards < 0:
+        parity_shards = 0
+    try:
+        noise_cover = float(raw.get("noise_cover", base.get("noise_cover", 0.05)))
+    except (TypeError, ValueError):
+        noise_cover = 0.05
+    if noise_cover < 0:
+        noise_cover = 0.0
+    if noise_cover > 1:
+        noise_cover = 1.0
+    try:
+        write_rate_bps = int(raw.get("write_rate_bps", base.get("write_rate_bps", 0)))
+    except (TypeError, ValueError):
+        write_rate_bps = 0
+    if write_rate_bps < 0:
+        write_rate_bps = 0
+    capture_mode = str(
+        raw.get("capture_mode", base.get("capture_mode", "afpacket"))
+    ).strip().lower()
+    if capture_mode not in {"afpacket", "pcap"}:
+        capture_mode = "afpacket"
+    return {
+        "interface": str(
+            raw.get("interface", base.get("interface", "eth0"))
+        ).strip()
+        or "eth0",
+        "capture_mode": capture_mode,
+        "data_shards": data_shards,
+        "parity_shards": parity_shards,
+        "noise_cover": noise_cover,
+        "psk": str(raw.get("psk", base.get("psk", ""))).strip(),
+        "write_rate_bps": write_rate_bps,
+    }
+
+
+def prompt_phantom_config(existing=None, role="server", default_public_port=443):
+    """Prompt for Phantom transport settings."""
+    existing = normalize_phantom_config(
+        existing,
+        {"public_port": _normalize_port_value(default_public_port, 443)},
+    )
+    print_header("🛡️ Phantom Transport Configuration")
+    iface = input_default("Network interface", existing.get("interface", "eth0")).strip() or "eth0"
+    ws_path = normalize_path(
+        input_default("WebSocket tunnel path", existing.get("ws_path", "/tunnel/stream")).strip(),
+        "/tunnel/stream",
+    )
+    psk = input_default("Packet encryption PSK (empty = auto-generate)", existing.get("psk", "")).strip()
+    if not psk:
+        psk = secrets.token_urlsafe(32)
+        print_info(f"Auto-generated PSK: {psk}")
+    domain = str(existing.get("domain", "")).strip()
+    internal_port = int(existing.get("internal_port", 8443))
+    public_port = int(existing.get("public_port", _normalize_port_value(default_public_port, 443)))
+    role_normalized = str(role).strip().lower()
+    if role_normalized == "server":
+        domain = normalize_domain_name(
+            input_default(
+                "Domain for Caddy TLS (blank = skip auto Caddy setup)",
+                domain,
+            ).strip()
+        )
+        while True:
+            internal_port = prompt_int("Internal WS port (nodelay listen)", internal_port)
+            if 1 <= internal_port <= 65535:
+                break
+            print_error("Internal port must be between 1 and 65535.")
+        while True:
+            public_port = prompt_int("Public tunnel port (client/Caddy)", public_port)
+            if 1 <= public_port <= 65535:
+                break
+            print_error("Public port must be between 1 and 65535.")
+    return normalize_phantom_config(
+        {
+            "domain": domain,
+            "interface": iface,
+            "ws_path": ws_path,
+            "psk": psk,
+            "internal_port": internal_port,
+            "public_port": public_port,
+        },
+        existing,
+    )
+
+
+def prompt_antifilter_config(existing=None):
+    """Prompt for AntiFilter transport settings."""
+    existing = normalize_antifilter_config(existing, {})
+    print_header("🔥 AntiFilter Transport Configuration")
+    iface = input_default("Network interface", existing.get("interface", "eth0")).strip() or "eth0"
+    capture_mode = input_default("Capture mode (afpacket / pcap)", existing.get("capture_mode", "afpacket")).strip().lower()
+    if capture_mode not in {"afpacket", "pcap"}:
+        capture_mode = "afpacket"
+    data_shards = prompt_int("FEC data shards", existing.get("data_shards", 10))
+    while data_shards < 1:
+        print_error("FEC data shards must be at least 1.")
+        data_shards = prompt_int("FEC data shards", existing.get("data_shards", 10))
+    parity_shards = prompt_int("FEC parity shards (loss recovery)", existing.get("parity_shards", 3))
+    while parity_shards < 0:
+        print_error("FEC parity shards cannot be negative.")
+        parity_shards = prompt_int("FEC parity shards (loss recovery)", existing.get("parity_shards", 3))
+    noise_raw = input_default("Noise cover ratio (0.0-1.0)", str(existing.get("noise_cover", 0.05))).strip()
+    try:
+        noise_cover = float(noise_raw)
+    except ValueError:
+        noise_cover = 0.05
+    if noise_cover < 0:
+        noise_cover = 0.0
+    if noise_cover > 1:
+        noise_cover = 1.0
+    write_rate_bps = prompt_int(
+        "Write rate limit (bps, 0=auto)",
+        existing.get("write_rate_bps", 0),
+    )
+    if write_rate_bps < 0:
+        write_rate_bps = 0
+    psk = input_default("Obfuscation PSK (empty = auto-generate)", existing.get("psk", "")).strip()
+    if not psk:
+        psk = secrets.token_urlsafe(32)
+        print_info(f"Auto-generated PSK: {psk}")
+    return normalize_antifilter_config(
+        {
+            "interface": iface,
+            "capture_mode": capture_mode,
+            "data_shards": data_shards,
+            "parity_shards": parity_shards,
+            "noise_cover": noise_cover,
+            "psk": psk,
+            "write_rate_bps": write_rate_bps,
+        },
+        existing,
+    )
 
 
 def empty_tls_config():
@@ -2894,10 +3145,10 @@ def prompt_endpoint_type(default="tcp", prompt_label="Transport Type"):
         min_width=46,
     )
     while True:
-        choice = input_default(f"{prompt_label} [1-9]", default_choice).strip()
+        choice = input_default(f"{prompt_label} [1-11]", default_choice).strip()
         if choice in TRANSPORT_TYPE_INDEX_TO_NAME:
             return TRANSPORT_TYPE_INDEX_TO_NAME[choice]
-        print_error("Invalid choice. Pick a number between 1 and 9.")
+        print_error("Invalid choice. Pick a number between 1 and 11.")
 
 
 def normalize_server_names_list(value):
@@ -3148,6 +3399,8 @@ def normalize_transport_endpoint(
     fallback_path="/tunnel",
     fallback_reality=None,
     fallback_port_hopping=None,
+    fallback_phantom=None,
+    fallback_antifilter=None,
 ):
     ep = endpoint if isinstance(endpoint, dict) else {}
     ep_type = normalize_endpoint_type(ep.get("type", fallback_type), normalize_endpoint_type(fallback_type))
@@ -3181,6 +3434,21 @@ def normalize_transport_endpoint(
         )
     else:
         reality_cfg = {}
+    if ep_type == "phantom":
+        phantom_cfg = normalize_phantom_config(
+            ep.get("phantom", {}),
+            fallback_phantom,
+        )
+        path = normalize_path(phantom_cfg.get("ws_path", path), "/tunnel/stream")
+    else:
+        phantom_cfg = {}
+    if ep_type == "antifilter":
+        antifilter_cfg = normalize_antifilter_config(
+            ep.get("antifilter", {}),
+            fallback_antifilter,
+        )
+    else:
+        antifilter_cfg = {}
     port_hopping_cfg = normalize_port_hopping_cfg(
         ep.get("port_hopping", {}),
         fallback_port_hopping,
@@ -3192,6 +3460,8 @@ def normalize_transport_endpoint(
         "path": path,
         "tls": tls_cfg,
         "reality": reality_cfg,
+        "phantom": phantom_cfg,
+        "antifilter": antifilter_cfg,
         "port_hopping": port_hopping_cfg,
     }
 
@@ -3412,6 +3682,20 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
                         f"Generated private key for this endpoint (use on server): {generated_private_key}"
                     )
 
+        phantom_cfg = {}
+        if ep_type == "phantom":
+            default_public_port = parse_port_from_address(address, 443)
+            phantom_cfg = prompt_phantom_config(
+                defaults.get("phantom", {}),
+                role=role,
+                default_public_port=default_public_port,
+            )
+            path = normalize_path(phantom_cfg.get("ws_path", path), "/tunnel/stream")
+
+        antifilter_cfg = {}
+        if ep_type == "antifilter":
+            antifilter_cfg = prompt_antifilter_config(defaults.get("antifilter", {}))
+
         endpoint = normalize_transport_endpoint(
             {
                 "type": ep_type,
@@ -3421,6 +3705,8 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
                 "port_hopping": port_hopping_cfg,
                 "tls": tls_cfg,
                 "reality": reality_cfg,
+                "phantom": phantom_cfg,
+                "antifilter": antifilter_cfg,
             },
             role=role,
             fallback_type=ep_type,
@@ -3428,6 +3714,8 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
             fallback_path=path,
             fallback_reality=default_reality_cfg,
             fallback_port_hopping=default_port_hopping_cfg,
+            fallback_phantom=defaults.get("phantom", {}),
+            fallback_antifilter=defaults.get("antifilter", {}),
         )
         if role == "client" and ep_type in {"ws", "wss"}:
             endpoint["url"] = resolve_ws_url({"type": ep_type}, endpoint["address"], endpoint["path"])
@@ -3559,11 +3847,6 @@ def normalize_ping_keepalive_config(cfg, role="server"):
     role_normalized = str(role or "").strip().lower()
     if role_normalized not in {"server", "client"}:
         role_normalized = "server"
-    if PING_KEEPALIVE_TEMP_DISABLED:
-        base["enabled"] = False
-        base["targets"] = []
-        base["server_targets"] = []
-        base["client_targets"] = []
     return base
 
 
@@ -3605,10 +3888,9 @@ def resolve_ping_keepalive_targets(role, cfg):
     return normalize_ping_keepalive_targets(targets)
 
 
-def prompt_ping_keepalive_settings(role, defaults=None, peer_hint=""):
-    if PING_KEEPALIVE_TEMP_DISABLED:
-        return normalize_ping_keepalive_config({}, role)
-
+def prompt_ping_keepalive_settings(role, defaults=None):
+    if PING_KEEPALIVE_TEMP_DISABLED == True :
+        return
     current = normalize_ping_keepalive_config(defaults, role)
     role_normalized = str(role or "").strip().lower()
     if role_normalized not in {"server", "client"}:
@@ -3621,8 +3903,6 @@ def prompt_ping_keepalive_settings(role, defaults=None, peer_hint=""):
         default_peer = existing_effective[0]
     elif role_normalized == "client" and isinstance(defaults, dict):
         default_peer = str(defaults.get("server_addr", "")).strip()
-    if not default_peer:
-        default_peer = str(peer_hint or "").strip()
 
     if role_normalized == "client":
         peer, err_msg = validate_ping_keepalive_peer_target(default_peer)
@@ -3649,7 +3929,7 @@ def prompt_ping_keepalive_settings(role, defaults=None, peer_hint=""):
     while True:
         peer_raw = input_default(
             "Peer server IP/hostname (blank = disable)",
-            default_peer,
+            "",
         ).strip()
         if not peer_raw:
             current["enabled"] = False
@@ -3684,8 +3964,9 @@ def normalize_dns_config(cfg, default=None):
         ),
         "dot_servers": normalize_dns_list(
             cfg.get("dot_servers", default.get("dot_servers", [])),
-            ["1.1.1.1:853", "8.8.8.8:853"],
+            ["one.one.one.one:853", "dns.google:853"],
         ),
+        "dot_server_name": str(cfg.get("dot_server_name", default.get("dot_server_name", "")) or "").strip(),
         "query_timeout": str(cfg.get("query_timeout", default.get("query_timeout", "3s")) or "3s").strip() or "3s",
         "cache_ttl": str(cfg.get("cache_ttl", default.get("cache_ttl", "2m")) or "2m").strip() or "2m",
         "max_inflight": 256,
@@ -3696,6 +3977,57 @@ def normalize_dns_config(cfg, default=None):
         out["max_inflight"] = 256
     if out["max_inflight"] <= 0:
         out["max_inflight"] = 256
+    return out
+
+
+def normalize_network_congestion_control(value, default=""):
+    raw = str(value or "").strip().lower()
+    if raw in {"", "bbr", "cubic", "reno"}:
+        return raw
+    return str(default or "").strip().lower()
+
+
+def normalize_custom_udp_fec_cfg(cfg, default=None):
+    if not isinstance(default, dict):
+        default = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    def _to_int(v, fallback):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return fallback
+
+    def _to_float(v, fallback):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return fallback
+
+    out = {
+        "enabled": bool(cfg.get("enabled", default.get("enabled", False))),
+        "data_shards": max(1, _to_int(cfg.get("data_shards", default.get("data_shards", 10)), 10)),
+        "parity_shards": max(0, _to_int(cfg.get("parity_shards", default.get("parity_shards", 3)), 3)),
+        "noise_cover_rate": _to_float(cfg.get("noise_cover_rate", default.get("noise_cover_rate", 0.0)), 0.0),
+        "morph_buckets": [],
+    }
+    if out["noise_cover_rate"] < 0:
+        out["noise_cover_rate"] = 0.0
+    if out["noise_cover_rate"] > 1:
+        out["noise_cover_rate"] = 1.0
+
+    raw_buckets = cfg.get("morph_buckets", default.get("morph_buckets", []))
+    if isinstance(raw_buckets, list):
+        buckets = []
+        for item in raw_buckets:
+            try:
+                value = int(item)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                buckets.append(value)
+        out["morph_buckets"] = buckets
     return out
 
 
@@ -3740,6 +4072,10 @@ def prompt_dns_settings(defaults=None):
         current["dot_servers"] = normalize_dns_list(
             prompt_csv_list("DoT servers (comma-separated)", current["dot_servers"]),
             current["dot_servers"],
+        )
+        current["dot_server_name"] = (
+            input_default("DoT TLS server name (optional, required when using IPs in strict mode)", current.get("dot_server_name", ""))
+            .strip()
         )
 
     current["query_timeout"] = input_default("DNS query timeout", current["query_timeout"]).strip() or current["query_timeout"]
@@ -3840,25 +4176,31 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         "httpsmimicry": "7",
         "httpmimicry": "8",
         "reality": "9",
+        "phantom": "10",
+        "antifilter": "11",
     }
     default_choice = "1"
     if isinstance(defaults, dict):
         default_choice = type_to_choice.get(str(defaults.get("type", "")).strip().lower(), "1")
 
     while True:
-        choice = input_default(f"\n{Colors.BOLD}Enter choice [1-9]{Colors.ENDC}", default_choice).strip()
-        if choice in {str(i) for i in range(1, 10)}:
+        choice = input_default(f"\n{Colors.BOLD}Enter choice [1-11]{Colors.ENDC}", default_choice).strip()
+        if choice in {str(i) for i in range(1, 12)}:
             break
-        print_error("Invalid choice. Pick a number between 1 and 9.")
+        print_error("Invalid choice. Pick a number between 1 and 11.")
 
     advanced_mode = str(deployment_mode).strip().lower() == "advanced"
     config = {
         "port": str(DEFAULT_IRAN_PORT),
         "path": "/tunnel",
         "network_mtu": 0,
+        "network_congestion_control": "",
         "network_dns": normalize_dns_config({"mode": "system"}, {"mode": "system"}),
+        "runtime_mem_housekeeper_mode": "off",
         "utls_strict_profile_match": True,
         "mux_type": "smux",
+        "mux_prefer_quic_native": False,
+        "custom_udp_fec": normalize_custom_udp_fec_cfg({}, {}),
         "mimicry_preset_region": "mixed",
         "mimicry_profiles": {},
         "mimicry_transport_mode": "websocket",
@@ -3889,16 +4231,15 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         "generated_private_key": "",
         "reality_key_generated": False,
         "listen_host": "",
-        "ping_keepalive": normalize_ping_keepalive_config({}, role),
+        "phantom": normalize_phantom_config({}, {}),
+        "antifilter": normalize_antifilter_config({}, {}),
     }
 
     if isinstance(defaults, dict):
         for k, v in defaults.items():
             config[k] = v
-    config["ping_keepalive"] = normalize_ping_keepalive_config(
-        config.get("ping_keepalive", {}),
-        role,
-    )
+    config["phantom"] = normalize_phantom_config(config.get("phantom", {}), {})
+    config["antifilter"] = normalize_antifilter_config(config.get("antifilter", {}), {})
 
     path_was_provided = isinstance(defaults, dict) and str(defaults.get("path", "")).strip() != ""
 
@@ -4169,6 +4510,40 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
                 config["reality_key_generated"],
             ) = prompt_reality_public_key(config.get("public_key", ""))
 
+    elif choice == "10":
+        config["type"] = "phantom"
+        config["allow_plaintext_framing"] = False
+        if role == "server":
+            config["port"] = str(config.get("port", 443))
+        else:
+            config["port"] = prompt_or_keep_port(443)
+        try:
+            default_public_port = int(config.get("port", 443))
+        except (TypeError, ValueError):
+            default_public_port = 443
+        config["phantom"] = prompt_phantom_config(
+            config.get("phantom", {}),
+            role=role,
+            default_public_port=default_public_port,
+        )
+        config["path"] = normalize_path(
+            config["phantom"].get("ws_path", "/tunnel/stream"),
+            "/tunnel/stream",
+        )
+        if role == "server":
+            config["listen_host"] = input_default(
+                "Internal listen host for Phantom",
+                str(config.get("listen_host", "127.0.0.1")).strip() or "127.0.0.1",
+            ).strip() or "127.0.0.1"
+            config["port"] = str(config["phantom"].get("public_port", default_public_port))
+
+    elif choice == "11":
+        config["type"] = "antifilter"
+        config["allow_plaintext_framing"] = False
+        config["port"] = prompt_or_keep_port(443)
+        config["path"] = normalize_path(config.get("path", "/tunnel"), "/tunnel")
+        config["antifilter"] = prompt_antifilter_config(config.get("antifilter", {}))
+
     if str(config.get("type", "")).strip().lower() != "httpmimicry":
         config["allow_plaintext_framing"] = False
 
@@ -4242,7 +4617,6 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
     config["ping_keepalive"] = prompt_ping_keepalive_settings(
         role,
         config.get("ping_keepalive", {}),
-        peer_hint=config.get("server_addr", ""),
     )
 
     return config
@@ -4509,6 +4883,16 @@ def load_instance_runtime_settings(role, instance):
     network_cfg = parsed.get("network", {}) if isinstance(parsed.get("network"), dict) else {}
     network_mtu = normalize_network_mtu(network_cfg.get("mtu", 0), 0)
     network_dns = normalize_dns_config(network_cfg.get("dns", {}), {})
+    network_congestion_control = normalize_network_congestion_control(
+        network_cfg.get("congestion_control", ""),
+        "",
+    )
+    runtime_cfg = parsed.get("runtime", {}) if isinstance(parsed.get("runtime"), dict) else {}
+    runtime_mem_housekeeper_mode = str(
+        runtime_cfg.get("mem_housekeeper_mode", "off")
+    ).strip().lower() or "off"
+    if runtime_mem_housekeeper_mode not in {"off", "debug_reclaim"}:
+        runtime_mem_housekeeper_mode = "off"
     utls_cfg = parsed.get("utls", {}) if isinstance(parsed.get("utls"), dict) else {}
     utls_strict_profile_match = bool(utls_cfg.get("strict_profile_match", True))
     http_mimicry_cfg = (
@@ -4516,6 +4900,14 @@ def load_instance_runtime_settings(role, instance):
     )
     mux_cfg = parsed.get("mux", {}) if isinstance(parsed.get("mux"), dict) else {}
     mux_type = normalize_mux_type(mux_cfg.get("type", "smux"), "smux")
+    mux_prefer_quic_native = bool(mux_cfg.get("prefer_quic_native", False))
+    transport_cfg = (
+        parsed.get("transport", {}) if isinstance(parsed.get("transport"), dict) else {}
+    )
+    custom_udp_fec = normalize_custom_udp_fec_cfg(
+        transport_cfg.get("custom_udp_fec", {}),
+        {},
+    )
     mimicry_preset_region = normalize_mimicry_preset_region(
         http_mimicry_cfg.get("preset_region", "mixed"),
         "mixed",
@@ -4527,10 +4919,6 @@ def load_instance_runtime_settings(role, instance):
     )
     mimicry_basic_auth_user = str(http_mimicry_cfg.get("basic_auth_user", "")).strip()
     mimicry_basic_auth_pass = str(http_mimicry_cfg.get("basic_auth_pass", "")).strip()
-    ping_keepalive_cfg = normalize_ping_keepalive_config(
-        parsed.get("ping_keepalive", {}),
-        role,
-    )
 
     if role == "server":
         server_cfg = parsed.get("server", {}) if isinstance(parsed.get("server"), dict) else {}
@@ -4579,28 +4967,53 @@ def load_instance_runtime_settings(role, instance):
                 {},
             )
         primary_listen = normalized_listens[0]
+        primary_type = normalize_endpoint_type(primary_listen.get("type", "tcp"), "tcp")
         tls_cfg = primary_listen.get("tls", {})
         primary_port_hopping = normalize_port_hopping_cfg(
             primary_listen.get("port_hopping", {}),
             legacy_port_hopping_cfg,
         )
+        primary_addr_port = parse_port_from_address(primary_listen.get("address", ":8443"), 8443)
+        primary_phantom = normalize_phantom_config(
+            primary_listen.get("phantom", {}),
+            {"public_port": primary_addr_port},
+        )
+        primary_antifilter = normalize_antifilter_config(
+            primary_listen.get("antifilter", {}),
+            {},
+        )
+        primary_port = primary_addr_port
+        if primary_type == "phantom":
+            primary_port = _normalize_port_value(
+                primary_phantom.get("public_port", primary_port),
+                primary_port,
+            )
+        path_value = str(primary_listen.get("path", "/tunnel"))
+        if primary_type == "phantom":
+            path_value = normalize_path(primary_phantom.get("ws_path", path_value), "/tunnel/stream")
         primary_reality = normalize_endpoint_reality_config(
             primary_listen.get("reality", {}),
             role="server",
             fallback=reality_global,
-            default_dest_when_empty=str(primary_listen.get("type", "tcp")).strip().lower() == "reality",
+            default_dest_when_empty=primary_type == "reality",
         )
         protocol_cfg = {
-            "type": str(primary_listen.get("type", "tcp")),
+            "type": primary_type,
             "tunnel_mode": tunnel_mode,
-            "port": parse_port_from_address(primary_listen.get("address", ":8443"), 8443),
+            "port": primary_port,
             "listen_host": parse_host_from_address(primary_listen.get("address", ":8443"), ""),
-            "path": str(primary_listen.get("path", "/tunnel")),
+            "path": path_value,
             "port_hopping": primary_port_hopping,
+            "phantom": primary_phantom,
+            "antifilter": primary_antifilter,
             "network_mtu": network_mtu,
+            "network_congestion_control": network_congestion_control,
             "network_dns": deep_copy(network_dns),
+            "runtime_mem_housekeeper_mode": runtime_mem_housekeeper_mode,
             "utls_strict_profile_match": utls_strict_profile_match,
             "mux_type": mux_type,
+            "mux_prefer_quic_native": mux_prefer_quic_native,
+            "custom_udp_fec": deep_copy(custom_udp_fec),
             "mimicry_preset_region": mimicry_preset_region,
             "mimicry_profiles": deep_copy(mimicry_profiles),
             "mimicry_transport_mode": mimicry_transport_mode,
@@ -4622,7 +5035,6 @@ def load_instance_runtime_settings(role, instance):
             "service_restart_minutes": service_restart_minutes,
             "service_runtime_max_minutes": service_runtime_max_minutes,
             "profile": profile,
-            "ping_keepalive": deep_copy(ping_keepalive_cfg),
         }
         mappings = (
             server_cfg.get("mappings", [])
@@ -4692,17 +5104,30 @@ def load_instance_runtime_settings(role, instance):
                 {},
             )
         primary_server = normalized_servers[0]
+        primary_type = normalize_endpoint_type(primary_server.get("type", "tcp"), "tcp")
         primary_addr = derive_client_address_from_endpoint(primary_server, "127.0.0.1:8443")
+        primary_addr_port = parse_port_from_address(primary_addr, 8443)
         tls_cfg = primary_server.get("tls", {})
         primary_port_hopping = normalize_port_hopping_cfg(
             primary_server.get("port_hopping", {}),
             legacy_port_hopping_cfg,
         )
+        primary_phantom = normalize_phantom_config(
+            primary_server.get("phantom", {}),
+            {"public_port": primary_addr_port},
+        )
+        primary_antifilter = normalize_antifilter_config(
+            primary_server.get("antifilter", {}),
+            {},
+        )
+        path_value = str(primary_server.get("path", "/tunnel"))
+        if primary_type == "phantom":
+            path_value = normalize_path(primary_phantom.get("ws_path", path_value), "/tunnel/stream")
         primary_reality = normalize_endpoint_reality_config(
             primary_server.get("reality", {}),
             role="client",
             fallback=reality_global,
-            default_dest_when_empty=str(primary_server.get("type", "tcp")).strip().lower() == "reality",
+            default_dest_when_empty=primary_type == "reality",
         )
         try:
             pool_size = int(client.get("pool_size", 3) or 3)
@@ -4711,21 +5136,27 @@ def load_instance_runtime_settings(role, instance):
         if pool_size < 1:
             pool_size = 1
         protocol_cfg = {
-            "type": str(primary_server.get("type", "tcp")),
+            "type": primary_type,
             "tunnel_mode": tunnel_mode,
-            "port": parse_port_from_address(primary_addr, 8443),
+            "port": primary_addr_port,
             "server_addr": parse_host_from_address(primary_addr, "127.0.0.1"),
             "pool_size": pool_size,
             "connection_strategy": normalize_connection_strategy(
                 client.get("connection_strategy", "parallel"),
                 "parallel",
             ),
-            "path": str(primary_server.get("path", "/tunnel")),
+            "path": path_value,
             "port_hopping": primary_port_hopping,
+            "phantom": primary_phantom,
+            "antifilter": primary_antifilter,
             "network_mtu": network_mtu,
+            "network_congestion_control": network_congestion_control,
             "network_dns": deep_copy(network_dns),
+            "runtime_mem_housekeeper_mode": runtime_mem_housekeeper_mode,
             "utls_strict_profile_match": utls_strict_profile_match,
             "mux_type": mux_type,
+            "mux_prefer_quic_native": mux_prefer_quic_native,
+            "custom_udp_fec": deep_copy(custom_udp_fec),
             "mimicry_preset_region": mimicry_preset_region,
             "mimicry_profiles": deep_copy(mimicry_profiles),
             "mimicry_transport_mode": mimicry_transport_mode,
@@ -4749,7 +5180,6 @@ def load_instance_runtime_settings(role, instance):
             "service_restart_minutes": service_restart_minutes,
             "service_runtime_max_minutes": service_runtime_max_minutes,
             "profile": profile,
-            "ping_keepalive": deep_copy(ping_keepalive_cfg),
         }
         mappings = client.get("mappings", [])
         if not isinstance(mappings, list):
@@ -4774,7 +5204,7 @@ def load_instance_runtime_settings(role, instance):
         for section in TUNING_SECTIONS
     )
 
-    tuning = deep_copy(base_tuning(role, profile))
+    tuning = deep_copy(base_tuning(role))
     for section in TUNING_SECTIONS:
         incoming = parsed.get(section, {})
         if not isinstance(incoming, dict):
@@ -4978,18 +5408,19 @@ def select_obfuscation_profile(default_key="speed"):
         print_error("Invalid choice.")
 
 
-def base_tuning(role, profile="balanced"):
-    _ = role
-    tuning = {
-        "smux": {
-            "version": 2,
-            "keepalive_enabled": True,
-            "keepalive_every": "5s",
-            "keepalive_timeout": "15s",
-            "max_frame_size": 32768,
-            "max_receive_buffer": 4 * 1024 * 1024,
-            "max_stream_buffer": 1024 * 1024,
-        },
+def base_tuning(role):
+    smux_values = {
+        "version": 2,
+        "keepalive_enabled": True,
+        "keepalive_every": "5s",
+        "keepalive_timeout": "15s",
+        "max_frame_size": 32768,
+        # Keep buffers moderate so backpressure kicks in before long one-way stalls.
+        "max_receive_buffer": 4 * 1024 * 1024,
+        "max_stream_buffer": 1024 * 1024,
+    }
+    return {
+        "smux": smux_values,
         "tcp": {
             "no_delay": True,
             "keepalive": "15s",
@@ -5006,6 +5437,10 @@ def base_tuning(role, profile="balanced"):
             "write_buffer": 8388608,
             "max_datagram_size": 65507,
             "session_idle_timeout": "2m",
+            "batch_enabled": False,
+            "batch_size": 16,
+            "pacing_enabled": False,
+            "pacing_rate_bps": 0,
         },
         "kcp": {
             "data_shards": 10,
@@ -5032,52 +5467,9 @@ def base_tuning(role, profile="balanced"):
         },
     }
 
-    profile_key = str(profile or "balanced").strip().lower()
-    if profile_key in {"", "balanced"}:
-        tuning["smux"].update(
-            {
-                "max_frame_size": 65535,
-                "max_receive_buffer": 32 * 1024 * 1024,
-                "max_stream_buffer": 32 * 1024 * 1024,
-            }
-        )
-        tuning["tcp"].update(
-            {
-                "keepalive": "3s",
-                "read_buffer": 32 * 1024 * 1024,
-                "write_buffer": 32 * 1024 * 1024,
-                "conn_limit": 300,
-                "auto_tune": False,
-            }
-        )
-        tuning["udp"].update(
-            {
-                "read_buffer": 262144,
-                "write_buffer": 262144,
-                "session_idle_timeout": "90s",
-            }
-        )
-        tuning["kcp"].update(
-            {
-                "interval": 5,
-                "mtu": 1400,
-                "send_window": 256,
-                "recv_window": 256,
-            }
-        )
 
-    return tuning
-
-
-def profile_health_interval(profile_key):
-    profile = str(profile_key or "balanced").strip().lower()
-    if profile in {"", "balanced"}:
-        return "1s"
-    return "15s"
-
-
-def configure_tuning(role, deployment_mode, profile="balanced"):
-    tuning = json.loads(json.dumps(base_tuning(role, profile)))
+def configure_tuning(role, deployment_mode):
+    tuning = json.loads(json.dumps(base_tuning(role)))
     if deployment_mode != "advanced":
         return tuning
 
@@ -5102,6 +5494,9 @@ def render_mappings_lines(mappings):
         lines.append(f"      protocol: {yaml_scalar(item['protocol'])}")
         lines.append(f"      bind: {yaml_scalar(item['bind'])}")
         lines.append(f"      target: {yaml_scalar(item['target'])}")
+        route_to = item.get("route_to", "")
+        if route_to:
+            lines.append(f"      route_to: {yaml_scalar(route_to)}")
     return lines
 
 
@@ -5376,15 +5771,43 @@ def build_primary_endpoint_reality(role, protocol_config, endpoint_type=""):
     )
 
 
+def _int_or_default(value, default_value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default_value)
+
+
 def build_server_primary_endpoint(protocol_config):
     endpoint_type = normalize_endpoint_type(protocol_config.get("type", "tcp"), "tcp")
+    phantom_cfg = normalize_phantom_config(
+        protocol_config.get("phantom", {}),
+        {"public_port": _int_or_default(protocol_config.get("port", 443), 443)},
+    )
+    antifilter_cfg = normalize_antifilter_config(protocol_config.get("antifilter", {}), {})
     path_default = default_path_for_transport(endpoint_type)
     path = normalize_path(protocol_config.get("path", path_default), path_default)
-    listen_host = str(protocol_config.get("listen_host", "")).strip()
-    if listen_host:
-        address = f"{listen_host}:{protocol_config.get('port', 8443)}"
+    if endpoint_type == "phantom":
+        path = normalize_path(phantom_cfg.get("ws_path", path), "/tunnel/stream")
+        listen_host = str(protocol_config.get("listen_host", "127.0.0.1")).strip() or "127.0.0.1"
+        internal_port = _normalize_port_value(
+            phantom_cfg.get("internal_port", 8443),
+            8443,
+        )
+        if listen_host:
+            address = f"{listen_host}:{internal_port}"
+        else:
+            address = f":{internal_port}"
+        phantom_cfg["public_port"] = _normalize_port_value(
+            protocol_config.get("port", phantom_cfg.get("public_port", 443)),
+            phantom_cfg.get("public_port", 443),
+        )
     else:
-        address = f":{protocol_config.get('port', 8443)}"
+        listen_host = str(protocol_config.get("listen_host", "")).strip()
+        if listen_host:
+            address = f"{listen_host}:{protocol_config.get('port', 8443)}"
+        else:
+            address = f":{protocol_config.get('port', 8443)}"
     port_hopping_cfg = normalize_port_hopping_cfg(protocol_config.get("port_hopping", {}), {})
     return normalize_transport_endpoint(
         {
@@ -5402,6 +5825,8 @@ def build_server_primary_endpoint(protocol_config):
                 "require_client_cert": False,
             },
             "reality": build_primary_endpoint_reality("server", protocol_config, endpoint_type),
+            "phantom": phantom_cfg,
+            "antifilter": antifilter_cfg,
         },
         role="server",
         fallback_type=endpoint_type,
@@ -5409,13 +5834,22 @@ def build_server_primary_endpoint(protocol_config):
         fallback_path=path,
         fallback_reality=build_primary_endpoint_reality("server", protocol_config, endpoint_type),
         fallback_port_hopping=port_hopping_cfg,
+        fallback_phantom=phantom_cfg,
+        fallback_antifilter=antifilter_cfg,
     )
 
 
 def build_client_primary_endpoint(protocol_config):
     endpoint_type = normalize_endpoint_type(protocol_config.get("type", "tcp"), "tcp")
+    phantom_cfg = normalize_phantom_config(
+        protocol_config.get("phantom", {}),
+        {"public_port": _int_or_default(protocol_config.get("port", 443), 443)},
+    )
+    antifilter_cfg = normalize_antifilter_config(protocol_config.get("antifilter", {}), {})
     path_default = default_path_for_transport(endpoint_type)
     path = normalize_path(protocol_config.get("path", path_default), path_default)
+    if endpoint_type == "phantom":
+        path = normalize_path(phantom_cfg.get("ws_path", path), "/tunnel/stream")
     server_addr = str(protocol_config.get("server_addr", "127.0.0.1")).strip() or "127.0.0.1"
     address = f"{server_addr}:{protocol_config.get('port', 8443)}"
     url = ""
@@ -5438,6 +5872,8 @@ def build_client_primary_endpoint(protocol_config):
                 "require_client_cert": False,
             },
             "reality": build_primary_endpoint_reality("client", protocol_config, endpoint_type),
+            "phantom": phantom_cfg,
+            "antifilter": antifilter_cfg,
         },
         role="client",
         fallback_type=endpoint_type,
@@ -5445,6 +5881,8 @@ def build_client_primary_endpoint(protocol_config):
         fallback_path=path,
         fallback_reality=build_primary_endpoint_reality("client", protocol_config, endpoint_type),
         fallback_port_hopping=port_hopping_cfg,
+        fallback_phantom=phantom_cfg,
+        fallback_antifilter=antifilter_cfg,
     )
 
 
@@ -5463,6 +5901,9 @@ def build_all_endpoints_for_render(role, protocol_config, primary_endpoint):
             fallback_address=primary_endpoint["address"],
             fallback_path=primary_endpoint["path"],
             fallback_reality=primary_endpoint.get("reality", {}),
+            fallback_port_hopping=primary_endpoint.get("port_hopping", {}),
+            fallback_phantom=primary_endpoint.get("phantom", {}),
+            fallback_antifilter=primary_endpoint.get("antifilter", {}),
         )
         if role == "client" and normalized["type"] in {"ws", "wss"} and not normalized["url"]:
             normalized["url"] = resolve_ws_url(
@@ -5589,6 +6030,20 @@ def build_client_setup_lines_for_server_summary(cfg):
             f"Mimicry Basic Pass: {str(cfg.get('mimicry_basic_auth_pass', '')).strip() or '(empty)'}"
         )
 
+    if ep_type == "phantom":
+        phantom_cfg = normalize_phantom_config(cfg.get("phantom", {}), {})
+        lines.append(f"Phantom WS Path: {phantom_cfg.get('ws_path', '/tunnel/stream')}")
+        if str(phantom_cfg.get("domain", "")).strip():
+            lines.append(f"Phantom Domain: {phantom_cfg.get('domain')}")
+        lines.append(f"Phantom Public Port: {phantom_cfg.get('public_port', cfg.get('port'))}")
+        lines.append(f"Phantom Internal Port: {phantom_cfg.get('internal_port', 8443)}")
+
+    if ep_type == "antifilter":
+        af_cfg = normalize_antifilter_config(cfg.get("antifilter", {}), {})
+        lines.append(
+            f"AntiFilter: mode={af_cfg.get('capture_mode', 'afpacket')} FEC={af_cfg.get('data_shards', 10)}/{af_cfg.get('parity_shards', 3)} noise={af_cfg.get('noise_cover', 0.05)}"
+        )
+
     if ep_type == "reality":
         public_key = str(cfg.get("public_key", "")).strip()
         private_key = str(cfg.get("private_key", "")).strip()
@@ -5676,6 +6131,39 @@ def render_named_transport_endpoint_lines(
                 f"{indent}    public_key: {yaml_scalar(reality_cfg.get('public_key', ''))}",
             ]
         )
+    if ep_type == "phantom":
+        phantom_cfg = normalize_phantom_config(
+            endpoint.get("phantom", {}) if isinstance(endpoint.get("phantom"), dict) else {},
+            {},
+        )
+        lines.extend(
+            [
+                f"{indent}  phantom:",
+                f"{indent}    interface: {yaml_scalar(phantom_cfg.get('interface', 'eth0'))}",
+                f"{indent}    ws_path: {yaml_scalar(phantom_cfg.get('ws_path', '/tunnel/stream'))}",
+                f"{indent}    psk: {yaml_scalar(phantom_cfg.get('psk', ''))}",
+                f"{indent}    domain: {yaml_scalar(phantom_cfg.get('domain', ''))}",
+                f"{indent}    internal_port: {yaml_scalar(phantom_cfg.get('internal_port', 8443))}",
+                f"{indent}    public_port: {yaml_scalar(phantom_cfg.get('public_port', 443))}",
+            ]
+        )
+    if ep_type == "antifilter":
+        af_cfg = normalize_antifilter_config(
+            endpoint.get("antifilter", {}) if isinstance(endpoint.get("antifilter"), dict) else {},
+            {},
+        )
+        lines.extend(
+            [
+                f"{indent}  antifilter:",
+                f"{indent}    interface: {yaml_scalar(af_cfg.get('interface', 'eth0'))}",
+                f"{indent}    capture_mode: {yaml_scalar(af_cfg.get('capture_mode', 'afpacket'))}",
+                f"{indent}    data_shards: {yaml_scalar(af_cfg.get('data_shards', 10))}",
+                f"{indent}    parity_shards: {yaml_scalar(af_cfg.get('parity_shards', 3))}",
+                f"{indent}    noise_cover: {yaml_scalar(af_cfg.get('noise_cover', 0.05))}",
+                f"{indent}    psk: {yaml_scalar(af_cfg.get('psk', ''))}",
+                f"{indent}    write_rate_bps: {yaml_scalar(af_cfg.get('write_rate_bps', 0))}",
+            ]
+        )
     return lines
 
 
@@ -5731,6 +6219,41 @@ def render_transport_endpoints_list_lines(
                     f"{indent}      public_key: {yaml_scalar(reality_cfg.get('public_key', ''))}",
                 ]
             )
+        # Phantom transport config
+        if ep_type == "phantom":
+            phantom_cfg = normalize_phantom_config(
+                endpoint.get("phantom", {}) if isinstance(endpoint.get("phantom"), dict) else {},
+                {},
+            )
+            lines.extend(
+                [
+                    f"{indent}    phantom:",
+                    f"{indent}      interface: {yaml_scalar(phantom_cfg.get('interface', 'eth0'))}",
+                    f"{indent}      ws_path: {yaml_scalar(phantom_cfg.get('ws_path', '/tunnel/stream'))}",
+                    f"{indent}      psk: {yaml_scalar(phantom_cfg.get('psk', ''))}",
+                    f"{indent}      domain: {yaml_scalar(phantom_cfg.get('domain', ''))}",
+                    f"{indent}      internal_port: {yaml_scalar(phantom_cfg.get('internal_port', 8443))}",
+                    f"{indent}      public_port: {yaml_scalar(phantom_cfg.get('public_port', 443))}",
+                ]
+            )
+        # AntiFilter transport config
+        if ep_type == "antifilter":
+            af_cfg = normalize_antifilter_config(
+                endpoint.get("antifilter", {}) if isinstance(endpoint.get("antifilter"), dict) else {},
+                {},
+            )
+            lines.extend(
+                [
+                    f"{indent}    antifilter:",
+                    f"{indent}      interface: {yaml_scalar(af_cfg.get('interface', 'eth0'))}",
+                    f"{indent}      capture_mode: {yaml_scalar(af_cfg.get('capture_mode', 'afpacket'))}",
+                    f"{indent}      data_shards: {yaml_scalar(af_cfg.get('data_shards', 10))}",
+                    f"{indent}      parity_shards: {yaml_scalar(af_cfg.get('parity_shards', 3))}",
+                    f"{indent}      noise_cover: {yaml_scalar(af_cfg.get('noise_cover', 0.05))}",
+                    f"{indent}      psk: {yaml_scalar(af_cfg.get('psk', ''))}",
+                    f"{indent}      write_rate_bps: {yaml_scalar(af_cfg.get('write_rate_bps', 0))}",
+                ]
+            )
     return lines
 
 
@@ -5743,6 +6266,19 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
     mimicry_enabled = resolve_http_mimicry_state(protocol_config, all_listens)
     network_mtu = normalize_network_mtu(protocol_config.get("network_mtu", 0), 0)
     network_dns = normalize_dns_config(protocol_config.get("network_dns", {}), {})
+    network_congestion_control = normalize_network_congestion_control(
+        protocol_config.get("network_congestion_control", ""),
+        "",
+    )
+    runtime_mem_housekeeper_mode = str(
+        protocol_config.get("runtime_mem_housekeeper_mode", "off")
+    ).strip().lower() or "off"
+    if runtime_mem_housekeeper_mode not in {"off", "debug_reclaim"}:
+        runtime_mem_housekeeper_mode = "off"
+    custom_udp_fec = normalize_custom_udp_fec_cfg(
+        protocol_config.get("custom_udp_fec", {}),
+        {},
+    )
     utls_strict_profile_match = bool(protocol_config.get("utls_strict_profile_match", True))
     reality_enabled = any(
         normalize_endpoint_type(ep.get("type", "tcp"), "tcp") == "reality"
@@ -5775,11 +6311,7 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
     reality_short_id = reality_cfg.get("short_id", "")
     reality_private_key = reality_cfg.get("private_key", "")
     mux_type = normalize_mux_type(protocol_config.get("mux_type", "smux"), "smux")
-    health_interval = profile_health_interval(protocol_config.get("profile", "balanced"))
-    ping_keepalive_cfg = normalize_ping_keepalive_config(
-        protocol_config.get("ping_keepalive", {}),
-        "server",
-    )
+    mux_prefer_quic_native = bool(protocol_config.get("mux_prefer_quic_native", False))
     lines = [
         "mode: server",
         f"tunnel_mode: {yaml_scalar(protocol_config.get('tunnel_mode', 'reverse'))}",
@@ -5809,6 +6341,7 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
             "",
             "mux:",
             f"  type: {yaml_scalar(mux_type)}",
+            f"  prefer_quic_native: {yaml_scalar(mux_prefer_quic_native)}",
             "",
             "smux:",
             f"  version: {yaml_scalar(tuning['smux']['version'])}",
@@ -5835,6 +6368,10 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
             f"  write_buffer: {yaml_scalar(tuning['udp']['write_buffer'])}",
             f"  max_datagram_size: {yaml_scalar(tuning['udp']['max_datagram_size'])}",
             f"  session_idle_timeout: {yaml_scalar(tuning['udp']['session_idle_timeout'])}",
+            f"  batch_enabled: {yaml_scalar(tuning['udp'].get('batch_enabled', False))}",
+            f"  batch_size: {yaml_scalar(tuning['udp'].get('batch_size', 16))}",
+            f"  pacing_enabled: {yaml_scalar(tuning['udp'].get('pacing_enabled', False))}",
+            f"  pacing_rate_bps: {yaml_scalar(tuning['udp'].get('pacing_rate_bps', 0))}",
             "",
             "kcp:",
             f"  data_shards: {yaml_scalar(tuning['kcp']['data_shards'])}",
@@ -5855,13 +6392,26 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
             "",
             "network:",
             f"  mtu: {yaml_scalar(network_mtu)}",
+            f"  congestion_control: {yaml_scalar(network_congestion_control)}",
             "  dns:",
             f"    mode: {yaml_scalar(network_dns['mode'])}",
             f"    doh_endpoints: {json.dumps(network_dns['doh_endpoints'])}",
             f"    dot_servers: {json.dumps(network_dns['dot_servers'])}",
+            f"    dot_server_name: {yaml_scalar(network_dns.get('dot_server_name', ''))}",
             f"    query_timeout: {yaml_scalar(network_dns['query_timeout'])}",
             f"    cache_ttl: {yaml_scalar(network_dns['cache_ttl'])}",
             f"    max_inflight: {yaml_scalar(network_dns['max_inflight'])}",
+            "",
+            "runtime:",
+            f"  mem_housekeeper_mode: {yaml_scalar(runtime_mem_housekeeper_mode)}",
+            "",
+            "transport:",
+            "  custom_udp_fec:",
+            f"    enabled: {yaml_scalar(custom_udp_fec['enabled'])}",
+            f"    data_shards: {yaml_scalar(custom_udp_fec['data_shards'])}",
+            f"    parity_shards: {yaml_scalar(custom_udp_fec['parity_shards'])}",
+            f"    noise_cover_rate: {yaml_scalar(custom_udp_fec['noise_cover_rate'])}",
+            f"    morph_buckets: {json.dumps(custom_udp_fec['morph_buckets'])}",
             "",
             "security:",
             f"  psk: {yaml_scalar(protocol_config.get('psk', ''))}",
@@ -5874,16 +6424,7 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
             "",
             "health:",
             "  enabled: true",
-            f"  interval: {yaml_scalar(health_interval)}",
-            "",
-            "ping_keepalive:",
-            f"  enabled: {yaml_scalar(ping_keepalive_cfg['enabled'])}",
-            f"  interval: {yaml_scalar(ping_keepalive_cfg['interval'])}",
-            f"  timeout: {yaml_scalar(ping_keepalive_cfg['timeout'])}",
-            f"  startup_delay: {yaml_scalar(ping_keepalive_cfg['startup_delay'])}",
-            f"  targets: {json.dumps(ping_keepalive_cfg['targets'])}",
-            f"  server_targets: {json.dumps(ping_keepalive_cfg['server_targets'])}",
-            f"  client_targets: {json.dumps(ping_keepalive_cfg['client_targets'])}",
+            '  interval: "15s"',
             "",
             "reconnect:",
             f"  min_delay: {yaml_scalar(tuning['reconnect']['min_delay'])}",
@@ -5939,6 +6480,19 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
     mimicry_enabled = resolve_http_mimicry_state(protocol_config, all_servers)
     network_mtu = normalize_network_mtu(protocol_config.get("network_mtu", 0), 0)
     network_dns = normalize_dns_config(protocol_config.get("network_dns", {}), {})
+    network_congestion_control = normalize_network_congestion_control(
+        protocol_config.get("network_congestion_control", ""),
+        "",
+    )
+    runtime_mem_housekeeper_mode = str(
+        protocol_config.get("runtime_mem_housekeeper_mode", "off")
+    ).strip().lower() or "off"
+    if runtime_mem_housekeeper_mode not in {"off", "debug_reclaim"}:
+        runtime_mem_housekeeper_mode = "off"
+    custom_udp_fec = normalize_custom_udp_fec_cfg(
+        protocol_config.get("custom_udp_fec", {}),
+        {},
+    )
     utls_strict_profile_match = bool(protocol_config.get("utls_strict_profile_match", True))
     connection_strategy = normalize_connection_strategy(
         protocol_config.get("connection_strategy", "parallel"),
@@ -5975,17 +6529,13 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
     reality_short_id = reality_cfg.get("short_id", "")
     reality_public_key = reality_cfg.get("public_key", "")
     mux_type = normalize_mux_type(protocol_config.get("mux_type", "smux"), "smux")
+    mux_prefer_quic_native = bool(protocol_config.get("mux_prefer_quic_native", False))
     try:
         pool_size = int(protocol_config.get("pool_size", 3))
     except (TypeError, ValueError):
         pool_size = 3
     if pool_size < 1:
         pool_size = 1
-    health_interval = profile_health_interval(protocol_config.get("profile", "balanced"))
-    ping_keepalive_cfg = normalize_ping_keepalive_config(
-        protocol_config.get("ping_keepalive", {}),
-        "client",
-    )
     lines = [
         "mode: client",
         f"tunnel_mode: {yaml_scalar(protocol_config.get('tunnel_mode', 'reverse'))}",
@@ -6010,6 +6560,7 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         "",
         "mux:",
         f"  type: {yaml_scalar(mux_type)}",
+        f"  prefer_quic_native: {yaml_scalar(mux_prefer_quic_native)}",
         "",
         "smux:",
         f"  version: {yaml_scalar(tuning['smux']['version'])}",
@@ -6036,6 +6587,10 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         f"  write_buffer: {yaml_scalar(tuning['udp']['write_buffer'])}",
         f"  max_datagram_size: {yaml_scalar(tuning['udp']['max_datagram_size'])}",
         f"  session_idle_timeout: {yaml_scalar(tuning['udp']['session_idle_timeout'])}",
+        f"  batch_enabled: {yaml_scalar(tuning['udp'].get('batch_enabled', False))}",
+        f"  batch_size: {yaml_scalar(tuning['udp'].get('batch_size', 16))}",
+        f"  pacing_enabled: {yaml_scalar(tuning['udp'].get('pacing_enabled', False))}",
+        f"  pacing_rate_bps: {yaml_scalar(tuning['udp'].get('pacing_rate_bps', 0))}",
         "",
         "kcp:",
         f"  data_shards: {yaml_scalar(tuning['kcp']['data_shards'])}",
@@ -6056,13 +6611,26 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         "",
         "network:",
             f"  mtu: {yaml_scalar(network_mtu)}",
+            f"  congestion_control: {yaml_scalar(network_congestion_control)}",
             "  dns:",
             f"    mode: {yaml_scalar(network_dns['mode'])}",
             f"    doh_endpoints: {json.dumps(network_dns['doh_endpoints'])}",
             f"    dot_servers: {json.dumps(network_dns['dot_servers'])}",
+            f"    dot_server_name: {yaml_scalar(network_dns.get('dot_server_name', ''))}",
             f"    query_timeout: {yaml_scalar(network_dns['query_timeout'])}",
             f"    cache_ttl: {yaml_scalar(network_dns['cache_ttl'])}",
             f"    max_inflight: {yaml_scalar(network_dns['max_inflight'])}",
+            "",
+            "runtime:",
+            f"  mem_housekeeper_mode: {yaml_scalar(runtime_mem_housekeeper_mode)}",
+            "",
+            "transport:",
+            "  custom_udp_fec:",
+            f"    enabled: {yaml_scalar(custom_udp_fec['enabled'])}",
+            f"    data_shards: {yaml_scalar(custom_udp_fec['data_shards'])}",
+            f"    parity_shards: {yaml_scalar(custom_udp_fec['parity_shards'])}",
+            f"    noise_cover_rate: {yaml_scalar(custom_udp_fec['noise_cover_rate'])}",
+            f"    morph_buckets: {json.dumps(custom_udp_fec['morph_buckets'])}",
             "",
             "security:",
         f"  psk: {yaml_scalar(protocol_config.get('psk', ''))}",
@@ -6075,16 +6643,7 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         "",
         "health:",
         "  enabled: true",
-        f"  interval: {yaml_scalar(health_interval)}",
-        "",
-        "ping_keepalive:",
-        f"  enabled: {yaml_scalar(ping_keepalive_cfg['enabled'])}",
-        f"  interval: {yaml_scalar(ping_keepalive_cfg['interval'])}",
-        f"  timeout: {yaml_scalar(ping_keepalive_cfg['timeout'])}",
-        f"  startup_delay: {yaml_scalar(ping_keepalive_cfg['startup_delay'])}",
-        f"  targets: {json.dumps(ping_keepalive_cfg['targets'])}",
-        f"  server_targets: {json.dumps(ping_keepalive_cfg['server_targets'])}",
-        f"  client_targets: {json.dumps(ping_keepalive_cfg['client_targets'])}",
+        '  interval: "15s"',
         "",
         "reconnect:",
         f"  min_delay: {yaml_scalar(tuning['reconnect']['min_delay'])}",
@@ -6224,10 +6783,9 @@ def create_service(role, instance="default", restart_minutes=0, runtime_max_minu
     config_path = os.path.join(CONFIG_DIR, build_config_filename(role, instance))
     exec_start = f"{os.path.join(INSTALL_DIR, BINARY_NAME)} {profile['mode']} -c {config_path}"
     description = profile["description"] if instance == "default" else f"{profile['description']} [{instance}]"
-    runtime_env = build_dynamic_runtime_env()
     env_lines = "\n".join(
         f'Environment="{key}={value}"'
-        for key, value in runtime_env.items()
+        for key, value in build_systemd_runtime_env().items()
     )
     content = f"""[Unit]
 Description={description}
@@ -6246,6 +6804,8 @@ KillSignal=SIGTERM
 FinalKillSignal=SIGKILL
 SendSIGKILL=yes
 LimitNOFILE=infinity
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
 
 [Install]
 WantedBy=multi-user.target
@@ -6258,9 +6818,7 @@ WantedBy=multi-user.target
     run_command(f"systemctl restart {service_name}")
     print_success(
         f"✅ Systemd service installed and started: {service_name}.service "
-        f"(auto-restart: {restart_label}, runtime-max: {runtime_max_label}, "
-        f"max-heap: {runtime_env.get('NODELAY_MEM_HOUSEKEEPER_MIN_HEAP')}, "
-        f"gomemlimit: {runtime_env.get('GOMEMLIMIT')})"
+        f"(auto-restart: {restart_label}, runtime-max: {runtime_max_label})"
     )
 
 
@@ -6450,11 +7008,6 @@ def edit_service_instance(service_name):
             role == "client"
             and str(protocol_cfg.get("tunnel_mode", "reverse")).strip().lower() == "direct"
         )
-        ping_keepalive_cfg = normalize_ping_keepalive_config(
-            protocol_cfg.get("ping_keepalive", {}),
-            role,
-        )
-        effective_ping_targets = resolve_ping_keepalive_targets(role, ping_keepalive_cfg)
         menu_lines = [
             f"Role:        {role} ({role_display(role)})",
             f"Instance:    {instance}",
@@ -6464,10 +7017,6 @@ def edit_service_instance(service_name):
             f"TunnelMode:  {protocol_cfg.get('tunnel_mode', 'reverse')}",
             f"Profile:     {protocol_cfg.get('profile', 'balanced')}",
             f"Obfuscation: {'enabled' if obfuscation_cfg.get('enabled') else 'disabled'}",
-            (
-                f"PingKA:      {'enabled' if ping_keepalive_cfg.get('enabled') else 'disabled'} "
-                f"(targets={len(effective_ping_targets)}, interval={ping_keepalive_cfg.get('interval', '1s')})"
-            ),
             (
                 f"AutoRestart: always ({DEFAULT_SERVICE_RESTART_SECONDS}s)"
             ),
@@ -6488,46 +7037,39 @@ def edit_service_instance(service_name):
             menu_lines.append(f"Extra EPs:   {len(protocol_cfg.get('additional_endpoints', []))}")
             if client_direct_mode:
                 menu_lines.append(f"Mappings:    {len(protocol_cfg.get('mappings', []))}")
-
-        supports_mapping_edit = role == "server" or client_direct_mode
-        if supports_mapping_edit:
-            choice_edit_mappings = "4"
-            choice_add_forward = "5"
-            choice_edit_tuning = "6"
-            choice_edit_license = "7"
-            choice_edit_runtime = "8"
-            choice_save = "9"
-        else:
-            choice_edit_mappings = ""
-            choice_add_forward = ""
-            choice_edit_tuning = "4"
-            choice_edit_license = "5"
-            choice_edit_runtime = "6"
-            choice_save = "7"
-
         menu_lines.append("")
-        menu_lines.append("1. Edit protocol / listen port / transport")
+        menu_lines.append("1. Edit protocol / listen port / transport / ping keepalive")
         menu_lines.append("2. Edit profile preset")
         menu_lines.append("3. Edit obfuscation preset")
-        if supports_mapping_edit:
+        if role == "server":
             menu_lines.extend(
                 [
-                    f"{choice_edit_mappings}. Edit port mappings",
-                    f"{choice_add_forward}. Add forward port (append only)",
-                    f"{choice_edit_tuning}. Edit advanced tuning",
-                    f"{choice_edit_license}. Edit license ID",
-                    f"{choice_edit_runtime}. Edit service runtime max",
-                    f"{choice_save}. Save changes and restart service",
+                    "4. Edit port mappings",
+                    "5. Edit advanced tuning",
+                    "6. Edit license ID",
+                    "7. Edit service runtime max",
+                    "8. Save changes and restart service",
+                    "0. Cancel",
+                ]
+            )
+        elif client_direct_mode:
+            menu_lines.extend(
+                [
+                    "4. Edit port mappings",
+                    "5. Edit advanced tuning",
+                    "6. Edit license ID",
+                    "7. Edit service runtime max",
+                    "8. Save changes and restart service",
                     "0. Cancel",
                 ]
             )
         else:
             menu_lines.extend(
                 [
-                    f"{choice_edit_tuning}. Edit advanced tuning",
-                    f"{choice_edit_license}. Edit license ID",
-                    f"{choice_edit_runtime}. Edit service runtime max",
-                    f"{choice_save}. Save changes and restart service",
+                    "4. Edit advanced tuning",
+                    "5. Edit license ID",
+                    "6. Edit service runtime max",
+                    "7. Save changes and restart service",
                     "0. Cancel",
                 ]
             )
@@ -6581,43 +7123,27 @@ def edit_service_instance(service_name):
         elif choice == "3":
             default_obf_key = match_obfuscation_preset_key(obfuscation_cfg)
             obfuscation_cfg = select_obfuscation_profile(default_key=default_obf_key)
-        elif choice == choice_edit_mappings and role == "server":
+        elif choice == "4" and role == "server":
             protocol_cfg["mappings"] = prompt_server_mappings(
                 existing=protocol_cfg.get("mappings", [])
             )
-        elif choice == choice_edit_mappings and client_direct_mode:
+        elif choice == "4" and client_direct_mode:
             protocol_cfg["mappings"] = prompt_server_mappings(
                 existing=protocol_cfg.get("mappings", []),
                 fixed_mode="direct",
                 bind_side_label="Client side",
                 target_side_label="Server side",
             )
-        elif choice == choice_add_forward and role == "server":
-            tunnel_mode_hint = str(protocol_cfg.get("tunnel_mode", "reverse")).strip().lower()
-            default_mode = tunnel_mode_hint if tunnel_mode_hint in {"reverse", "direct"} else "reverse"
-            protocol_cfg["mappings"] = prompt_append_forward_port_mapping(
-                existing=protocol_cfg.get("mappings", []),
-                fixed_mode=None,
-                default_mode=default_mode,
-            )
-        elif choice == choice_add_forward and client_direct_mode:
-            protocol_cfg["mappings"] = prompt_append_forward_port_mapping(
-                existing=protocol_cfg.get("mappings", []),
-                fixed_mode="direct",
-                default_mode="direct",
-                bind_side_label="Client side",
-                target_side_label="Server side",
-            )
-        elif choice == choice_edit_tuning:
+        elif (choice == "5" and role == "server") or (choice == "5" and client_direct_mode) or (choice == "4" and role == "client" and not client_direct_mode):
             tuning = configure_tuning_from_existing(tuning)
             explicit_tuning = True
-        elif choice == choice_edit_license:
+        elif (choice == "6" and role == "server") or (choice == "6" and client_direct_mode) or (choice == "5" and role == "client" and not client_direct_mode):
             protocol_cfg["license"] = prompt_license_id()
-        elif choice == choice_edit_runtime:
+        elif (choice == "7" and role == "server") or (choice == "7" and client_direct_mode) or (choice == "6" and role == "client" and not client_direct_mode):
             protocol_cfg["service_runtime_max_minutes"] = prompt_service_runtime_max_minutes(
                 default_minutes=protocol_cfg.get("service_runtime_max_minutes", 0)
             )
-        elif choice == choice_save:
+        elif (choice == "8" and role == "server") or (choice == "8" and client_direct_mode) or (choice == "7" and role == "client" and not client_direct_mode):
             config_file = build_config_filename(role, instance)
             restart_minutes = protocol_cfg.get("service_restart_minutes", DEFAULT_SERVICE_RESTART_MINUTES)
             runtime_max_minutes = protocol_cfg.get(
@@ -6645,6 +7171,8 @@ def edit_service_instance(service_name):
                 restart_minutes=restart_minutes,
                 runtime_max_minutes=runtime_max_minutes,
             )
+            if role == "server":
+                maybe_setup_phantom_frontend(protocol_cfg)
             return
         elif choice == "0":
             print_info("Edit cancelled.")
@@ -6779,7 +7307,7 @@ def install_server_flow(
     cfg["tunnel_mode"] = tunnel_mode
     cfg["license"] = prompt_license_id()
     cfg["profile"] = select_config_profile()
-    tuning = configure_tuning("server", deployment_mode, cfg.get("profile", "balanced"))
+    tuning = configure_tuning("server", deployment_mode)
     obfuscation_cfg = select_obfuscation_profile()
     cfg["service_restart_minutes"] = prompt_service_restart_minutes(
         default_minutes=DEFAULT_SERVICE_RESTART_MINUTES
@@ -6809,6 +7337,7 @@ def install_server_flow(
         restart_minutes=cfg.get("service_restart_minutes", 0),
         runtime_max_minutes=cfg.get("service_runtime_max_minutes", 0),
     )
+    maybe_setup_phantom_frontend(cfg)
     maybe_apply_linux_network_tuning()
 
     all_listens = collect_render_endpoints("server", cfg)
@@ -6824,6 +7353,11 @@ def install_server_flow(
     if str(cfg.get("type", "")).strip().lower() in {"httpmimicry", "httpsmimicry"}:
         print(f"Mimic Path: {Colors.BOLD}{cfg.get('path', '')}{Colors.ENDC}")
         print("Note: Enter this exact Mimic Path on the client.")
+    if str(cfg.get("type", "")).strip().lower() == "phantom":
+        phantom_cfg = normalize_phantom_config(cfg.get("phantom", {}), {})
+        print(f"Phantom Domain: {Colors.BOLD}{phantom_cfg.get('domain', '') or '(not set)'}{Colors.ENDC}")
+        print(f"Phantom WS Path: {Colors.BOLD}{phantom_cfg.get('ws_path', '/tunnel/stream')}{Colors.ENDC}")
+        print(f"Phantom Internal Port: {Colors.BOLD}{phantom_cfg.get('internal_port', 8443)}{Colors.ENDC}")
     print(f"Listens:  {Colors.BOLD}{len(all_listens)} endpoint(s){Colors.ENDC}")
     for ep in all_listens:
         print(f"  - {format_endpoint_summary(ep)}")
@@ -6886,7 +7420,7 @@ def install_client_flow(
     cfg["tunnel_mode"] = tunnel_mode
     cfg["license"] = ""
     cfg["profile"] = select_config_profile()
-    tuning = configure_tuning("client", deployment_mode, cfg.get("profile", "balanced"))
+    tuning = configure_tuning("client", deployment_mode)
     obfuscation_cfg = select_obfuscation_profile()
     cfg["service_restart_minutes"] = prompt_service_restart_minutes(
         default_minutes=DEFAULT_SERVICE_RESTART_MINUTES
@@ -6929,6 +7463,9 @@ def install_client_flow(
     print(f"Run command: {Colors.BOLD}nodelay client -c {config_path}{Colors.ENDC}")
     print(f"Profile:    {Colors.BOLD}{cfg['profile']}{Colors.ENDC}")
     print(f"Tunnel Port: {Colors.BOLD}{cfg.get('port')}{Colors.ENDC}")
+    if str(cfg.get("type", "")).strip().lower() == "phantom":
+        phantom_cfg = normalize_phantom_config(cfg.get("phantom", {}), {})
+        print(f"Phantom WS Path: {Colors.BOLD}{phantom_cfg.get('ws_path', '/tunnel/stream')}{Colors.ENDC}")
     print(f"Pool Size:  {Colors.BOLD}{cfg.get('pool_size', 3)}{Colors.ENDC}")
     print(f"Strategy:   {Colors.BOLD}{cfg.get('connection_strategy', 'parallel')}{Colors.ENDC}")
     print(f"Upstreams:  {Colors.BOLD}{len(all_servers)} endpoint(s){Colors.ENDC}")
