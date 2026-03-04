@@ -293,7 +293,8 @@ def print_header(text):
 def print_success(text):
     print(f"{Colors.GREEN}[+] {text}{Colors.ENDC}")
 
-
+def print_warning(text):
+    print(f"{Colors.YELLOW}[!!]{text}{Colors.ENDC}")
 def print_info(text):
     print(f"{Colors.BLUE}[*] {text}{Colors.ENDC}")
 
@@ -2769,6 +2770,8 @@ TRANSPORT_TYPE_OPTIONS = [
     ("10", "phantom", "🛡️ Phantom (Stealth L3/L7 via Caddy)"),
     ("11", "antifilter", "🔥 AntiFilter (Raw UDP + FEC + pcap)"),
     ("12", "dnstunnel", "📡 DNS Tunnel (UDP53/TCP53/DoH, stealth)"),
+    ("13", "tun", "🔧 TUN Mode (L3 tunnel, IPX encapsulation, BIP)"),
+    ("14", "cdn", "🌐 CDN (HTTP/HTTPS WebSocket through Cloudflare/CDN)"),
 ]
 TRANSPORT_TYPE_INDEX_TO_NAME = {idx: name for idx, name, _ in TRANSPORT_TYPE_OPTIONS}
 TRANSPORT_TYPE_NAME_TO_INDEX = {name: idx for idx, name, _ in TRANSPORT_TYPE_OPTIONS}
@@ -2789,7 +2792,7 @@ def normalize_endpoint_type(value, default="tcp"):
 
 
 def endpoint_supports_path(transport_type):
-    return normalize_endpoint_type(transport_type) in {"ws", "wss", "httpmimicry", "httpsmimicry"}
+    return normalize_endpoint_type(transport_type) in {"ws", "wss", "httpmimicry", "httpsmimicry", "cdn"}
 
 
 def endpoint_uses_tls(transport_type):
@@ -2798,7 +2801,7 @@ def endpoint_uses_tls(transport_type):
 
 def endpoint_needs_raw_cap(transport_type):
     """Returns True if the transport requires CAP_NET_RAW (AF_PACKET / pcap)."""
-    return normalize_endpoint_type(transport_type) in {"phantom", "antifilter", "dnstunnel"}
+    return normalize_endpoint_type(transport_type) in {"phantom", "antifilter", "dnstunnel", "tun"}
 
 
 def endpoint_is_dnstunnel(transport_type):
@@ -2922,14 +2925,41 @@ def prompt_dnstunnel_config(role):
             break
         print_error("Invalid choice.")
 
-    # TUN interface settings
-    if role == "server":
-        cfg["tun_name"] = input_default("TUN interface name", "dtun0").strip()
-        cfg["tun_ip"] = input_default("TUN IP/CIDR (server side)", "10.99.0.1/24").strip()
+    # ── Port mappings (required for forwarding) ─────────────────────────────
+    print()
+    if role == "client":
+        print_info(
+            "Port mappings define which local ports to listen on (Iran side).\n"
+            "Traffic is forwarded over DNS to the server (Kharej), which dials the target."
+        )
+        cfg["mappings"] = prompt_server_mappings(
+            fixed_mode="direct",
+            bind_side_label="Iran (this client)",
+            target_side_label="Kharej (server dials target)",
+        )
     else:
-        cfg["tun_name"] = input_default("TUN interface name", "dtun0").strip()
-        cfg["tun_ip"] = input_default("TUN IP/CIDR (client side)", "10.99.0.2/24").strip()
-    cfg["tun_mtu"] = int(input_default("TUN MTU", "1280").strip())
+        print_info(
+            "The server does not need port mappings — it receives streams from the client\n"
+            "and dials the target address carried in each stream."
+        )
+        cfg["mappings"] = []
+
+    # ── TUN interface (optional, Linux only) ──────────────────────────────────
+    enable_tun = input_default("Enable TUN interface? (advanced, Linux only) (y/N)", "n").strip().lower()
+    if enable_tun in {"y", "yes"}:
+        cfg["tun_enabled"] = True
+        if role == "server":
+            cfg["tun_name"] = input_default("TUN interface name", "dtun0").strip()
+            cfg["tun_ip"] = input_default("TUN IP/CIDR (server side)", "10.99.0.1/24").strip()
+        else:
+            cfg["tun_name"] = input_default("TUN interface name", "dtun0").strip()
+            cfg["tun_ip"] = input_default("TUN IP/CIDR (client side)", "10.99.0.2/24").strip()
+        cfg["tun_mtu"] = int(input_default("TUN MTU", "1280").strip())
+    else:
+        cfg["tun_enabled"] = False
+        cfg["tun_name"] = ""
+        cfg["tun_ip"] = ""
+        cfg["tun_mtu"] = 1280
 
     # Sliding window
     cfg["window_size"] = int(input_default("Sliding window size (frames)", "32").strip())
@@ -2971,10 +3001,29 @@ def build_dnstunnel_config_text(role, dns_cfg):
         f"  record_type: {yaml_scalar(dns_cfg['record_type'])}",
         f"  encoding: {yaml_scalar(dns_cfg['encoding'])}",
         "",
+    ])
+
+    # Port mappings (client only, but include for both so config is self-documenting)
+    mappings = dns_cfg.get("mappings", [])
+    if mappings:
+        lines.append("  mappings:")
+        for m in mappings:
+            lines.append(f"    - name: {yaml_scalar(m['name'])}")
+            lines.append(f"      protocol: {yaml_scalar(m['protocol'])}")
+            lines.append(f"      bind: {yaml_scalar(m['bind'])}")
+            lines.append(f"      target: {yaml_scalar(m['target'])}")
+        lines.append("")
+    else:
+        lines.extend(["  mappings: []", ""])
+
+    # TUN interface (optional)
+    tun_enabled = dns_cfg.get("tun_enabled", False)
+    lines.extend([
         "  tun:",
-        f"    name: {yaml_scalar(dns_cfg['tun_name'])}",
-        f"    ip: {yaml_scalar(dns_cfg['tun_ip'])}",
-        f"    mtu: {yaml_scalar(dns_cfg['tun_mtu'])}",
+        f"    enabled: {yaml_scalar(tun_enabled)}",
+        f"    name: {yaml_scalar(dns_cfg.get('tun_name', 'dtun0'))}",
+        f"    ip: {yaml_scalar(dns_cfg.get('tun_ip', ''))}",
+        f"    mtu: {yaml_scalar(dns_cfg.get('tun_mtu', 1280))}",
         "",
         "  window:",
         f"    size: {yaml_scalar(dns_cfg['window_size'])}",
@@ -3008,17 +3057,22 @@ def generate_dnstunnel_config(role, dns_cfg, instance):
 
 
 def install_dnstunnel_flow():
-    """Interactive flow for installing the DNS tunnel."""
-    print_header("📡 DNS Tunnel Setup")
+    """Interactive flow for installing the DNS tunnel (direct mode).
+
+    Direct tunnel:
+      Server = Kharej (abroad) — runs authoritative DNS on port 53
+      Client = Iran (censored)  — binds local ports, forwards over DNS
+    """
+    print_header("📡 DNS Tunnel Setup (Direct Mode)")
     print_menu(
         "Select Role",
         [
-            f"{Colors.GREEN}[1]{Colors.ENDC} Server (authoritative DNS, e.g. Iran side)",
-            f"{Colors.GREEN}[2]{Colors.ENDC} Client (tunnel initiator, e.g. Kharej side)",
+            f"{Colors.GREEN}[1]{Colors.ENDC} Server (Kharej / abroad — authoritative DNS, dials targets)",
+            f"{Colors.GREEN}[2]{Colors.ENDC} Client (Iran / censored — binds local ports, tunnels over DNS)",
             f"{Colors.WARNING}[0]{Colors.ENDC} Cancel",
         ],
         color=Colors.CYAN,
-        min_width=56,
+        min_width=64,
     )
 
     while True:
@@ -3045,7 +3099,8 @@ def install_dnstunnel_flow():
     )
 
     print_header("✅ DNS Tunnel Installation Complete")
-    print(f"Role:        {Colors.BOLD}{role}{Colors.ENDC}")
+    role_label = "Kharej (abroad)" if role == "server" else "Iran (censored)"
+    print(f"Role:        {Colors.BOLD}{role} — {role_label}{Colors.ENDC}")
     print(f"Instance:    {Colors.BOLD}{instance}{Colors.ENDC}")
     print(f"Config:      {Colors.BOLD}{config_path}{Colors.ENDC}")
     print(f"Base Domain: {Colors.BOLD}{dns_cfg['base_domain']}{Colors.ENDC}")
@@ -3053,15 +3108,25 @@ def install_dnstunnel_flow():
     print(f"Transport:   {Colors.BOLD}{dns_cfg['dns_transport']}{Colors.ENDC}")
     print(f"Record Type: {Colors.BOLD}{dns_cfg['record_type']}{Colors.ENDC}")
     print(f"Encoding:    {Colors.BOLD}{dns_cfg['encoding']}{Colors.ENDC}")
-    print(f"TUN:         {Colors.BOLD}{dns_cfg['tun_name']} ({dns_cfg['tun_ip']}, MTU {dns_cfg['tun_mtu']}){Colors.ENDC}")
+    if dns_cfg.get("tun_enabled"):
+        print(f"TUN:         {Colors.BOLD}{dns_cfg['tun_name']} ({dns_cfg['tun_ip']}, MTU {dns_cfg['tun_mtu']}){Colors.ENDC}")
+    else:
+        print(f"TUN:         {Colors.BOLD}disabled{Colors.ENDC}")
     print(f"Window:      {Colors.BOLD}{dns_cfg['window_size']} frames{Colors.ENDC}")
     print(f"Jitter:      {Colors.BOLD}{'enabled' if dns_cfg['jitter_enabled'] else 'disabled'}{Colors.ENDC}")
     if role == "server":
         print(f"Listen:      {Colors.BOLD}{dns_cfg.get('listen_addr', ':53')}{Colors.ENDC}")
+    mappings = dns_cfg.get("mappings", [])
+    if mappings:
+        print(f"Mappings:    {Colors.BOLD}{len(mappings)} port forwarding rule(s){Colors.ENDC}")
+        for m in mappings:
+            print(f"  ├─ {m['name']}: {m['protocol']} {m['bind']} → {m['target']}")
     print()
     print_info("Ensure the same PSK and base domain are configured on both client and server.")
     if role == "server":
         print_info("Point an NS record for the tunnel domain to this server's IP.")
+    if role == "client" and mappings:
+        print_info("The client will listen on the bind ports above and forward traffic over DNS.")
 
 
 def ensure_caddy_installed():
@@ -3097,25 +3162,203 @@ def ensure_caddy_installed():
 
 
 def setup_caddy_for_phantom(domain, internal_port, ws_path):
-    """Install Caddy, generate Caddyfile, and start the service."""
+    """Install Caddy, generate Caddyfile, and start the service.
+
+    Attempts trusted ACME cert first. If that fails (or domain is an IP / internal),
+    falls back to a self-signed certificate so HTTPS always works.
+    """
     ensure_caddy_installed()
+
+    site_root = f"/var/www/{domain}" if domain else "/var/www/phantom"
+    os.makedirs(site_root, exist_ok=True)
+    with open(os.path.join(site_root, "index.html"), "w") as f:
+        f.write("<html><body>Welcome</body></html>")
+
+    # Build Caddyfile — try trusted TLS first.
     caddyfile = f"""{domain} {{
     handle {ws_path} {{
         reverse_proxy localhost:{internal_port}
     }}
     handle {{
-        root * /var/www/{domain}
+        root * {site_root}
         file_server
     }}
 }}"""
-    os.makedirs(f"/var/www/{domain}", exist_ok=True)
-    with open(f"/var/www/{domain}/index.html", "w") as f:
-        f.write("<html><body>Welcome</body></html>")
+
+    os.makedirs("/etc/caddy", exist_ok=True)
     with open("/etc/caddy/Caddyfile", "w") as f:
         f.write(caddyfile)
     run_command("systemctl enable --now caddy", check=False)
     run_command("systemctl reload caddy", check=False)
-    print_success(f"✅ Caddy configured: {domain} → ws_path={ws_path} → localhost:{internal_port}")
+
+    # Give Caddy a moment to attempt ACME, then check if it's healthy.
+    import time
+    time.sleep(3)
+    rc, stdout, _ = run_command_output("systemctl is-active caddy")
+    caddy_ok = rc == 0 and "active" in stdout.lower()
+
+    if not caddy_ok:
+        print_warning("⚠️  Caddy failed to obtain a trusted certificate — falling back to self-signed.")
+        _setup_phantom_self_signed(domain, internal_port, ws_path, site_root)
+    else:
+        print_success(f"✅ Caddy configured (trusted TLS): {domain} → ws_path={ws_path} → localhost:{internal_port}")
+
+
+def _setup_phantom_self_signed(domain, internal_port, ws_path, site_root):
+    """Generate a self-signed cert via openssl and configure Caddy to use it."""
+    cert_dir = "/etc/caddy/certs"
+    os.makedirs(cert_dir, exist_ok=True)
+    cert_path = os.path.join(cert_dir, "phantom.crt")
+    key_path = os.path.join(cert_dir, "phantom.key")
+
+    cn = domain or "phantom.local"
+    san = f"DNS:{domain}" if domain and not _is_ip(domain) else f"IP:{domain}" if domain else "DNS:phantom.local"
+
+    openssl_cmd = (
+        f'openssl req -x509 -newkey rsa:2048 '
+        f'-keyout "{key_path}" -out "{cert_path}" '
+        f'-days 3650 -nodes '
+        f'-subj "/CN={cn}" '
+        f'-addext "subjectAltName={san}"'
+    )
+    ret = run_command(openssl_cmd, check=False)
+
+    if not ret or not os.path.exists(cert_path):
+        # Retry without -addext (older openssl)
+        openssl_cmd_fallback = (
+            f'openssl req -x509 -newkey rsa:2048 '
+            f'-keyout "{key_path}" -out "{cert_path}" '
+            f'-days 3650 -nodes '
+            f'-subj "/CN={cn}"'
+        )
+        run_command(openssl_cmd_fallback, check=False)
+
+    if not os.path.exists(cert_path) or not os.path.exists(key_path):
+        print_error("❌ Failed to generate self-signed certificate. HTTPS will not work.")
+        return
+
+    # Caddyfile with explicit self-signed cert
+    listen_addr = domain if domain else ":443"
+    caddyfile = f"""{listen_addr} {{
+    tls {cert_path} {key_path}
+    handle {ws_path} {{
+        reverse_proxy localhost:{internal_port}
+    }}
+    handle {{
+        root * {site_root}
+        file_server
+    }}
+}}"""
+    with open("/etc/caddy/Caddyfile", "w") as f:
+        f.write(caddyfile)
+    run_command("systemctl reload caddy", check=False)
+    print_success(
+        f"✅ Caddy configured (self-signed TLS): {listen_addr} → ws_path={ws_path} → localhost:{internal_port}\n"
+        f"   Cert: {cert_path}  Key: {key_path}"
+    )
+
+
+def _is_ip(value):
+    """Check if value looks like an IP address."""
+    import ipaddress
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def detect_default_interface():
+    """Auto-detect the default network interface by querying the routing table.
+
+    Strategy:
+      1. ``ip route get 8.8.8.8`` — most reliable; returns the interface used
+         to reach the Internet.
+      2. ``ip route show default`` — fallback; parses the 'dev' field from
+         the default route.
+      3. Scan /sys/class/net for the first non-lo, non-virtual interface.
+      4. Fall back to "eth0".
+    """
+    # --- method 1: ip route get -------------------------------------------
+    try:
+        rc, out, _ = run_command_output("ip route get 8.8.8.8")
+        if rc == 0 and out:
+            m = re.search(r'dev\s+(\S+)', out)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+
+    # --- method 2: ip route show default ----------------------------------
+    try:
+        rc, out, _ = run_command_output("ip route show default")
+        if rc == 0 and out:
+            m = re.search(r'dev\s+(\S+)', out)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+
+    # --- method 3: scan /sys/class/net ------------------------------------
+    try:
+        net_dir = "/sys/class/net"
+        if os.path.isdir(net_dir):
+            for name in sorted(os.listdir(net_dir)):
+                if name == "lo":
+                    continue
+                # Skip virtual / tunnel devices
+                if os.path.islink(os.path.join(net_dir, name, "device")) or \
+                   os.path.exists(os.path.join(net_dir, name, "address")):
+                    addr_path = os.path.join(net_dir, name, "address")
+                    if os.path.exists(addr_path):
+                        mac = open(addr_path).read().strip()
+                        if mac and mac != "00:00:00:00:00:00":
+                            return name
+    except Exception:
+        pass
+
+    return "eth0"
+
+
+def get_interface_mac(iface):
+    """Return the MAC address of the given interface, or empty string."""
+    # --- method 1: /sys/class/net/<iface>/address -------------------------
+    try:
+        path = f"/sys/class/net/{iface}/address"
+        if os.path.exists(path):
+            mac = open(path).read().strip()
+            if mac and mac != "00:00:00:00:00:00":
+                return mac
+    except Exception:
+        pass
+
+    # --- method 2: ip link show --------------------------------------------
+    try:
+        rc, out, _ = run_command_output(f"ip link show {shlex.quote(iface)}")
+        if rc == 0 and out:
+            m = re.search(r'link/ether\s+([0-9a-fA-F:]{17})', out)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+
+    return ""
+
+
+def prompt_interface_with_autodetect(label="Network interface", existing_value=""):
+    """Prompt for network interface with auto-detection and MAC display."""
+    detected = detect_default_interface()
+    default_iface = existing_value or detected
+    mac = get_interface_mac(detected)
+    if mac:
+        print_info(f"🔍 Detected default interface: {detected} (MAC: {mac})")
+    else:
+        print_info(f"🔍 Detected default interface: {detected}")
+    iface = input_default(label, default_iface).strip() or default_iface
+    chosen_mac = get_interface_mac(iface)
+    if iface != detected and chosen_mac:
+        print_info(f"   Interface {iface} MAC: {chosen_mac}")
+    return iface
 
 
 def prompt_phantom_config(existing=None):
@@ -3123,7 +3366,7 @@ def prompt_phantom_config(existing=None):
     existing = existing or {}
     print_header("🛡️ Phantom Transport Configuration")
     domain = input_default("Domain for Caddy TLS (e.g. example.com)", existing.get("domain", "")).strip()
-    iface = input_default("Network interface", existing.get("interface", "eth0")).strip() or "eth0"
+    iface = prompt_interface_with_autodetect("Network interface", existing.get("interface", ""))
     ws_path = input_default("WebSocket tunnel path", existing.get("ws_path", "/tunnel/stream")).strip() or "/tunnel/stream"
     psk = input_default("Packet encryption PSK (empty = auto-generate)", existing.get("psk", "")).strip()
     if not psk:
@@ -3139,11 +3382,47 @@ def prompt_phantom_config(existing=None):
     }
 
 
+def ensure_antifilter_deps():
+    """Install libpcap / AF_PACKET dependencies if not already present.
+
+    AF_PACKET is built into the Linux kernel (≥3.x) so it's always available.
+    libpcap is needed if capture_mode=pcap is chosen, and also provides the
+    header files needed to compile Go code that uses gopacket/pcap.
+    """
+    # libpcap runtime + dev headers
+    if os.path.exists("/usr/lib/x86_64-linux-gnu/libpcap.so") or os.path.exists("/usr/lib64/libpcap.so"):
+        print_info("✅ libpcap already installed")
+    else:
+        print_info("📦 Installing libpcap (required for AntiFilter raw capture)...")
+        if os.path.exists("/etc/debian_version"):
+            run_command("apt-get update -qq && apt-get install -y libpcap-dev", check=False)
+        elif os.path.exists("/etc/redhat-release"):
+            run_command("dnf install -y libpcap-devel || yum install -y libpcap-devel", check=False)
+        elif os.path.exists("/etc/arch-release"):
+            run_command("pacman -Sy --noconfirm libpcap", check=False)
+        elif os.path.exists("/etc/alpine-release"):
+            run_command("apk add libpcap-dev", check=False)
+        else:
+            print_warning("⚠️  Could not detect distro. Please install libpcap-dev manually.")
+            return
+        # Verify
+        if shutil.which("pcap-config") or os.path.exists("/usr/include/pcap.h") or os.path.exists("/usr/include/pcap/pcap.h"):
+            print_success("✅ libpcap installed successfully")
+        else:
+            print_warning("⚠️  libpcap installation may have failed. AntiFilter pcap mode may not work.")
+
+    # AF_PACKET is a kernel feature — just verify the header exists for builds
+    if os.path.exists("/usr/include/linux/if_packet.h"):
+        print_info("✅ AF_PACKET kernel support detected")
+    else:
+        print_info("ℹ️  AF_PACKET header not found (usually fine on modern kernels)")
+
+
 def prompt_antifilter_config(existing=None):
     """Prompt for AntiFilter transport settings."""
     existing = existing or {}
     print_header("🔥 AntiFilter Transport Configuration")
-    iface = input_default("Network interface", existing.get("interface", "eth0")).strip() or "eth0"
+    iface = prompt_interface_with_autodetect("Network interface", existing.get("interface", ""))
     capture_mode = input_default("Capture mode (afpacket / pcap)", existing.get("capture_mode", "afpacket")).strip().lower()
     if capture_mode not in {"afpacket", "pcap"}:
         capture_mode = "afpacket"
@@ -3168,6 +3447,114 @@ def prompt_antifilter_config(existing=None):
     }
 
 
+def ensure_tun_deps():
+    """Ensure the TUN kernel module is loaded and /dev/net/tun exists.
+
+    Many VPS providers have TUN/TAP support compiled as a module but do not
+    load it at boot.  This function loads it proactively so the binary
+    doesn't fail at runtime.
+    """
+    if os.path.exists("/dev/net/tun"):
+        print_info("✅ /dev/net/tun already exists")
+    else:
+        print_info("📦 Loading TUN kernel module...")
+        run_command("modprobe tun", check=False)
+        if not os.path.exists("/dev/net"):
+            run_command("mkdir -p /dev/net", check=False)
+        if not os.path.exists("/dev/net/tun"):
+            run_command("mknod /dev/net/tun c 10 200 && chmod 666 /dev/net/tun", check=False)
+        if os.path.exists("/dev/net/tun"):
+            print_success("✅ /dev/net/tun created successfully")
+        else:
+            print_error("❌ Failed to create /dev/net/tun. TUN/TAP may not be available on this kernel.")
+
+
+def prompt_tun_transport_config(existing=None):
+    """Prompt for TUN Mode transport settings."""
+    existing = existing or {}
+    print_header("🔧 TUN Mode Transport Configuration")
+    print_info("This creates a L3 TUN tunnel with IPX encapsulation and BIP framing.")
+    print_info("Traffic appears as legacy Novell NetWare IPX — invisible to most DPI.")
+    iface = prompt_interface_with_autodetect("Network interface", existing.get("interface", ""))
+    tun_name = input_default("TUN device name", existing.get("tun_name", "ntun0")).strip() or "ntun0"
+    local_ip = input_default("Local TUN IP (CIDR, e.g. 10.0.0.1/30)", existing.get("local_ip", "10.0.0.1/30")).strip()
+    peer_ip = input_default("Peer TUN IP (e.g. 10.0.0.2)", existing.get("peer_ip", "10.0.0.2")).strip()
+    mtu = prompt_int("TUN MTU", existing.get("mtu", 1400))
+    psk = input_default("Encryption PSK (empty = auto-generate)", existing.get("psk", "")).strip()
+    if not psk:
+        psk = secrets.token_urlsafe(32)
+        print_info(f"Auto-generated PSK: {psk}")
+    return {
+        "interface": iface,
+        "tun_name": tun_name,
+        "local_ip": local_ip,
+        "peer_ip": peer_ip,
+        "mtu": mtu,
+        "psk": psk,
+    }
+
+
+def prompt_cdn_config(existing=None, role="server"):
+    """Prompt for CDN transport settings (HTTP/HTTPS WebSocket through CDN)."""
+    existing = existing or {}
+    print_header("🌐 CDN Transport Configuration")
+    print_info("This transport tunnels through a CDN (e.g. Cloudflare) using WebSocket.")
+    print_info("Traffic looks like regular HTTPS/WebSocket to the CDN and censors.")
+    print_info("")
+    print_info("Prerequisites:")
+    print_info("  1. Register your domain with a CDN (e.g. Cloudflare)")
+    print_info("  2. Point the domain DNS (A/AAAA record) to your origin server IP")
+    print_info("  3. Enable CDN proxying (orange cloud in Cloudflare)")
+    print_info("  4. Enable WebSocket in CDN settings (Cloudflare: Network → WebSockets)")
+    print_info("")
+    domain = input_default(
+        "CDN domain (e.g. tunnel.example.com)",
+        existing.get("domain", ""),
+    ).strip()
+    while not domain:
+        print_error("Domain is required for CDN transport.")
+        domain = input_default("CDN domain", "").strip()
+
+    # Scheme selection
+    print_info("")
+    print_info("CDN routing scheme:")
+    print_info("  [1] wss  — HTTPS + WebSocket (recommended, Cloudflare Full/Strict SSL)")
+    print_info("  [2] ws   — HTTP  + WebSocket (Cloudflare Flexible SSL, no TLS on origin)")
+    scheme_default = "1" if existing.get("scheme", "wss") in {"wss", "https", ""} else "2"
+    scheme_choice = input_default("Scheme [1=wss / 2=ws]", scheme_default).strip()
+    if scheme_choice == "2":
+        scheme = "ws"
+    else:
+        scheme = "wss"
+
+    # CDN edge port
+    if scheme == "wss":
+        print_info("Cloudflare HTTPS ports: 443, 2053, 2083, 2087, 2096, 8443")
+        cdn_port_default = existing.get("cdn_port", 443)
+    else:
+        print_info("Cloudflare HTTP ports: 80, 8080, 8880, 2052, 2082, 2086, 2095")
+        cdn_port_default = existing.get("cdn_port", 80)
+    cdn_port = prompt_int("CDN edge port", cdn_port_default)
+
+    # WebSocket path
+    path = input_default(
+        "WebSocket tunnel path",
+        existing.get("path", "/cdn-tunnel"),
+    ).strip() or "/cdn-tunnel"
+
+    if role == "server" and scheme == "wss":
+        print_info("")
+        print_info("ℹ️  Full/Strict SSL mode requires a TLS certificate on the origin.")
+        print_info("   You can use a Cloudflare Origin Certificate or Let's Encrypt.")
+
+    return {
+        "domain": domain,
+        "cdn_port": cdn_port,
+        "scheme": scheme,
+        "path": path,
+    }
+
+
 def empty_tls_config():
     return {
         "cert_file": "",
@@ -3185,6 +3572,8 @@ def default_path_for_transport(transport_type):
         return "/ws"
     if transport_type in {"httpmimicry", "httpsmimicry"}:
         return "/api/v1/upload"
+    if transport_type == "cdn":
+        return "/cdn-tunnel"
     return "/tunnel"
 
 
@@ -4225,7 +4614,13 @@ def prompt_license_id():
 
 def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deployment_mode="default"):
     back_signal = "__BACK_TO_TRANSPORT_MENU__"
-    options = [(idx, label) for idx, _, label in TRANSPORT_TYPE_OPTIONS]
+    # Show all transport protocols except DNS Tunnel (12), which has its own
+    # dedicated setup flow via install_dnstunnel_flow().
+    STANDARD_PROTOCOL_OPTIONS = [
+        (idx, name, label) for idx, name, label in TRANSPORT_TYPE_OPTIONS
+        if name != "dnstunnel"
+    ]
+    options = [(idx, label) for idx, _, label in STANDARD_PROTOCOL_OPTIONS]
     print_menu(
         "📜 Select Protocol",
         [f"{Colors.GREEN}[{key}]{Colors.ENDC} {name}" for key, name in options],
@@ -4233,26 +4628,18 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         min_width=44,
     )
 
-    type_to_choice = {
-        "tcp": "1",
-        "tls": "2",
-        "ws": "3",
-        "wss": "4",
-        "kcp": "5",
-        "quic": "6",
-        "httpsmimicry": "7",
-        "httpmimicry": "8",
-        "reality": "9",
-    }
+    type_to_choice = {name: idx for idx, name, _ in STANDARD_PROTOCOL_OPTIONS}
+    valid_choices = {idx for idx, _, _ in STANDARD_PROTOCOL_OPTIONS}
+    max_label = max(int(idx) for idx, _, _ in STANDARD_PROTOCOL_OPTIONS)
     default_choice = "1"
     if isinstance(defaults, dict):
         default_choice = type_to_choice.get(str(defaults.get("type", "")).strip().lower(), "1")
 
     while True:
-        choice = input_default(f"\n{Colors.BOLD}Enter choice [1-9]{Colors.ENDC}", default_choice).strip()
-        if choice in {str(i) for i in range(1, 10)}:
+        choice = input_default(f"\n{Colors.BOLD}Enter choice [1-{max_label}]{Colors.ENDC}", default_choice).strip()
+        if choice in valid_choices:
             break
-        print_error("Invalid choice. Pick a number between 1 and 9.")
+        print_error(f"Invalid choice. Pick one of the listed options.")
 
     advanced_mode = str(deployment_mode).strip().lower() == "advanced"
     config = {
@@ -4570,6 +4957,43 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
                 config["generated_private_key"],
                 config["reality_key_generated"],
             ) = prompt_reality_public_key(config.get("public_key", ""))
+
+    elif choice == "10":
+        config["type"] = "phantom"
+        config["port"] = prompt_or_keep_port(443)
+        phantom_cfg = prompt_phantom_config(config.get("phantom", {}))
+        config["phantom"] = phantom_cfg
+        if phantom_cfg.get("domain"):
+            setup_caddy_for_phantom(
+                phantom_cfg["domain"],
+                phantom_cfg.get("internal_port", 8443),
+                phantom_cfg.get("ws_path", "/tunnel/stream"),
+            )
+
+    elif choice == "11":
+        config["type"] = "antifilter"
+        config["port"] = prompt_or_keep_port(443)
+        ensure_antifilter_deps()
+        antifilter_cfg = prompt_antifilter_config(config.get("antifilter", {}))
+        config["antifilter"] = antifilter_cfg
+
+    elif choice == "13":
+        config["type"] = "tun"
+        ensure_tun_deps()
+        tun_cfg = prompt_tun_transport_config(config.get("tun", {}))
+        config["tun"] = tun_cfg
+
+    elif choice == "14":
+        config["type"] = "cdn"
+        cdn_cfg = prompt_cdn_config(config.get("cdn", {}), role=role)
+        config["cdn"] = cdn_cfg
+        # CDN with Full SSL (wss) needs TLS cert on the origin server
+        cdn_scheme = str(cdn_cfg.get("scheme", "wss")).strip().lower()
+        if cdn_scheme in {"wss", "https"} and role == "server":
+            config["port"] = prompt_or_keep_port(443)
+        else:
+            config["port"] = prompt_or_keep_port(80)
+        config["path"] = cdn_cfg.get("path", "/cdn-tunnel")
 
     if str(config.get("type", "")).strip().lower() != "httpmimicry":
         config["allow_plaintext_framing"] = False
@@ -5772,7 +6196,7 @@ def build_server_primary_endpoint(protocol_config):
     else:
         address = f":{protocol_config.get('port', 8443)}"
     port_hopping_cfg = normalize_port_hopping_cfg(protocol_config.get("port_hopping", {}), {})
-    return normalize_transport_endpoint(
+    result = normalize_transport_endpoint(
         {
             "type": endpoint_type,
             "address": address,
@@ -5796,6 +6220,12 @@ def build_server_primary_endpoint(protocol_config):
         fallback_reality=build_primary_endpoint_reality("server", protocol_config, endpoint_type),
         fallback_port_hopping=port_hopping_cfg,
     )
+    # Inject transport-specific sub-configs that normalize_transport_endpoint does not preserve
+    for _ts_key in ("phantom", "antifilter", "tun", "cdn"):
+        _ts_val = protocol_config.get(_ts_key)
+        if isinstance(_ts_val, dict) and _ts_val:
+            result[_ts_key] = _ts_val
+    return result
 
 
 def build_client_primary_endpoint(protocol_config):
@@ -5808,7 +6238,7 @@ def build_client_primary_endpoint(protocol_config):
     if endpoint_type in {"ws", "wss"}:
         url = resolve_ws_url({"type": endpoint_type}, address, path)
     port_hopping_cfg = normalize_port_hopping_cfg(protocol_config.get("port_hopping", {}), {})
-    return normalize_transport_endpoint(
+    result = normalize_transport_endpoint(
         {
             "type": endpoint_type,
             "address": address,
@@ -5832,6 +6262,12 @@ def build_client_primary_endpoint(protocol_config):
         fallback_reality=build_primary_endpoint_reality("client", protocol_config, endpoint_type),
         fallback_port_hopping=port_hopping_cfg,
     )
+    # Inject transport-specific sub-configs that normalize_transport_endpoint does not preserve
+    for _ts_key in ("phantom", "antifilter", "tun", "cdn"):
+        _ts_val = protocol_config.get(_ts_key)
+        if isinstance(_ts_val, dict) and _ts_val:
+            result[_ts_key] = _ts_val
+    return result
 
 
 def build_all_endpoints_for_render(role, protocol_config, primary_endpoint):
@@ -6140,6 +6576,31 @@ def render_transport_endpoints_list_lines(
                     f"{indent}      parity_shards: {yaml_scalar(af_cfg.get('parity_shards', 3))}",
                     f"{indent}      noise_cover: {yaml_scalar(af_cfg.get('noise_cover', 0.05))}",
                     f"{indent}      psk: {yaml_scalar(af_cfg.get('psk', ''))}",
+                ]
+            )
+        # TUN Mode transport config
+        if ep_type == "tun":
+            tun_cfg = endpoint.get("tun", {}) if isinstance(endpoint.get("tun"), dict) else {}
+            lines.extend(
+                [
+                    f"{indent}    tun:",
+                    f"{indent}      interface: {yaml_scalar(tun_cfg.get('interface', 'eth0'))}",
+                    f"{indent}      tun_name: {yaml_scalar(tun_cfg.get('tun_name', 'ntun0'))}",
+                    f"{indent}      local_ip: {yaml_scalar(tun_cfg.get('local_ip', ''))}",
+                    f"{indent}      peer_ip: {yaml_scalar(tun_cfg.get('peer_ip', ''))}",
+                    f"{indent}      mtu: {yaml_scalar(tun_cfg.get('mtu', 1400))}",
+                    f"{indent}      psk: {yaml_scalar(tun_cfg.get('psk', ''))}",
+                ]
+            )
+        # CDN transport config
+        if ep_type == "cdn":
+            cdn_cfg = endpoint.get("cdn", {}) if isinstance(endpoint.get("cdn"), dict) else {}
+            lines.extend(
+                [
+                    f"{indent}    cdn:",
+                    f"{indent}      domain: {yaml_scalar(cdn_cfg.get('domain', ''))}",
+                    f"{indent}      cdn_port: {yaml_scalar(cdn_cfg.get('cdn_port', 443))}",
+                    f"{indent}      scheme: {yaml_scalar(cdn_cfg.get('scheme', 'wss'))}",
                 ]
             )
     return lines
@@ -7381,6 +7842,31 @@ def install_tunnel_flow(tunnel_type):
         print_error(f"Unknown tunnel type: {tunnel_type}")
         return
 
+    # For direct mode, offer DNS Tunnel as a sub-option
+    if tunnel_type == "direct":
+        print_header(f"🧭 {profile['label']} Setup")
+        print_menu(
+            "Tunnel Method",
+            [
+                f"{Colors.GREEN}[1]{Colors.ENDC} 🌐 Standard Transport (TCP/TLS/WS/QUIC/CDN/...)",
+                f"{Colors.GREEN}[2]{Colors.ENDC} 📡 DNS Tunnel (stealth DNS-based tunnel)",
+                f"{Colors.WARNING}[0]{Colors.ENDC} Cancel",
+            ],
+            color=Colors.CYAN,
+            min_width=58,
+        )
+        while True:
+            method_choice = input("Select method [1/2/0]: ").strip()
+            if method_choice == "0":
+                print_info("Tunnel setup cancelled.")
+                return
+            if method_choice == "2":
+                install_dnstunnel_flow()
+                return
+            if method_choice == "1":
+                break
+            print_error("Invalid choice.")
+
     print_header(f"🧭 {profile['label']} Setup")
     print_menu(
         "Select Node Role",
@@ -7461,8 +7947,7 @@ def main_menu():
                 f"{Colors.CYAN}[8]{Colors.ENDC} 🧷 Install nodelay-manager alias",
                 f"{Colors.CYAN}[9]{Colors.ENDC} ⬆️ Update nodelay-manager script",
                 f"{Colors.CYAN}[10]{Colors.ENDC} 🌌 Find best REALITY SNI (Run on Tunnel Client)",
-                f"{Colors.CYAN}[11]{Colors.ENDC} � DNS Tunnel Setup (stealth DNS-based tunnel)",
-                f"{Colors.CYAN}[12]{Colors.ENDC} �🗑️  Uninstall",
+                f"{Colors.CYAN}[11]{Colors.ENDC} 🗑️  Uninstall",
                 f"{Colors.WARNING}[0]{Colors.ENDC} 🚪 Exit",
             ],
             color=Colors.CYAN,
@@ -7521,12 +8006,6 @@ def main_menu():
             input("\nPress Enter to continue...")
 
         elif choice == "11":
-            check_root()
-            if ensure_binary():
-                install_dnstunnel_flow()
-                input("\nPress Enter to continue...")
-
-        elif choice == "12":
             uninstall_everything()
             input("\nPress Enter to continue...")
 
