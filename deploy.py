@@ -5125,16 +5125,16 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         config.get("ping_keepalive", {}),
     )
 
-    # Anti-DPI / MTU fragmentation — client-side only
-    if role == "client":
-        config["frag"] = prompt_frag_config(config.get("frag", {}))
+    # Anti-DPI / MTU fragmentation — both client and server
+    config["frag"] = prompt_frag_config(config.get("frag", {}), role=role)
 
     return config
 
 
-def prompt_frag_config(existing=None):
-    """Prompt for Anti-DPI / MTU fragmentation settings (client-side only)."""
+def prompt_frag_config(existing=None, role="client"):
+    """Prompt for Anti-DPI / MTU fragmentation settings (client and server)."""
     existing = existing or {}
+    is_server = (role == "server")
     print_header("🛡️ Anti-DPI / MTU Fragmentation")
     print_info("MTU fragmentation splits ALL outgoing traffic into small TCP chunks.")
     print_info("This defeats DPI systems that rely on packet-size heuristics or")
@@ -5143,8 +5143,11 @@ def prompt_frag_config(existing=None):
     print_info("How it works:")
     print_info("  • Every write is split into small fragments (e.g. 200 bytes)")
     print_info("  • TCP MSS is clamped to enforce kernel-level small segments")
-    print_info("  • TLS ClientHello SNI is split across TCP segments")
+    if not is_server:
+        print_info("  • TLS ClientHello SNI is split across TCP segments")
     print_info("  • Optional inter-fragment delay spreads packets over time")
+    if is_server:
+        print_info("  • Applied to BOTH directions: server→client writes are fragmented")
     print_info("")
 
     # MTU fragmentation (main feature) — enabled by default for all transports
@@ -5154,7 +5157,18 @@ def prompt_frag_config(existing=None):
     ).strip().lower() not in {"n", "no"}
 
     if not mtu_enabled:
-        # Also ask about ClientHello-only fragmentation
+        if is_server:
+            # Server doesn't need ClientHello fragmentation
+            return {
+                "enabled": False,
+                "split_pos": 0,
+                "fake_ttl": 0,
+                "reverse_order": False,
+                "mtu_enabled": False,
+                "fragment_size": 0,
+                "fragment_delay": "",
+            }
+        # Client: also ask about ClientHello-only fragmentation
         ch_default = "y" if existing.get("enabled", False) else "n"
         ch_enabled = input_default(
             "Enable TLS ClientHello fragmentation only? (y/N)", ch_default
@@ -5190,6 +5204,18 @@ def prompt_frag_config(existing=None):
     ).strip()
     if fragment_delay in {"0", "0ms", "0s", ""}:
         fragment_delay = ""
+
+    if is_server:
+        # Server doesn't need ClientHello fragmentation
+        return {
+            "enabled": False,
+            "split_pos": 0,
+            "fake_ttl": 0,
+            "reverse_order": False,
+            "mtu_enabled": True,
+            "fragment_size": fragment_size,
+            "fragment_delay": fragment_delay,
+        }
 
     # ClientHello fragmentation — disabled by default, even with MTU frag
     ch_default = "y" if existing.get("enabled", False) else "n"
@@ -6930,11 +6956,19 @@ def build_server_config_text(protocol_config, tuning, obfuscation_cfg):
     lines.extend(
         [
             "",
+        ]
+    )
+    frag_cfg = protocol_config.get("frag", {}) if isinstance(protocol_config.get("frag"), dict) else {}
+    lines.extend(
+        [
             "frag:",
-            "  enabled: false",
-            "  split_pos: 0",
-            "  fake_ttl: 0",
-            "  reverse_order: false",
+            f"  enabled: {yaml_scalar(frag_cfg.get('enabled', False))}",
+            f"  split_pos: {yaml_scalar(frag_cfg.get('split_pos', 0))}",
+            f"  fake_ttl: {yaml_scalar(frag_cfg.get('fake_ttl', 0))}",
+            f"  reverse_order: {yaml_scalar(frag_cfg.get('reverse_order', False))}",
+            f"  mtu_enabled: {yaml_scalar(frag_cfg.get('mtu_enabled', False))}",
+            f"  fragment_size: {yaml_scalar(frag_cfg.get('fragment_size', 0))}",
+            f"  fragment_delay: {yaml_scalar(frag_cfg.get('fragment_delay', ''))}",
             "",
             "utls:",
             "  enabled: false",
