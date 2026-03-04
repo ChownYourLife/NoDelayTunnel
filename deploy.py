@@ -5069,7 +5069,87 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         config.get("ping_keepalive", {}),
     )
 
+    # Anti-DPI / MTU fragmentation — client-side only
+    if role == "client":
+        config["frag"] = prompt_frag_config(config.get("frag", {}))
+
     return config
+
+
+def prompt_frag_config(existing=None):
+    """Prompt for Anti-DPI / MTU fragmentation settings (client-side only)."""
+    existing = existing or {}
+    print_header("🛡️ Anti-DPI / MTU Fragmentation")
+    print_info("MTU fragmentation splits ALL outgoing traffic into small TCP chunks.")
+    print_info("This defeats DPI systems that rely on packet-size heuristics or")
+    print_info("need to reassemble large payloads to detect tunnel signatures.")
+    print_info("")
+    print_info("How it works:")
+    print_info("  • Every write is split into small fragments (e.g. 200 bytes)")
+    print_info("  • TCP MSS is clamped to enforce kernel-level small segments")
+    print_info("  • TLS ClientHello SNI is split across TCP segments")
+    print_info("  • Optional inter-fragment delay spreads packets over time")
+    print_info("")
+
+    # MTU fragmentation (main feature) — enabled by default for all transports
+    mtu_default = "n" if existing.get("mtu_enabled") is False else "y"
+    mtu_enabled = input_default(
+        "Enable MTU fragmentation? (Y/n)", mtu_default
+    ).strip().lower() not in {"n", "no"}
+
+    if not mtu_enabled:
+        # Also ask about ClientHello-only fragmentation
+        ch_default = "y" if existing.get("enabled", False) else "n"
+        ch_enabled = input_default(
+            "Enable TLS ClientHello fragmentation only? (y/N)", ch_default
+        ).strip().lower() in {"y", "yes"}
+        return {
+            "enabled": ch_enabled,
+            "split_pos": existing.get("split_pos", 0),
+            "fake_ttl": existing.get("fake_ttl", 0),
+            "reverse_order": existing.get("reverse_order", False),
+            "mtu_enabled": False,
+            "fragment_size": 0,
+            "fragment_delay": "",
+        }
+
+    # Fragment size
+    print_info("")
+    print_info("Fragment size (bytes per TCP write):")
+    print_info("  Smaller = harder for DPI, but slower throughput")
+    print_info("  Recommended: 100-300 for maximum stealth, 400-800 for balance")
+    fragment_size = prompt_int("Fragment size", existing.get("fragment_size", 200))
+    if fragment_size < 64:
+        fragment_size = 64
+    if fragment_size > 1400:
+        fragment_size = 1400
+
+    # Fragment delay
+    print_info("")
+    print_info("Inter-fragment delay (optional, e.g. '1ms', '500us', '0' to disable):")
+    print_info("  Adds a small pause between chunks to spread traffic patterns.")
+    delay_default = existing.get("fragment_delay", "")
+    fragment_delay = input_default(
+        "Fragment delay", delay_default
+    ).strip()
+    if fragment_delay in {"0", "0ms", "0s", ""}:
+        fragment_delay = ""
+
+    # ClientHello fragmentation — disabled by default, even with MTU frag
+    ch_default = "y" if existing.get("enabled", False) else "n"
+    ch_enabled = input_default(
+        "Also enable TLS ClientHello fragmentation? (y/N)", ch_default
+    ).strip().lower() in {"y", "yes"}
+
+    return {
+        "enabled": ch_enabled,
+        "split_pos": existing.get("split_pos", 0),
+        "fake_ttl": existing.get("fake_ttl", 0),
+        "reverse_order": existing.get("reverse_order", False),
+        "mtu_enabled": True,
+        "fragment_size": fragment_size,
+        "fragment_delay": fragment_delay,
+    }
 
 
 PROFILE_PRESETS = [
@@ -7010,14 +7090,18 @@ def build_client_config_text(protocol_config, tuning, obfuscation_cfg):
         ]
     )
     lines.extend(render_http_mimicry_lines(protocol_config, enabled=mimicry_enabled))
+    frag_cfg = protocol_config.get("frag", {}) if isinstance(protocol_config.get("frag"), dict) else {}
     lines.extend(
         [
             "",
             "frag:",
-            "  enabled: false",
-            "  split_pos: 0",
-            "  fake_ttl: 0",
-            "  reverse_order: false",
+            f"  enabled: {yaml_scalar(frag_cfg.get('enabled', False))}",
+            f"  split_pos: {yaml_scalar(frag_cfg.get('split_pos', 0))}",
+            f"  fake_ttl: {yaml_scalar(frag_cfg.get('fake_ttl', 0))}",
+            f"  reverse_order: {yaml_scalar(frag_cfg.get('reverse_order', False))}",
+            f"  mtu_enabled: {yaml_scalar(frag_cfg.get('mtu_enabled', False))}",
+            f"  fragment_size: {yaml_scalar(frag_cfg.get('fragment_size', 0))}",
+            f"  fragment_delay: {yaml_scalar(frag_cfg.get('fragment_delay', ''))}",
             "",
             "utls:",
             "  enabled: true",
@@ -7811,6 +7895,13 @@ def install_client_flow(
     print(f"Path MTU:   {Colors.BOLD}{cfg.get('network_mtu', 0)}{Colors.ENDC}")
     print(f"MUX:        {Colors.BOLD}{cfg.get('mux_type', 'smux')}{Colors.ENDC}")
     print(f"Deploy:     {Colors.BOLD}{deployment_mode}{Colors.ENDC}")
+    frag_info = cfg.get("frag", {})
+    if isinstance(frag_info, dict) and frag_info.get("mtu_enabled"):
+        frag_size = frag_info.get("fragment_size", 200)
+        frag_delay = frag_info.get("fragment_delay", "") or "none"
+        print(f"MTU Frag:   {Colors.BOLD}ON (size={frag_size}B, delay={frag_delay}){Colors.ENDC}")
+    elif isinstance(frag_info, dict) and frag_info.get("enabled"):
+        print(f"Frag:       {Colors.BOLD}ClientHello only{Colors.ENDC}")
     if cfg["type"] == "reality":
         print(f"ShortID:    {Colors.BOLD}{cfg['short_id']}{Colors.ENDC}")
         print(f"PublicKey:  {Colors.BOLD}{cfg['public_key']}{Colors.ENDC}")
