@@ -2771,7 +2771,7 @@ TRANSPORT_TYPE_OPTIONS = [
     ("11", "antifilter", "🔥 AntiFilter (Raw UDP + FEC + pcap)"),
     ("12", "dnstunnel", "📡 DNS Tunnel (UDP53/TCP53/DoH, stealth)"),
     ("13", "tun", "🔧 TUN Mode (L3 tunnel, IPX encapsulation, BIP)"),
-    ("14", "cdn", "🌐 CDN (HTTP/HTTPS WebSocket through Cloudflare/CDN)"),
+    ("14", "cdn", "🌐 CDN (HTTP/HTTPS through Cloudflare/CDN)"),
 ]
 TRANSPORT_TYPE_INDEX_TO_NAME = {idx: name for idx, name, _ in TRANSPORT_TYPE_OPTIONS}
 TRANSPORT_TYPE_NAME_TO_INDEX = {name: idx for idx, name, _ in TRANSPORT_TYPE_OPTIONS}
@@ -3495,17 +3495,16 @@ def prompt_tun_transport_config(existing=None):
 
 
 def prompt_cdn_config(existing=None, role="server"):
-    """Prompt for CDN transport settings (HTTP/HTTPS WebSocket through CDN)."""
+    """Prompt for CDN transport settings (pure HTTP/HTTPS streaming through CDN)."""
     existing = existing or {}
     print_header("🌐 CDN Transport Configuration")
-    print_info("This transport tunnels through a CDN (e.g. Cloudflare) using WebSocket.")
-    print_info("Traffic looks like regular HTTPS/WebSocket to the CDN and censors.")
+    print_info("This transport tunnels through a CDN (e.g. Cloudflare) using pure HTTP streaming.")
+    print_info("Traffic looks like regular HTTP/HTTPS POST requests to the CDN and censors.")
     print_info("")
     print_info("Prerequisites:")
     print_info("  1. Register your domain with a CDN (e.g. Cloudflare)")
     print_info("  2. Point the domain DNS (A/AAAA record) to your origin server IP")
     print_info("  3. Enable CDN proxying (orange cloud in Cloudflare)")
-    print_info("  4. Enable WebSocket in CDN settings (Cloudflare: Network → WebSockets)")
     print_info("")
     domain = input_default(
         "CDN domain (e.g. tunnel.example.com)",
@@ -3518,17 +3517,17 @@ def prompt_cdn_config(existing=None, role="server"):
     # Scheme selection
     print_info("")
     print_info("CDN routing scheme:")
-    print_info("  [1] wss  — HTTPS + WebSocket (recommended, Cloudflare Full/Strict SSL)")
-    print_info("  [2] ws   — HTTP  + WebSocket (Cloudflare Flexible SSL, no TLS on origin)")
-    scheme_default = "1" if existing.get("scheme", "wss") in {"wss", "https", ""} else "2"
-    scheme_choice = input_default("Scheme [1=wss / 2=ws]", scheme_default).strip()
+    print_info("  [1] https — HTTPS streaming (recommended, Cloudflare Full/Strict SSL)")
+    print_info("  [2] http  — HTTP  streaming (Cloudflare Flexible SSL, no TLS on origin)")
+    scheme_default = "1" if existing.get("scheme", "https") in {"https", "wss", ""} else "2"
+    scheme_choice = input_default("Scheme [1=https / 2=http]", scheme_default).strip()
     if scheme_choice == "2":
-        scheme = "ws"
+        scheme = "http"
     else:
-        scheme = "wss"
+        scheme = "https"
 
     # CDN edge port
-    if scheme == "wss":
+    if scheme == "https":
         print_info("Cloudflare HTTPS ports: 443, 2053, 2083, 2087, 2096, 8443")
         cdn_port_default = existing.get("cdn_port", 443)
     else:
@@ -3536,13 +3535,13 @@ def prompt_cdn_config(existing=None, role="server"):
         cdn_port_default = existing.get("cdn_port", 80)
     cdn_port = prompt_int("CDN edge port", cdn_port_default)
 
-    # WebSocket path
+    # HTTP tunnel path
     path = input_default(
-        "WebSocket tunnel path",
+        "HTTP tunnel path",
         existing.get("path", "/cdn-tunnel"),
     ).strip() or "/cdn-tunnel"
 
-    if role == "server" and scheme == "wss":
+    if role == "server" and scheme == "https":
         print_info("")
         print_info("ℹ️  Full/Strict SSL mode requires a TLS certificate on the origin.")
         print_info("   You can use a Cloudflare Origin Certificate or Let's Encrypt.")
@@ -3957,7 +3956,7 @@ def derive_client_address_from_endpoint(endpoint, fallback="127.0.0.1:8443"):
         return fallback
     port = parsed.port
     if port is None:
-        port = 443 if parsed.scheme == "wss" else 80
+        port = 443 if parsed.scheme in {"wss", "https"} else 80
     return f"{host}:{port}"
 
 
@@ -4987,9 +4986,9 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         config["type"] = "cdn"
         cdn_cfg = prompt_cdn_config(config.get("cdn", {}), role=role)
         config["cdn"] = cdn_cfg
-        # CDN with Full SSL (wss) needs TLS cert on the origin server
-        cdn_scheme = str(cdn_cfg.get("scheme", "wss")).strip().lower()
-        if cdn_scheme in {"wss", "https"} and role == "server":
+        # CDN with Full SSL (https) needs TLS cert on the origin server
+        cdn_scheme = str(cdn_cfg.get("scheme", "https")).strip().lower()
+        if cdn_scheme in {"https", "wss"} and role == "server":
             config["port"] = prompt_or_keep_port(443)
         else:
             config["port"] = prompt_or_keep_port(80)
@@ -6600,7 +6599,7 @@ def render_transport_endpoints_list_lines(
                     f"{indent}    cdn:",
                     f"{indent}      domain: {yaml_scalar(cdn_cfg.get('domain', ''))}",
                     f"{indent}      cdn_port: {yaml_scalar(cdn_cfg.get('cdn_port', 443))}",
-                    f"{indent}      scheme: {yaml_scalar(cdn_cfg.get('scheme', 'wss'))}",
+                    f"{indent}      scheme: {yaml_scalar(cdn_cfg.get('scheme', 'https'))}",
                 ]
             )
     return lines
