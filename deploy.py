@@ -2811,6 +2811,11 @@ def endpoint_is_dnstunnel(transport_type):
 
 # ── DNS Tunnel configuration helpers ──────────────────────────────────────────
 
+DNS_TUNNEL_MODE_TYPES = [
+    ("1", "classic", "Classic (sliding window, compatible)"),
+    ("2", "quic", "QUIC-over-DNS (recommended, 10x faster)"),
+]
+
 DNS_TUNNEL_TRANSPORT_TYPES = [
     ("1", "udp53", "UDP port 53"),
     ("2", "tcp53", "TCP port 53"),
@@ -2835,6 +2840,25 @@ def prompt_dnstunnel_config(role):
     print_header("📡 DNS Tunnel Configuration")
 
     cfg = {}
+
+    # Tunnel mode: classic or QUIC
+    print_menu(
+        "DNS Tunnel Mode",
+        [f"{Colors.GREEN}[{idx}]{Colors.ENDC} {label}" for idx, _, label in DNS_TUNNEL_MODE_TYPES],
+        color=Colors.CYAN,
+        min_width=56,
+    )
+    while True:
+        mode_choice = input_default("Select tunnel mode", "2").strip()
+        found = False
+        for idx, name, _ in DNS_TUNNEL_MODE_TYPES:
+            if mode_choice == idx or mode_choice.lower() == name:
+                cfg["mode"] = name
+                found = True
+                break
+        if found:
+            break
+        print_error("Invalid choice.")
 
     # Base domain (required)
     cfg["base_domain"] = input_default(
@@ -2887,43 +2911,49 @@ def prompt_dnstunnel_config(role):
             "8.8.8.8",
         ).strip()
 
-    # Record type preference
-    print_menu(
-        "DNS Record Type for Payload",
-        [f"{Colors.GREEN}[{idx}]{Colors.ENDC} {label}" for idx, _, label in DNS_TUNNEL_RECORD_TYPES],
-        color=Colors.CYAN,
-        min_width=48,
-    )
-    while True:
-        rt_choice = input_default("Select record type", "1").strip()
-        found = False
-        for idx, name, _ in DNS_TUNNEL_RECORD_TYPES:
-            if rt_choice == idx or rt_choice.lower() == name.lower():
-                cfg["record_type"] = name
-                found = True
+    # Record type and encoding — only relevant for classic mode.
+    # QUIC-over-DNS always uses TXT records and Base32 (hardcoded).
+    if cfg.get("mode") == "quic":
+        cfg["record_type"] = "TXT"
+        cfg["encoding"] = "base32"
+    else:
+        # Record type preference
+        print_menu(
+            "DNS Record Type for Payload",
+            [f"{Colors.GREEN}[{idx}]{Colors.ENDC} {label}" for idx, _, label in DNS_TUNNEL_RECORD_TYPES],
+            color=Colors.CYAN,
+            min_width=48,
+        )
+        while True:
+            rt_choice = input_default("Select record type", "1").strip()
+            found = False
+            for idx, name, _ in DNS_TUNNEL_RECORD_TYPES:
+                if rt_choice == idx or rt_choice.lower() == name.lower():
+                    cfg["record_type"] = name
+                    found = True
+                    break
+            if found:
                 break
-        if found:
-            break
-        print_error("Invalid choice.")
+            print_error("Invalid choice.")
 
-    # Encoding
-    print_menu(
-        "Upstream Encoding",
-        [f"{Colors.GREEN}[{idx}]{Colors.ENDC} {label}" for idx, _, label in DNS_TUNNEL_ENCODING_TYPES],
-        color=Colors.CYAN,
-        min_width=48,
-    )
-    while True:
-        enc_choice = input_default("Select encoding", "1").strip()
-        found = False
-        for idx, name, _ in DNS_TUNNEL_ENCODING_TYPES:
-            if enc_choice == idx or enc_choice.lower() == name:
-                cfg["encoding"] = name
-                found = True
+        # Encoding
+        print_menu(
+            "Upstream Encoding",
+            [f"{Colors.GREEN}[{idx}]{Colors.ENDC} {label}" for idx, _, label in DNS_TUNNEL_ENCODING_TYPES],
+            color=Colors.CYAN,
+            min_width=48,
+        )
+        while True:
+            enc_choice = input_default("Select encoding", "1").strip()
+            found = False
+            for idx, name, _ in DNS_TUNNEL_ENCODING_TYPES:
+                if enc_choice == idx or enc_choice.lower() == name:
+                    cfg["encoding"] = name
+                    found = True
+                    break
+            if found:
                 break
-        if found:
-            break
-        print_error("Invalid choice.")
+            print_error("Invalid choice.")
 
     # ── Port mappings (required for forwarding) ─────────────────────────────
     print()
@@ -2961,34 +2991,49 @@ def prompt_dnstunnel_config(role):
         cfg["tun_ip"] = ""
         cfg["tun_mtu"] = 1280
 
-    # Sliding window
-    cfg["window_size"] = int(input_default("Sliding window size (frames)", "32").strip())
+    # Sliding window & jitter (classic mode only — QUIC handles its own)
+    if cfg.get("mode", "classic") == "classic":
+        cfg["window_size"] = int(input_default("Sliding window size (frames)", "32").strip())
 
-    # Jitter / anti-analysis
-    enable_jitter = input_default("Enable traffic jitter & dummy queries? (Y/n)", "y").strip().lower()
-    cfg["jitter_enabled"] = enable_jitter in {"y", "yes", ""}
-    if cfg["jitter_enabled"]:
-        cfg["jitter_min_ms"] = int(input_default("Min poll interval (ms)", "200").strip())
-        cfg["jitter_max_ms"] = int(input_default("Max poll interval (ms)", "2000").strip())
-        cfg["dummy_probability"] = float(input_default("Dummy query probability (0.0-1.0)", "0.15").strip())
+        # Jitter / anti-analysis
+        enable_jitter = input_default("Enable traffic jitter & dummy queries? (Y/n)", "y").strip().lower()
+        cfg["jitter_enabled"] = enable_jitter in {"y", "yes", ""}
+        if cfg["jitter_enabled"]:
+            cfg["jitter_min_ms"] = int(input_default("Min poll interval (ms)", "200").strip())
+            cfg["jitter_max_ms"] = int(input_default("Max poll interval (ms)", "2000").strip())
+            cfg["dummy_probability"] = float(input_default("Dummy query probability (0.0-1.0)", "0.15").strip())
+        else:
+            cfg["jitter_min_ms"] = 200
+            cfg["jitter_max_ms"] = 2000
+            cfg["dummy_probability"] = 0.0
     else:
-        cfg["jitter_min_ms"] = 200
-        cfg["jitter_max_ms"] = 2000
+        # QUIC mode — QUIC handles congestion/flow control, adaptive poller handles polling
+        cfg["window_size"] = 0
+        cfg["jitter_enabled"] = False
+        cfg["jitter_min_ms"] = 0
+        cfg["jitter_max_ms"] = 0
         cfg["dummy_probability"] = 0.0
 
     # Listen port (server only)
     if role == "server":
         cfg["listen_addr"] = input_default("Listen address for DNS server", ":53").strip()
+        # Upstream DNS for forwarding non-tunnel queries (QUIC mode)
+        if cfg.get("mode") == "quic":
+            cfg["upstream_dns"] = input_default(
+                "Upstream DNS for forwarding non-tunnel queries", "8.8.8.8:53"
+            ).strip()
 
     return cfg
 
 
 def build_dnstunnel_config_text(role, dns_cfg):
     """Generate YAML configuration for the DNS tunnel."""
+    tunnel_mode = dns_cfg.get("mode", "classic")
     lines = [
         f"mode: {role}",
         "",
         "dns_tunnel:",
+        f"  tunnel_mode: {yaml_scalar(tunnel_mode)}",
         f"  base_domain: {yaml_scalar(dns_cfg['base_domain'])}",
         f"  psk: {yaml_scalar(dns_cfg['psk'])}",
         f"  dns_transport: {yaml_scalar(dns_cfg['dns_transport'])}",
@@ -3039,6 +3084,8 @@ def build_dnstunnel_config_text(role, dns_cfg):
             "",
             f"  listen_addr: {yaml_scalar(dns_cfg.get('listen_addr', ':53'))}",
         ])
+        if dns_cfg.get("upstream_dns"):
+            lines.append(f"  upstream_dns: {yaml_scalar(dns_cfg['upstream_dns'])}")
     lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -3475,6 +3522,8 @@ def prompt_tun_transport_config(existing=None, role="server"):
     print_header("🔧 TUN Mode Transport Configuration")
     print_info("This creates a L3 TUN tunnel with IPX encapsulation and BIP framing.")
     print_info("Traffic appears as legacy Novell NetWare IPX — invisible to most DPI.")
+    print_info("MTU fragmentation is automatic: large packets are split across multiple")
+    print_info("BIP frames to fit within the NIC wire MTU (usually 1500).")
     iface = prompt_interface_with_autodetect("Network interface", existing.get("interface", ""))
     tun_name = input_default("TUN device name", existing.get("tun_name", "ntun0")).strip() or "ntun0"
     # Role-aware IP defaults: server=10.0.0.1, client=10.0.0.2
