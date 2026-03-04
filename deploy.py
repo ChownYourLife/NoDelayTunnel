@@ -3469,7 +3469,7 @@ def ensure_tun_deps():
             print_error("❌ Failed to create /dev/net/tun. TUN/TAP may not be available on this kernel.")
 
 
-def prompt_tun_transport_config(existing=None):
+def prompt_tun_transport_config(existing=None, role="server"):
     """Prompt for TUN Mode transport settings."""
     existing = existing or {}
     print_header("🔧 TUN Mode Transport Configuration")
@@ -3477,8 +3477,15 @@ def prompt_tun_transport_config(existing=None):
     print_info("Traffic appears as legacy Novell NetWare IPX — invisible to most DPI.")
     iface = prompt_interface_with_autodetect("Network interface", existing.get("interface", ""))
     tun_name = input_default("TUN device name", existing.get("tun_name", "ntun0")).strip() or "ntun0"
-    local_ip = input_default("Local TUN IP (CIDR, e.g. 10.0.0.1/30)", existing.get("local_ip", "10.0.0.1/30")).strip()
-    peer_ip = input_default("Peer TUN IP (e.g. 10.0.0.2)", existing.get("peer_ip", "10.0.0.2")).strip()
+    # Role-aware IP defaults: server=10.0.0.1, client=10.0.0.2
+    if role == "client":
+        default_local_ip = "10.0.0.2/30"
+        default_peer_ip = "10.0.0.1"
+    else:
+        default_local_ip = "10.0.0.1/30"
+        default_peer_ip = "10.0.0.2"
+    local_ip = input_default("Local TUN IP (CIDR)", existing.get("local_ip", default_local_ip)).strip()
+    peer_ip = input_default("Peer TUN IP", existing.get("peer_ip", default_peer_ip)).strip()
     mtu = prompt_int("TUN MTU", existing.get("mtu", 1400))
     psk = input_default("Encryption PSK (empty = auto-generate)", existing.get("psk", "")).strip()
     if not psk:
@@ -4979,7 +4986,7 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
     elif choice == "13":
         config["type"] = "tun"
         ensure_tun_deps()
-        tun_cfg = prompt_tun_transport_config(config.get("tun", {}))
+        tun_cfg = prompt_tun_transport_config(config.get("tun", {}), role=role)
         config["tun"] = tun_cfg
 
     elif choice == "14":
