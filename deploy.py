@@ -3108,7 +3108,8 @@ def generate_dnstunnel_config(role, dns_cfg, instance):
     """Write the DNS tunnel config file and return the path."""
     if not os.path.exists(CONFIG_DIR):
         os.makedirs(CONFIG_DIR)
-    config_filename = f"nodelay-dnstunnel-{role}-{instance}.yaml"
+    # Use the standard filename so create_service finds it with build_config_filename.
+    config_filename = build_config_filename(role, instance)
     config_path = os.path.join(CONFIG_DIR, config_filename)
     content = build_dnstunnel_config_text(role, dns_cfg)
     with open(config_path, "w") as f:
@@ -3151,12 +3152,14 @@ def install_dnstunnel_flow():
 
     config_path = generate_dnstunnel_config(role, dns_cfg, instance)
 
-    # Create systemd service (reuses existing service infrastructure).
+    # Create systemd service.  The DNS tunnel uses a dedicated subcommand
+    # ("dns-tunnel") rather than the generic "server" / "client" modes.
     create_service(
         role,
         instance,
         restart_minutes=0,
         runtime_max_minutes=0,
+        subcommand="dns-tunnel",
     )
 
     print_header("✅ DNS Tunnel Installation Complete")
@@ -3534,10 +3537,22 @@ def prompt_tun_transport_config(existing=None, role="server"):
     """Prompt for TUN Mode transport settings."""
     existing = existing or {}
     print_header("🔧 TUN Mode Transport Configuration")
-    print_info("This creates a L3 TUN tunnel with IPX encapsulation and BIP framing.")
-    print_info("Traffic appears as legacy Novell NetWare IPX — invisible to most DPI.")
+    print_info("This creates a L3 TUN tunnel with BIP framing over UDP or raw IPX.")
     print_info("MTU fragmentation is automatic: large packets are split across multiple")
-    print_info("BIP frames to fit within the NIC wire MTU (usually 1500).")
+    print_info("BIP frames to fit within the wire MTU.")
+    print_info("")
+    print_info("Wire mode:")
+    print_info("  [1] udp — BIP frames inside standard UDP packets (works everywhere, recommended)")
+    print_info("  [2] ipx — BIP frames inside raw IPX EtherType 0x8137 (may be blocked by cloud vSwitches)")
+    wire_mode_default = "1" if existing.get("wire_mode", "udp") in {"udp", ""} else "2"
+    wire_mode_choice = input_default("Wire mode [1=udp / 2=ipx]", wire_mode_default).strip()
+    if wire_mode_choice == "2":
+        wire_mode = "ipx"
+    else:
+        wire_mode = "udp"
+    wire_port = 0
+    if wire_mode == "udp":
+        wire_port = prompt_int("UDP wire port", existing.get("wire_port", 4789))
     iface = prompt_interface_with_autodetect("Network interface", existing.get("interface", ""))
     tun_name = input_default("TUN device name", existing.get("tun_name", "ntun0")).strip() or "ntun0"
     # Role-aware IP defaults: server=10.0.0.1, client=10.0.0.2
@@ -3549,11 +3564,25 @@ def prompt_tun_transport_config(existing=None, role="server"):
         default_peer_ip = "10.0.0.2"
     local_ip = input_default("Local TUN IP (CIDR)", existing.get("local_ip", default_local_ip)).strip()
     peer_ip = input_default("Peer TUN IP", existing.get("peer_ip", default_peer_ip)).strip()
+    print_info("")
+    if wire_mode == "udp":
+        print_info("Peer address = the remote server/client's REAL public IP.")
+        print_info("Required for UDP wire mode on the CLIENT side (server learns it automatically).")
+    else:
+        print_info("Peer address = the remote server/client's REAL IP (for L2 MAC resolution).")
+        print_info("If empty, frames are sent to the default gateway (typical for cross-network VPS).")
+    peer_addr = input_default(
+        "Remote peer public IP (empty = auto via gateway)",
+        existing.get("peer_addr", ""),
+    ).strip()
     mtu = prompt_int("TUN MTU", existing.get("mtu", 1400))
     wire_mtu_default = existing.get("wire_mtu", 0)
     print_info("")
-    print_info("Wire MTU = max Ethernet payload for IPX frames on the physical NIC.")
-    print_info("Set to the SMALLEST NIC MTU across both server and client (0 = auto from local NIC).")
+    if wire_mode == "ipx":
+        print_info("Wire MTU = max Ethernet payload for IPX frames on the physical NIC.")
+    else:
+        print_info("Wire MTU = max UDP payload size (0 = auto, typically 1472).")
+    print_info("Set to the SMALLEST MTU across both server and client (0 = auto from local NIC).")
     wire_mtu = prompt_int("Wire MTU (0=auto)", wire_mtu_default)
     if wire_mtu < 0:
         wire_mtu = 0
@@ -3566,9 +3595,12 @@ def prompt_tun_transport_config(existing=None, role="server"):
         "tun_name": tun_name,
         "local_ip": local_ip,
         "peer_ip": peer_ip,
+        "peer_addr": peer_addr,
         "mtu": mtu,
         "wire_mtu": wire_mtu,
         "psk": psk,
+        "wire_mode": wire_mode,
+        "wire_port": wire_port,
     }
 
 
@@ -6771,9 +6803,12 @@ def render_transport_endpoints_list_lines(
                     f"{indent}      tun_name: {yaml_scalar(tun_cfg.get('tun_name', 'ntun0'))}",
                     f"{indent}      local_ip: {yaml_scalar(tun_cfg.get('local_ip', ''))}",
                     f"{indent}      peer_ip: {yaml_scalar(tun_cfg.get('peer_ip', ''))}",
+                    f"{indent}      peer_addr: {yaml_scalar(tun_cfg.get('peer_addr', ''))}",
                     f"{indent}      mtu: {yaml_scalar(tun_cfg.get('mtu', 1400))}",
                     f"{indent}      wire_mtu: {yaml_scalar(tun_cfg.get('wire_mtu', 0))}",
                     f"{indent}      psk: {yaml_scalar(tun_cfg.get('psk', ''))}",
+                    f"{indent}      wire_mode: {yaml_scalar(tun_cfg.get('wire_mode', 'udp'))}",
+                    f"{indent}      wire_port: {yaml_scalar(tun_cfg.get('wire_port', 4789))}",
                 ]
             )
         # CDN transport config
@@ -7307,7 +7342,13 @@ def render_service_runtime_max_lines(runtime_max_minutes):
     return f"RuntimeMaxSec={runtime_max_minutes * 60}"
 
 
-def create_service(role, instance="default", restart_minutes=0, runtime_max_minutes=0):
+def create_service(role, instance="default", restart_minutes=0, runtime_max_minutes=0, subcommand=None):
+    """Create (or overwrite) the systemd service unit for a tunnel role.
+
+    Args:
+        subcommand: Override the binary sub-command (e.g. "dns-tunnel").
+                    Defaults to the role's standard mode ("server" / "client").
+    """
     restart_minutes = normalize_service_restart_minutes(
         restart_minutes, DEFAULT_SERVICE_RESTART_MINUTES
     )
@@ -7326,7 +7367,9 @@ def create_service(role, instance="default", restart_minutes=0, runtime_max_minu
     service_name = build_service_name(role, instance)
     service_path = service_file_path(service_name)
     config_path = os.path.join(CONFIG_DIR, build_config_filename(role, instance))
-    exec_start = f"{os.path.join(INSTALL_DIR, BINARY_NAME)} {profile['mode']} -c {config_path}"
+    # Use the caller-supplied subcommand, else fall back to the profile's mode.
+    cmd = subcommand if subcommand else profile["mode"]
+    exec_start = f"{os.path.join(INSTALL_DIR, BINARY_NAME)} {cmd} -c {config_path}"
     description = profile["description"] if instance == "default" else f"{profile['description']} [{instance}]"
     env_lines = "\n".join(
         f'Environment="{key}={value}"'
