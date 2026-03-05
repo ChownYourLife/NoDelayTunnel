@@ -2900,16 +2900,27 @@ def prompt_dnstunnel_config(role):
     # DoH endpoint (only for doh transport)
     if cfg["dns_transport"] == "doh":
         cfg["doh_url"] = input_default(
-            "DoH endpoint URL",
+            "DoH endpoint URL (include :port if non-standard, e.g. https://server:8443/dns-query)",
             "https://1.1.1.1/dns-query",
         ).strip()
 
     # Upstream resolver (for UDP/TCP transport on client)
     if role == "client" and cfg["dns_transport"] in {"udp53", "tcp53"}:
-        cfg["resolver"] = input_default(
-            "Upstream DNS resolver address",
+        resolver_addr = input_default(
+            "DNS resolver/server address (IP or hostname)",
             "8.8.8.8",
         ).strip()
+        dns_port = input_default(
+            "DNS server port (53 = standard, or custom if server listen_addr differs)",
+            "53",
+        ).strip()
+        try:
+            dns_port_int = int(dns_port)
+            if not (1 <= dns_port_int <= 65535):
+                dns_port_int = 53
+        except ValueError:
+            dns_port_int = 53
+        cfg["resolver"] = f"{resolver_addr}:{dns_port_int}"
 
     # Record type and encoding — only relevant for classic mode.
     # QUIC-over-DNS always uses TXT records and Base32 (hardcoded).
@@ -3016,7 +3027,10 @@ def prompt_dnstunnel_config(role):
 
     # Listen port (server only)
     if role == "server":
-        cfg["listen_addr"] = input_default("Listen address for DNS server", ":53").strip()
+        cfg["listen_addr"] = input_default(
+            "Listen address for DNS server (e.g. :53, :8443, 0.0.0.0:5353)",
+            ":53",
+        ).strip()
         # Upstream DNS for forwarding non-tunnel queries (QUIC mode)
         if cfg.get("mode") == "quic":
             cfg["upstream_dns"] = input_default(
@@ -4065,11 +4079,11 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
         ep_type = prompt_endpoint_type(default=defaults.get("type", "tcp"))
 
         try:
-            port_default = int(defaults.get("port", 443))
+            port_default = int(defaults.get("port", 8443))
         except (TypeError, ValueError):
-            port_default = 443
+            port_default = 8443
         if not (1 <= port_default <= 65535):
-            port_default = 443
+            port_default = 8443
 
         if role == "server":
             host_default = str(defaults.get("listen_host", "")).strip()
