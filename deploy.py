@@ -3536,6 +3536,13 @@ def prompt_tun_transport_config(existing=None, role="server"):
     local_ip = input_default("Local TUN IP (CIDR)", existing.get("local_ip", default_local_ip)).strip()
     peer_ip = input_default("Peer TUN IP", existing.get("peer_ip", default_peer_ip)).strip()
     mtu = prompt_int("TUN MTU", existing.get("mtu", 1400))
+    wire_mtu_default = existing.get("wire_mtu", 0)
+    print_info("")
+    print_info("Wire MTU = max Ethernet payload for IPX frames on the physical NIC.")
+    print_info("Set to the SMALLEST NIC MTU across both server and client (0 = auto from local NIC).")
+    wire_mtu = prompt_int("Wire MTU (0=auto)", wire_mtu_default)
+    if wire_mtu < 0:
+        wire_mtu = 0
     psk = input_default("Encryption PSK (empty = auto-generate)", existing.get("psk", "")).strip()
     if not psk:
         psk = secrets.token_urlsafe(32)
@@ -3546,6 +3553,7 @@ def prompt_tun_transport_config(existing=None, role="server"):
         "local_ip": local_ip,
         "peer_ip": peer_ip,
         "mtu": mtu,
+        "wire_mtu": wire_mtu,
         "psk": psk,
     }
 
@@ -6750,6 +6758,7 @@ def render_transport_endpoints_list_lines(
                     f"{indent}      local_ip: {yaml_scalar(tun_cfg.get('local_ip', ''))}",
                     f"{indent}      peer_ip: {yaml_scalar(tun_cfg.get('peer_ip', ''))}",
                     f"{indent}      mtu: {yaml_scalar(tun_cfg.get('mtu', 1400))}",
+                    f"{indent}      wire_mtu: {yaml_scalar(tun_cfg.get('wire_mtu', 0))}",
                     f"{indent}      psk: {yaml_scalar(tun_cfg.get('psk', ''))}",
                 ]
             )
