@@ -2769,7 +2769,7 @@ TRANSPORT_TYPE_OPTIONS = [
     ("9", "reality", "🌌 REALITY"),
     ("10", "phantom", "🛡️ Phantom (Stealth L3/L7 via Caddy)"),
     ("11", "antifilter", "🔥 AntiFilter (Raw UDP + FEC + pcap)"),
-    ("12", "dnstunnel", "📡 DNS Tunnel (UDP53/TCP53/DoH, stealth)"),
+    ("12", "dns", "📡 DNS Tunnel (UDP/TCP/DoH, stealth)"),
     ("13", "tun", "🔧 TUN Mode (L3 tunnel, IPX encapsulation, BIP)"),
     ("14", "cdn", "🌐 CDN (HTTP/HTTPS through Cloudflare/CDN)"),
 ]
@@ -2786,6 +2786,8 @@ MUX_TYPE_NAME_TO_INDEX = {name: idx for idx, name, _ in MUX_TYPE_OPTIONS}
 
 def normalize_endpoint_type(value, default="tcp"):
     raw = str(value or "").strip().lower()
+    if raw == "dnstunnel":
+        raw = "dns"
     if raw in TRANSPORT_TYPE_NAME_TO_INDEX:
         return raw
     return default
@@ -2801,12 +2803,193 @@ def endpoint_uses_tls(transport_type):
 
 def endpoint_needs_raw_cap(transport_type):
     """Returns True if the transport requires CAP_NET_RAW (AF_PACKET / pcap)."""
-    return normalize_endpoint_type(transport_type) in {"phantom", "antifilter", "dnstunnel", "tun"}
+    return normalize_endpoint_type(transport_type) in {"phantom", "antifilter", "tun"}
 
 
 def endpoint_is_dnstunnel(transport_type):
     """Returns True if the transport is the DNS tunnel."""
-    return normalize_endpoint_type(transport_type) == "dnstunnel"
+    return normalize_endpoint_type(transport_type) == "dns"
+
+
+DNS_QUERY_TRANSPORT_OPTIONS = [
+    ("1", "udp", "UDP (port 53 style)"),
+    ("2", "tcp", "TCP DNS"),
+    ("3", "doh", "DNS-over-HTTPS (DoH)"),
+]
+
+DNS_LISTEN_NETWORK_OPTIONS = [
+    ("1", "udp", "UDP listener"),
+    ("2", "tcp", "TCP listener"),
+]
+
+
+def normalize_dns_query_transport(value, default="udp"):
+    raw = str(value or "").strip().lower()
+    if raw in {"udp53", "udp"}:
+        return "udp"
+    if raw in {"tcp53", "tcp"}:
+        return "tcp"
+    if raw == "doh":
+        return "doh"
+    return default
+
+
+def normalize_dns_listen_network(value, default="udp"):
+    raw = str(value or "").strip().lower()
+    if raw in {"udp53", "udp"}:
+        return "udp"
+    if raw in {"tcp53", "tcp"}:
+        return "tcp"
+    return default
+
+
+def empty_dns_transport_config():
+    return {
+        "base_domain": "",
+        "psk": "",
+        "query_transport": "udp",
+        "listen_network": "udp",
+        "query_timeout": "5s",
+        "alpn": "nodelay-dns-quic-v1",
+        "poll_min_interval": "20ms",
+        "poll_max_interval": "500ms",
+        "poll_idle_threshold": "2s",
+        "poll_burst_count": 10,
+    }
+
+
+def normalize_dns_transport_config(value, fallback=None):
+    raw = value if isinstance(value, dict) else {}
+    base = fallback if isinstance(fallback, dict) else {}
+    merged = empty_dns_transport_config()
+    merged.update(base)
+    merged.update(raw)
+
+    merged["base_domain"] = str(merged.get("base_domain", "")).strip().strip(".").lower()
+    merged["psk"] = str(merged.get("psk", "")).strip()
+    merged["query_transport"] = normalize_dns_query_transport(merged.get("query_transport", "udp"), "udp")
+    merged["listen_network"] = normalize_dns_listen_network(merged.get("listen_network", "udp"), "udp")
+    merged["query_timeout"] = str(merged.get("query_timeout", "5s") or "5s").strip() or "5s"
+    merged["alpn"] = str(merged.get("alpn", "nodelay-dns-quic-v1") or "nodelay-dns-quic-v1").strip() or "nodelay-dns-quic-v1"
+    merged["poll_min_interval"] = str(merged.get("poll_min_interval", "20ms") or "20ms").strip() or "20ms"
+    merged["poll_max_interval"] = str(merged.get("poll_max_interval", "500ms") or "500ms").strip() or "500ms"
+    merged["poll_idle_threshold"] = str(merged.get("poll_idle_threshold", "2s") or "2s").strip() or "2s"
+    try:
+        merged["poll_burst_count"] = int(merged.get("poll_burst_count", 10) or 10)
+    except (TypeError, ValueError):
+        merged["poll_burst_count"] = 10
+    if merged["poll_burst_count"] <= 0:
+        merged["poll_burst_count"] = 10
+    return merged
+
+
+def prompt_dns_query_transport(default="udp"):
+    normalized_default = normalize_dns_query_transport(default, "udp")
+    default_choice = next(
+        (idx for idx, name, _ in DNS_QUERY_TRANSPORT_OPTIONS if name == normalized_default),
+        "1",
+    )
+    print_menu(
+        "📡 DNS Query Transport",
+        [f"{Colors.GREEN}[{idx}]{Colors.ENDC} {label}" for idx, _, label in DNS_QUERY_TRANSPORT_OPTIONS],
+        color=Colors.CYAN,
+        min_width=56,
+    )
+    while True:
+        choice = input_default("Query transport", default_choice).strip().lower()
+        for idx, name, _ in DNS_QUERY_TRANSPORT_OPTIONS:
+            if choice == idx or choice == name:
+                return name
+        print_error("Invalid choice.")
+
+
+def prompt_dns_listen_network(default="udp"):
+    normalized_default = normalize_dns_listen_network(default, "udp")
+    default_choice = next(
+        (idx for idx, name, _ in DNS_LISTEN_NETWORK_OPTIONS if name == normalized_default),
+        "1",
+    )
+    print_menu(
+        "📥 DNS Listen Network",
+        [f"{Colors.GREEN}[{idx}]{Colors.ENDC} {label}" for idx, _, label in DNS_LISTEN_NETWORK_OPTIONS],
+        color=Colors.CYAN,
+        min_width=44,
+    )
+    while True:
+        choice = input_default("Listen network", default_choice).strip().lower()
+        for idx, name, _ in DNS_LISTEN_NETWORK_OPTIONS:
+            if choice == idx or choice == name:
+                return name
+        print_error("Invalid choice.")
+
+
+def prompt_dns_transport_settings(role, existing=None, default_doh_url="", advanced=False):
+    print_header("📡 DNS Tunnel Configuration")
+    current = normalize_dns_transport_config(existing, {})
+
+    base_domain = input_default(
+        "Authoritative tunnel domain (e.g. t.example.com)",
+        current.get("base_domain", ""),
+    ).strip().strip(".").lower()
+    while not base_domain:
+        print_error("Base domain is required.")
+        base_domain = input_default("Authoritative tunnel domain", "").strip().strip(".").lower()
+
+    dns_psk = input_default(
+        "DNS transport PSK (shared between client and server)",
+        current.get("psk", "") or secrets.token_hex(32),
+    ).strip()
+    while not dns_psk:
+        print_error("DNS transport PSK is required.")
+        dns_psk = input_default(
+            "DNS transport PSK (shared between client and server)",
+            secrets.token_hex(32),
+        ).strip()
+
+    query_transport = prompt_dns_query_transport(current.get("query_transport", "udp"))
+    listen_network = prompt_dns_listen_network(current.get("listen_network", "udp"))
+
+    url = ""
+    if role == "client" and query_transport == "doh":
+        url_default = str(default_doh_url or "").strip() or "https://1.1.1.1/dns-query"
+        url = input_default(
+            "DoH endpoint URL (e.g. https://dns.example.com/dns-query)",
+            url_default,
+        ).strip()
+        while not url:
+            print_error("DoH endpoint URL is required when query transport is DoH.")
+            url = input_default("DoH endpoint URL", url_default).strip()
+
+    dns_cfg = normalize_dns_transport_config(
+        {
+            "base_domain": base_domain,
+            "psk": dns_psk,
+            "query_transport": query_transport,
+            "listen_network": listen_network,
+            "query_timeout": current.get("query_timeout", "5s"),
+            "alpn": current.get("alpn", "nodelay-dns-quic-v1"),
+            "poll_min_interval": current.get("poll_min_interval", "20ms"),
+            "poll_max_interval": current.get("poll_max_interval", "500ms"),
+            "poll_idle_threshold": current.get("poll_idle_threshold", "2s"),
+            "poll_burst_count": current.get("poll_burst_count", 10),
+        },
+        current,
+    )
+
+    if advanced:
+        dns_cfg["query_timeout"] = input_default("DNS query timeout", dns_cfg["query_timeout"]).strip() or dns_cfg["query_timeout"]
+        dns_cfg["alpn"] = input_default("DNS transport ALPN", dns_cfg["alpn"]).strip() or dns_cfg["alpn"]
+        dns_cfg["poll_min_interval"] = input_default("Poll min interval", dns_cfg["poll_min_interval"]).strip() or dns_cfg["poll_min_interval"]
+        dns_cfg["poll_max_interval"] = input_default("Poll max interval", dns_cfg["poll_max_interval"]).strip() or dns_cfg["poll_max_interval"]
+        dns_cfg["poll_idle_threshold"] = input_default("Poll idle threshold", dns_cfg["poll_idle_threshold"]).strip() or dns_cfg["poll_idle_threshold"]
+        dns_cfg["poll_burst_count"] = prompt_int("Poll burst count", dns_cfg["poll_burst_count"])
+        if dns_cfg["poll_burst_count"] <= 0:
+            dns_cfg["poll_burst_count"] = 10
+
+    return {
+        "url": url,
+        "dns": normalize_dns_transport_config(dns_cfg, current),
+    }
 
 
 # ── DNS Tunnel configuration helpers ──────────────────────────────────────────
@@ -3537,22 +3720,43 @@ def prompt_tun_transport_config(existing=None, role="server"):
     """Prompt for TUN Mode transport settings."""
     existing = existing or {}
     print_header("🔧 TUN Mode Transport Configuration")
-    print_info("This creates a L3 TUN tunnel with BIP framing over UDP or raw IPX.")
+    print_info("This creates a L3 TUN tunnel with separate encapsulation and transport profiles.")
     print_info("MTU fragmentation is automatic: large packets are split across multiple")
-    print_info("BIP frames to fit within the wire MTU.")
+    print_info("transport records to fit within the wire MTU.")
     print_info("")
-    print_info("Wire mode:")
-    print_info("  [1] udp — BIP frames inside standard UDP packets (works everywhere, recommended)")
-    print_info("  [2] ipx — BIP frames inside raw IPX EtherType 0x8137 (may be blocked by cloud vSwitches)")
-    wire_mode_default = "1" if existing.get("wire_mode", "udp") in {"udp", ""} else "2"
-    wire_mode_choice = input_default("Wire mode [1=udp / 2=ipx]", wire_mode_default).strip()
-    if wire_mode_choice == "2":
-        wire_mode = "ipx"
-    else:
-        wire_mode = "udp"
-    wire_port = 0
-    if wire_mode == "udp":
-        wire_port = prompt_int("UDP wire port", existing.get("wire_port", 4789))
+    print_info("Encapsulation profile:")
+    print_info("  [1] ipx      — IPX-style wrapper around encrypted payload")
+    print_info("  [2] tcp_like — stream-style wrapper around encrypted payload")
+    encaps_default_value = existing.get("encapsulation_profile", "ipx") or "ipx"
+    encaps_default = "2" if encaps_default_value == "tcp_like" else "1"
+    encaps_choice = input_default("Encapsulation profile [1=ipx / 2=tcp_like]", encaps_default).strip()
+    encapsulation_profile = "tcp_like" if encaps_choice == "2" else "ipx"
+
+    print_info("")
+    print_info("Transport profile:")
+    print_info("  [1] bip  — BIP transport records over routed datagrams (default)")
+    print_info("  [2] udp  — UDP datagram carrier")
+    print_info("  [3] tcp  — TCP stream carrier")
+    print_info("  [4] icmp — raw ICMP carrier (provider support required)")
+    print_info("  [5] ipip — raw IP-in-IP style carrier (provider support required)")
+    print_info("  [6] gre  — raw GRE carrier (provider support required)")
+    transport_default_value = existing.get("transport_profile", "bip") or "bip"
+    transport_map = {"bip": "1", "udp": "2", "tcp": "3", "icmp": "4", "ipip": "5", "gre": "6"}
+    transport_choice = input_default(
+        "Transport profile [1=bip / 2=udp / 3=tcp / 4=icmp / 5=ipip / 6=gre]",
+        transport_map.get(transport_default_value, "1"),
+    ).strip()
+    transport_profile = {
+        "2": "udp",
+        "3": "tcp",
+        "4": "icmp",
+        "5": "ipip",
+        "6": "gre",
+    }.get(transport_choice, "bip")
+
+    transport_port = 0
+    if transport_profile in {"bip", "udp", "tcp"}:
+        transport_port = prompt_int("Transport port", existing.get("transport_port", 4789))
     iface = prompt_interface_with_autodetect("Network interface", existing.get("interface", ""))
     tun_name = input_default("TUN device name", existing.get("tun_name", "ntun0")).strip() or "ntun0"
     # Role-aware IP defaults: server=10.0.0.1, client=10.0.0.2
@@ -3565,23 +3769,20 @@ def prompt_tun_transport_config(existing=None, role="server"):
     local_ip = input_default("Local TUN IP (CIDR)", existing.get("local_ip", default_local_ip)).strip()
     peer_ip = input_default("Peer TUN IP", existing.get("peer_ip", default_peer_ip)).strip()
     print_info("")
-    if wire_mode == "udp":
+    if transport_profile in {"bip", "udp", "tcp"}:
         print_info("Peer address = the remote server/client's REAL public IP.")
-        print_info("Required for UDP wire mode on the CLIENT side (server learns it automatically).")
+        print_info("Required on the client side; the server binds to the first validated peer.")
     else:
-        print_info("Peer address = the remote server/client's REAL IP (for L2 MAC resolution).")
-        print_info("If empty, frames are sent to the default gateway (typical for cross-network VPS).")
+        print_info("Peer address = the remote server/client's REAL public IP for the raw IP carrier.")
+        print_info("Raw carriers may be blocked by your VPS provider or path.")
     peer_addr = input_default(
-        "Remote peer public IP (empty = auto via gateway)",
+        "Remote peer public IP",
         existing.get("peer_addr", ""),
     ).strip()
     mtu = prompt_int("TUN MTU", existing.get("mtu", 1400))
     wire_mtu_default = existing.get("wire_mtu", 0)
     print_info("")
-    if wire_mode == "ipx":
-        print_info("Wire MTU = max Ethernet payload for IPX frames on the physical NIC.")
-    else:
-        print_info("Wire MTU = max UDP payload size (0 = auto, typically 1472).")
+    print_info("Wire MTU = max effective payload budget before transport and encapsulation overhead.")
     print_info("Set to the SMALLEST MTU across both server and client (0 = auto from local NIC).")
     wire_mtu = prompt_int("Wire MTU (0=auto)", wire_mtu_default)
     if wire_mtu < 0:
@@ -3599,8 +3800,9 @@ def prompt_tun_transport_config(existing=None, role="server"):
         "mtu": mtu,
         "wire_mtu": wire_mtu,
         "psk": psk,
-        "wire_mode": wire_mode,
-        "wire_port": wire_port,
+        "encapsulation_profile": encapsulation_profile,
+        "transport_profile": transport_profile,
+        "transport_port": transport_port,
     }
 
 
@@ -3747,10 +3949,10 @@ def prompt_endpoint_type(default="tcp", prompt_label="Transport Type"):
         min_width=46,
     )
     while True:
-        choice = input_default(f"{prompt_label} [1-11]", default_choice).strip()
+        choice = input_default(f"{prompt_label} [1-{len(TRANSPORT_TYPE_OPTIONS)}]", default_choice).strip()
         if choice in TRANSPORT_TYPE_INDEX_TO_NAME:
             return TRANSPORT_TYPE_INDEX_TO_NAME[choice]
-        print_error("Invalid choice. Pick a number between 1 and 11.")
+        print_error(f"Invalid choice. Pick a number between 1 and {len(TRANSPORT_TYPE_OPTIONS)}.")
 
 
 def normalize_server_names_list(value):
@@ -4001,6 +4203,7 @@ def normalize_transport_endpoint(
     fallback_path="/tunnel",
     fallback_reality=None,
     fallback_port_hopping=None,
+    fallback_dns=None,
 ):
     ep = endpoint if isinstance(endpoint, dict) else {}
     ep_type = normalize_endpoint_type(ep.get("type", fallback_type), normalize_endpoint_type(fallback_type))
@@ -4034,6 +4237,13 @@ def normalize_transport_endpoint(
         )
     else:
         reality_cfg = {}
+    if ep_type == "dns":
+        dns_cfg = normalize_dns_transport_config(
+            ep.get("dns", {}),
+            fallback_dns,
+        )
+    else:
+        dns_cfg = {}
     port_hopping_cfg = normalize_port_hopping_cfg(
         ep.get("port_hopping", {}),
         fallback_port_hopping,
@@ -4044,6 +4254,7 @@ def normalize_transport_endpoint(
         "url": url,
         "path": path,
         "tls": tls_cfg,
+        "dns": dns_cfg,
         "reality": reality_cfg,
         "port_hopping": port_hopping_cfg,
     }
@@ -4172,6 +4383,8 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
         )
 
         tls_cfg = empty_tls_config()
+        dns_cfg = empty_dns_transport_config()
+        endpoint_url = ""
         if endpoint_uses_tls(ep_type):
             if role == "server":
                 cert_default = str(defaults.get("cert", "")).strip()
@@ -4227,6 +4440,21 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
                         break
                     print_error("Client cert_file and key_file must both be set, or both left empty.")
 
+        if ep_type == "dns":
+            default_doh_url = ""
+            if role == "client":
+                host_for_url = parse_host_from_address(address, "")
+                if host_for_url:
+                    default_doh_url = f"https://{host_for_url}/dns-query"
+            dns_settings = prompt_dns_transport_settings(
+                role=role,
+                existing=defaults.get("dns", {}),
+                default_doh_url=default_doh_url,
+                advanced=False,
+            )
+            dns_cfg = dns_settings["dns"]
+            endpoint_url = dns_settings["url"]
+
         reality_cfg = {}
         if ep_type == "reality":
             reality_cfg = normalize_endpoint_reality_config(
@@ -4269,10 +4497,11 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
             {
                 "type": ep_type,
                 "address": address,
-                "url": "",
+                "url": endpoint_url,
                 "path": path,
                 "port_hopping": port_hopping_cfg,
                 "tls": tls_cfg,
+                "dns": dns_cfg,
                 "reality": reality_cfg,
             },
             role=role,
@@ -4281,6 +4510,7 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
             fallback_path=path,
             fallback_reality=default_reality_cfg,
             fallback_port_hopping=default_port_hopping_cfg,
+            fallback_dns=defaults.get("dns", {}),
         )
         if role == "client" and ep_type in {"ws", "wss"}:
             endpoint["url"] = resolve_ws_url({"type": ep_type}, endpoint["address"], endpoint["path"])
@@ -4723,13 +4953,7 @@ def prompt_license_id():
 
 def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deployment_mode="default"):
     back_signal = "__BACK_TO_TRANSPORT_MENU__"
-    # Show all transport protocols except DNS Tunnel (12), which has its own
-    # dedicated setup flow via install_dnstunnel_flow().
-    STANDARD_PROTOCOL_OPTIONS = [
-        (idx, name, label) for idx, name, label in TRANSPORT_TYPE_OPTIONS
-        if name != "dnstunnel"
-    ]
-    options = [(idx, label) for idx, _, label in STANDARD_PROTOCOL_OPTIONS]
+    options = [(idx, label) for idx, _, label in TRANSPORT_TYPE_OPTIONS]
     print_menu(
         "📜 Select Protocol",
         [f"{Colors.GREEN}[{key}]{Colors.ENDC} {name}" for key, name in options],
@@ -4737,12 +4961,15 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         min_width=44,
     )
 
-    type_to_choice = {name: idx for idx, name, _ in STANDARD_PROTOCOL_OPTIONS}
-    valid_choices = {idx for idx, _, _ in STANDARD_PROTOCOL_OPTIONS}
-    max_label = max(int(idx) for idx, _, _ in STANDARD_PROTOCOL_OPTIONS)
+    type_to_choice = {name: idx for idx, name, _ in TRANSPORT_TYPE_OPTIONS}
+    valid_choices = {idx for idx, _, _ in TRANSPORT_TYPE_OPTIONS}
+    max_label = max(int(idx) for idx, _, _ in TRANSPORT_TYPE_OPTIONS)
     default_choice = "1"
     if isinstance(defaults, dict):
-        default_choice = type_to_choice.get(str(defaults.get("type", "")).strip().lower(), "1")
+        default_choice = type_to_choice.get(
+            normalize_endpoint_type(defaults.get("type", ""), "tcp"),
+            "1",
+        )
 
     while True:
         choice = input_default(f"\n{Colors.BOLD}Enter choice [1-{max_label}]{Colors.ENDC}", default_choice).strip()
@@ -4770,6 +4997,7 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         "pool_size": 3,
         "connection_strategy": "parallel",
         "additional_endpoints": [],
+        "url": "",
         "port_hopping": {
             "enabled": False,
             "start_port": 0,
@@ -4778,6 +5006,7 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
             "mode": "spread",
             "count": 0,
         },
+        "dns": empty_dns_transport_config(),
         "cert": "",
         "key": "",
         "psk": "",
@@ -5085,6 +5314,36 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         ensure_antifilter_deps()
         antifilter_cfg = prompt_antifilter_config(config.get("antifilter", {}))
         config["antifilter"] = antifilter_cfg
+
+    elif choice == "12":
+        config["type"] = "dns"
+        default_doh_url = str(config.get("url", "")).strip()
+        if not default_doh_url and server_addr:
+            default_doh_url = f"https://{server_addr}/dns-query"
+        dns_settings = prompt_dns_transport_settings(
+            role=role,
+            existing=config.get("dns", {}),
+            default_doh_url=default_doh_url,
+            advanced=advanced_mode,
+        )
+        config["dns"] = dns_settings["dns"]
+        config["url"] = dns_settings["url"]
+        if role == "client" and config["dns"]["query_transport"] == "doh":
+            try:
+                parsed_doh = urllib.parse.urlparse(config["url"])
+            except Exception:
+                parsed_doh = None
+            if parsed_doh and parsed_doh.scheme:
+                if parsed_doh.port:
+                    config["port"] = str(parsed_doh.port)
+                elif parsed_doh.scheme == "http":
+                    config["port"] = "80"
+                else:
+                    config["port"] = "443"
+            else:
+                config["port"] = "443"
+        else:
+            config["port"] = prompt_or_keep_port(53)
 
     elif choice == "13":
         config["type"] = "tun"
@@ -5606,6 +5865,7 @@ def load_instance_runtime_settings(role, instance):
             fallback_address=":8443",
             fallback_path="/tunnel",
             fallback_reality=reality_global,
+            fallback_dns=empty_dns_transport_config(),
         )
         normalized_listens = []
         for ep in listens:
@@ -5619,6 +5879,7 @@ def load_instance_runtime_settings(role, instance):
                     fallback_address=primary_fallback["address"],
                     fallback_path=primary_fallback["path"],
                     fallback_reality=reality_global,
+                    fallback_dns=primary_fallback.get("dns", {}),
                 )
             )
         if not normalized_listens:
@@ -5650,6 +5911,7 @@ def load_instance_runtime_settings(role, instance):
             "port": parse_port_from_address(primary_listen.get("address", ":8443"), 8443),
             "listen_host": parse_host_from_address(primary_listen.get("address", ":8443"), ""),
             "path": str(primary_listen.get("path", "/tunnel")),
+            "url": str(primary_listen.get("url", "")),
             "port_hopping": primary_port_hopping,
             "network_mtu": network_mtu,
             "network_congestion_control": network_congestion_control,
@@ -5665,6 +5927,7 @@ def load_instance_runtime_settings(role, instance):
             "mimicry_basic_auth_user": mimicry_basic_auth_user,
             "mimicry_basic_auth_pass": mimicry_basic_auth_pass,
             "additional_endpoints": deep_copy(normalized_listens[1:]),
+            "dns": deep_copy(primary_listen.get("dns", {})) if isinstance(primary_listen.get("dns"), dict) else empty_dns_transport_config(),
             "cert": str(tls_cfg.get("cert_file", "")),
             "key": str(tls_cfg.get("key_file", "")),
             "psk": psk,
@@ -5722,6 +5985,7 @@ def load_instance_runtime_settings(role, instance):
             fallback_address="127.0.0.1:8443",
             fallback_path="/tunnel",
             fallback_reality=reality_global,
+            fallback_dns=empty_dns_transport_config(),
         )
         normalized_servers = []
         for ep in servers:
@@ -5735,6 +5999,7 @@ def load_instance_runtime_settings(role, instance):
                     fallback_address=primary_fallback["address"],
                     fallback_path=primary_fallback["path"],
                     fallback_reality=reality_global,
+                    fallback_dns=primary_fallback.get("dns", {}),
                 )
             )
         if not normalized_servers:
@@ -5778,6 +6043,7 @@ def load_instance_runtime_settings(role, instance):
                 "parallel",
             ),
             "path": str(primary_server.get("path", "/tunnel")),
+            "url": str(primary_server.get("url", "")),
             "port_hopping": primary_port_hopping,
             "network_mtu": network_mtu,
             "network_congestion_control": network_congestion_control,
@@ -5793,6 +6059,7 @@ def load_instance_runtime_settings(role, instance):
             "mimicry_basic_auth_user": mimicry_basic_auth_user,
             "mimicry_basic_auth_pass": mimicry_basic_auth_pass,
             "additional_endpoints": deep_copy(normalized_servers[1:]),
+            "dns": deep_copy(primary_server.get("dns", {})) if isinstance(primary_server.get("dns"), dict) else empty_dns_transport_config(),
             "cert": "",
             "key": "",
             "psk": psk,
@@ -6405,6 +6672,7 @@ def build_server_primary_endpoint(protocol_config):
     endpoint_type = normalize_endpoint_type(protocol_config.get("type", "tcp"), "tcp")
     path_default = default_path_for_transport(endpoint_type)
     path = normalize_path(protocol_config.get("path", path_default), path_default)
+    dns_cfg = normalize_dns_transport_config(protocol_config.get("dns", {}), {})
     listen_host = str(protocol_config.get("listen_host", "")).strip()
     if listen_host:
         address = f"{listen_host}:{protocol_config.get('port', 8443)}"
@@ -6415,7 +6683,7 @@ def build_server_primary_endpoint(protocol_config):
         {
             "type": endpoint_type,
             "address": address,
-            "url": "",
+            "url": str(protocol_config.get("url", "")).strip() if endpoint_type == "dns" else "",
             "path": path,
             "port_hopping": port_hopping_cfg,
             "tls": {
@@ -6426,6 +6694,7 @@ def build_server_primary_endpoint(protocol_config):
                 "insecure_skip_verify": False,
                 "require_client_cert": False,
             },
+            "dns": dns_cfg,
             "reality": build_primary_endpoint_reality("server", protocol_config, endpoint_type),
         },
         role="server",
@@ -6434,9 +6703,10 @@ def build_server_primary_endpoint(protocol_config):
         fallback_path=path,
         fallback_reality=build_primary_endpoint_reality("server", protocol_config, endpoint_type),
         fallback_port_hopping=port_hopping_cfg,
+        fallback_dns=dns_cfg,
     )
     # Inject transport-specific sub-configs that normalize_transport_endpoint does not preserve
-    for _ts_key in ("phantom", "antifilter", "tun", "cdn"):
+    for _ts_key in ("dns", "phantom", "antifilter", "tun", "cdn"):
         _ts_val = protocol_config.get(_ts_key)
         if isinstance(_ts_val, dict) and _ts_val:
             result[_ts_key] = _ts_val
@@ -6447,11 +6717,16 @@ def build_client_primary_endpoint(protocol_config):
     endpoint_type = normalize_endpoint_type(protocol_config.get("type", "tcp"), "tcp")
     path_default = default_path_for_transport(endpoint_type)
     path = normalize_path(protocol_config.get("path", path_default), path_default)
+    dns_cfg = normalize_dns_transport_config(protocol_config.get("dns", {}), {})
     server_addr = str(protocol_config.get("server_addr", "127.0.0.1")).strip() or "127.0.0.1"
     address = f"{server_addr}:{protocol_config.get('port', 8443)}"
+    if endpoint_type == "dns" and dns_cfg.get("query_transport") == "doh":
+        address = ""
     url = ""
     if endpoint_type in {"ws", "wss"}:
         url = resolve_ws_url({"type": endpoint_type}, address, path)
+    elif endpoint_type == "dns":
+        url = str(protocol_config.get("url", "")).strip()
     port_hopping_cfg = normalize_port_hopping_cfg(protocol_config.get("port_hopping", {}), {})
     result = normalize_transport_endpoint(
         {
@@ -6468,6 +6743,7 @@ def build_client_primary_endpoint(protocol_config):
                 "insecure_skip_verify": bool(protocol_config.get("insecure_skip_verify", False)),
                 "require_client_cert": False,
             },
+            "dns": dns_cfg,
             "reality": build_primary_endpoint_reality("client", protocol_config, endpoint_type),
         },
         role="client",
@@ -6476,9 +6752,10 @@ def build_client_primary_endpoint(protocol_config):
         fallback_path=path,
         fallback_reality=build_primary_endpoint_reality("client", protocol_config, endpoint_type),
         fallback_port_hopping=port_hopping_cfg,
+        fallback_dns=dns_cfg,
     )
     # Inject transport-specific sub-configs that normalize_transport_endpoint does not preserve
-    for _ts_key in ("phantom", "antifilter", "tun", "cdn"):
+    for _ts_key in ("dns", "phantom", "antifilter", "tun", "cdn"):
         _ts_val = protocol_config.get(_ts_key)
         if isinstance(_ts_val, dict) and _ts_val:
             result[_ts_key] = _ts_val
@@ -6500,6 +6777,7 @@ def build_all_endpoints_for_render(role, protocol_config, primary_endpoint):
             fallback_address=primary_endpoint["address"],
             fallback_path=primary_endpoint["path"],
             fallback_reality=primary_endpoint.get("reality", {}),
+            fallback_dns=primary_endpoint.get("dns", {}),
         )
         if role == "client" and normalized["type"] in {"ws", "wss"} and not normalized["url"]:
             normalized["url"] = resolve_ws_url(
@@ -6599,6 +6877,7 @@ def resolve_server_address_for_client_summary(cfg):
 def build_client_setup_lines_for_server_summary(cfg):
     server_address, all_eps = resolve_server_address_for_client_summary(cfg)
     ep_type = normalize_endpoint_type(cfg.get("type", "tcp"), "tcp")
+    dns_cfg = normalize_dns_transport_config(cfg.get("dns", {}), {})
     tunnel_mode = str(cfg.get("tunnel_mode", "reverse")).strip().lower() or "reverse"
     psk_text = str(cfg.get("psk", "")).strip() or "(disabled)"
     path_text = str(cfg.get("path", "")).strip() or "/tunnel"
@@ -6613,6 +6892,11 @@ def build_client_setup_lines_for_server_summary(cfg):
 
     if ep_type in {"ws", "wss"}:
         lines.append(f"Path: {path_text}")
+
+    if ep_type == "dns":
+        lines.append(f"DNS Base Domain: {dns_cfg.get('base_domain', '') or '(missing)'}")
+        lines.append(f"DNS Query Transport: {dns_cfg.get('query_transport', 'udp')}")
+        lines.append(f"DNS Listen Network: {dns_cfg.get('listen_network', 'udp')}")
 
     if ep_type in {"httpmimicry", "httpsmimicry"}:
         lines.append(f"Mimic Path: {path_text}")
@@ -6674,6 +6958,7 @@ def render_named_transport_endpoint_lines(
 ):
     ep_type = normalize_endpoint_type(endpoint.get("type", "tcp"), "tcp")
     tls_cfg = endpoint.get("tls", {}) if isinstance(endpoint.get("tls"), dict) else {}
+    dns_cfg = endpoint.get("dns", {}) if isinstance(endpoint.get("dns"), dict) else {}
     reality_cfg = (
         endpoint.get("reality", {}) if isinstance(endpoint.get("reality"), dict) else {}
     )
@@ -6686,6 +6971,23 @@ def render_named_transport_endpoint_lines(
         f"{indent}  url: {yaml_scalar(endpoint.get('url', ''))}",
         f"{indent}  path: {yaml_scalar(endpoint.get('path', '/tunnel'))}",
     ]
+    if ep_type == "dns":
+        normalized_dns = normalize_dns_transport_config(dns_cfg, {})
+        lines.extend(
+            [
+                f"{indent}  dns:",
+                f"{indent}    base_domain: {yaml_scalar(normalized_dns.get('base_domain', ''))}",
+                f"{indent}    psk: {yaml_scalar(normalized_dns.get('psk', ''))}",
+                f"{indent}    query_transport: {yaml_scalar(normalized_dns.get('query_transport', 'udp'))}",
+                f"{indent}    listen_network: {yaml_scalar(normalized_dns.get('listen_network', 'udp'))}",
+                f"{indent}    query_timeout: {yaml_scalar(normalized_dns.get('query_timeout', '5s'))}",
+                f"{indent}    alpn: {yaml_scalar(normalized_dns.get('alpn', 'nodelay-dns-quic-v1'))}",
+                f"{indent}    poll_min_interval: {yaml_scalar(normalized_dns.get('poll_min_interval', '20ms'))}",
+                f"{indent}    poll_max_interval: {yaml_scalar(normalized_dns.get('poll_max_interval', '500ms'))}",
+                f"{indent}    poll_idle_threshold: {yaml_scalar(normalized_dns.get('poll_idle_threshold', '2s'))}",
+                f"{indent}    poll_burst_count: {yaml_scalar(normalized_dns.get('poll_burst_count', 10))}",
+            ]
+        )
     lines.extend(render_port_hopping_lines(f"{indent}  ", endpoint.get("port_hopping", {})))
     if include_tls:
         lines.extend(
@@ -6728,6 +7030,7 @@ def render_transport_endpoints_list_lines(
     for endpoint in endpoints:
         ep_type = normalize_endpoint_type(endpoint.get("type", "tcp"), "tcp")
         tls_cfg = endpoint.get("tls", {}) if isinstance(endpoint.get("tls"), dict) else {}
+        dns_cfg = endpoint.get("dns", {}) if isinstance(endpoint.get("dns"), dict) else {}
         reality_cfg = (
             endpoint.get("reality", {}) if isinstance(endpoint.get("reality"), dict) else {}
         )
@@ -6741,6 +7044,23 @@ def render_transport_endpoints_list_lines(
                 f"{indent}    path: {yaml_scalar(endpoint.get('path', '/tunnel'))}",
             ]
         )
+        if ep_type == "dns":
+            normalized_dns = normalize_dns_transport_config(dns_cfg, {})
+            lines.extend(
+                [
+                    f"{indent}    dns:",
+                    f"{indent}      base_domain: {yaml_scalar(normalized_dns.get('base_domain', ''))}",
+                    f"{indent}      psk: {yaml_scalar(normalized_dns.get('psk', ''))}",
+                    f"{indent}      query_transport: {yaml_scalar(normalized_dns.get('query_transport', 'udp'))}",
+                    f"{indent}      listen_network: {yaml_scalar(normalized_dns.get('listen_network', 'udp'))}",
+                    f"{indent}      query_timeout: {yaml_scalar(normalized_dns.get('query_timeout', '5s'))}",
+                    f"{indent}      alpn: {yaml_scalar(normalized_dns.get('alpn', 'nodelay-dns-quic-v1'))}",
+                    f"{indent}      poll_min_interval: {yaml_scalar(normalized_dns.get('poll_min_interval', '20ms'))}",
+                    f"{indent}      poll_max_interval: {yaml_scalar(normalized_dns.get('poll_max_interval', '500ms'))}",
+                    f"{indent}      poll_idle_threshold: {yaml_scalar(normalized_dns.get('poll_idle_threshold', '2s'))}",
+                    f"{indent}      poll_burst_count: {yaml_scalar(normalized_dns.get('poll_burst_count', 10))}",
+                ]
+            )
         lines.extend(render_port_hopping_lines(f"{indent}    ", endpoint.get("port_hopping", {})))
         if include_tls:
             lines.extend(
@@ -6807,8 +7127,9 @@ def render_transport_endpoints_list_lines(
                     f"{indent}      mtu: {yaml_scalar(tun_cfg.get('mtu', 1400))}",
                     f"{indent}      wire_mtu: {yaml_scalar(tun_cfg.get('wire_mtu', 0))}",
                     f"{indent}      psk: {yaml_scalar(tun_cfg.get('psk', ''))}",
-                    f"{indent}      wire_mode: {yaml_scalar(tun_cfg.get('wire_mode', 'udp'))}",
-                    f"{indent}      wire_port: {yaml_scalar(tun_cfg.get('wire_port', 4789))}",
+                    f"{indent}      encapsulation_profile: {yaml_scalar(tun_cfg.get('encapsulation_profile', 'ipx'))}",
+                    f"{indent}      transport_profile: {yaml_scalar(tun_cfg.get('transport_profile', 'bip'))}",
+                    f"{indent}      transport_port: {yaml_scalar(tun_cfg.get('transport_port', 4789))}",
                 ]
             )
         # CDN transport config
@@ -8087,31 +8408,6 @@ def install_tunnel_flow(tunnel_type):
     if not profile:
         print_error(f"Unknown tunnel type: {tunnel_type}")
         return
-
-    # For direct mode, offer DNS Tunnel as a sub-option
-    if tunnel_type == "direct":
-        print_header(f"🧭 {profile['label']} Setup")
-        print_menu(
-            "Tunnel Method",
-            [
-                f"{Colors.GREEN}[1]{Colors.ENDC} 🌐 Standard Transport (TCP/TLS/WS/QUIC/CDN/...)",
-                f"{Colors.GREEN}[2]{Colors.ENDC} 📡 DNS Tunnel (stealth DNS-based tunnel)",
-                f"{Colors.WARNING}[0]{Colors.ENDC} Cancel",
-            ],
-            color=Colors.CYAN,
-            min_width=58,
-        )
-        while True:
-            method_choice = input("Select method [1/2/0]: ").strip()
-            if method_choice == "0":
-                print_info("Tunnel setup cancelled.")
-                return
-            if method_choice == "2":
-                install_dnstunnel_flow()
-                return
-            if method_choice == "1":
-                break
-            print_error("Invalid choice.")
 
     print_header(f"🧭 {profile['label']} Setup")
     print_menu(
