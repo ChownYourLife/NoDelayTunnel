@@ -3087,23 +3087,25 @@ def prompt_dnstunnel_config(role):
             "https://1.1.1.1/dns-query",
         ).strip()
 
-    # Upstream resolver (for UDP/TCP transport on client)
+    # Upstream resolvers (for UDP/TCP transport on client)
     if role == "client" and cfg["dns_transport"] in {"udp53", "tcp53"}:
-        resolver_addr = input_default(
-            "DNS resolver/server address (IP or hostname)",
-            "8.8.8.8",
+        resolvers_input = input_default(
+            "DNS resolvers (comma-separated IP or IP:PORT)",
+            "1.1.1.1:53, 8.8.8.8:53",
         ).strip()
-        dns_port = input_default(
-            "DNS server port (53 = standard, or custom if server listen_addr differs)",
-            "53",
-        ).strip()
-        try:
-            dns_port_int = int(dns_port)
-            if not (1 <= dns_port_int <= 65535):
-                dns_port_int = 53
-        except ValueError:
-            dns_port_int = 53
-        cfg["resolver"] = f"{resolver_addr}:{dns_port_int}"
+        
+        resolvers = []
+        for r in resolvers_input.split(','):
+            r = r.strip()
+            if not r: continue
+            if ':' not in r:
+                r += ":53"
+            resolvers.append(r)
+            
+        if not resolvers:
+            resolvers = ["8.8.8.8:53"]
+            
+        cfg["resolvers"] = resolvers
 
     # Record type and encoding — only relevant for classic mode.
     # QUIC-over-DNS always uses TXT records and Base32 (hardcoded).
@@ -3237,7 +3239,11 @@ def build_dnstunnel_config_text(role, dns_cfg):
     ]
     if dns_cfg.get("doh_url"):
         lines.append(f"  doh_url: {yaml_scalar(dns_cfg['doh_url'])}")
-    if dns_cfg.get("resolver"):
+    if dns_cfg.get("resolvers"):
+        lines.append("  resolvers:")
+        for res in dns_cfg.get("resolvers"):
+            lines.append(f"    - {yaml_scalar(res)}")
+    elif dns_cfg.get("resolver"):
         lines.append(f"  resolver: {yaml_scalar(dns_cfg['resolver'])}")
     lines.extend([
         f"  record_type: {yaml_scalar(dns_cfg['record_type'])}",
