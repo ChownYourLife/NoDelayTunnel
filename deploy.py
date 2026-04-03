@@ -13,6 +13,7 @@ import time
 import ipaddress
 import socket
 import ssl
+import struct
 import unicodedata
 import urllib.parse
 import urllib.request
@@ -81,6 +82,11 @@ IPERF_TEST_MSS = 1300
 IPERF_GOOD_MBPS = 150.0
 IPERF_EXCELLENT_MBPS = 200.0
 IPERF_POOR_MBPS = 100.0
+SPOOF_TEST_DEFAULT_PORT = 47890
+SPOOF_TEST_DEFAULT_TIMEOUT = 20
+SPOOF_TEST_DEFAULT_COUNT = 3
+SPOOF_TEST_MAGIC = "NODELAY-SPOOF-TEST"
+SPOOF_TEST_ACK_MAGIC = "NODELAY-SPOOF-ACK"
 PORT_HOPPING_MAX_PORTS = 256
 MSS_CLAMP_DEFAULT = 0
 SYSTEMD_RUNTIME_ENV_STATIC = {
@@ -294,7 +300,8 @@ def print_success(text):
     print(f"{Colors.GREEN}[+] {text}{Colors.ENDC}")
 
 def print_warning(text):
-    print(f"{Colors.YELLOW}[!!]{text}{Colors.ENDC}")
+    print(f"{Colors.YELLOW}[!!] {text}{Colors.ENDC}")
+
 def print_info(text):
     print(f"{Colors.BLUE}[*] {text}{Colors.ENDC}")
 
@@ -1545,6 +1552,391 @@ def direct_connectivity_test_menu(default_host=""):
         print_error("Invalid choice.")
 
 
+def resolve_ipv4_host_for_spoof_test(host):
+    candidate = normalize_ipv4_address(host)
+    if candidate:
+        return candidate
+    try:
+        infos = socket.getaddrinfo(str(host).strip(), None, socket.AF_INET, socket.SOCK_DGRAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve IPv4 for {host}: {exc}") from exc
+    for info in infos:
+        resolved = normalize_ipv4_address(info[4][0])
+        if resolved:
+            return resolved
+    raise ValueError(f"No IPv4 address found for {host}")
+
+
+def detect_outbound_ipv4_for_target(target_host, target_port):
+    try:
+        target_ip = resolve_ipv4_host_for_spoof_test(target_host)
+    except ValueError:
+        return ""
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect((target_ip, int(target_port)))
+        return normalize_ipv4_address(sock.getsockname()[0])
+    except OSError:
+        return ""
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def ipv4_checksum(data):
+    payload = data if isinstance(data, (bytes, bytearray)) else bytes(data or b"")
+    if len(payload) % 2:
+        payload += b"\x00"
+    total = 0
+    for offset in range(0, len(payload), 2):
+        total += (payload[offset] << 8) + payload[offset + 1]
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+
+def build_spoof_test_udp_packet(source_ip, dest_ip, source_port, dest_port, payload, ttl=64):
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    source_raw = socket.inet_aton(source_ip)
+    dest_raw = socket.inet_aton(dest_ip)
+    udp_length = 8 + len(payload)
+    total_length = 20 + udp_length
+    ident = random.randint(0, 65535)
+    ip_header = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45,
+        0,
+        total_length,
+        ident,
+        0,
+        ttl,
+        socket.IPPROTO_UDP,
+        0,
+        source_raw,
+        dest_raw,
+    )
+    ip_header = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45,
+        0,
+        total_length,
+        ident,
+        0,
+        ttl,
+        socket.IPPROTO_UDP,
+        ipv4_checksum(ip_header),
+        source_raw,
+        dest_raw,
+    )
+    udp_header = struct.pack("!HHHH", int(source_port), int(dest_port), udp_length, 0)
+    return ip_header + udp_header + payload
+
+
+def wait_for_spoof_test_ack(ack_sock, probe_id, deadline):
+    while time.time() < deadline:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        ack_sock.settimeout(min(1.0, max(0.1, remaining)))
+        try:
+            payload, addr = ack_sock.recvfrom(4096)
+        except socket.timeout:
+            continue
+        except OSError:
+            return None
+        text = payload.decode("utf-8", errors="ignore").strip()
+        if not text.startswith(f"{SPOOF_TEST_ACK_MAGIC}|"):
+            continue
+        parts = text.split("|")
+        if len(parts) < 5:
+            continue
+        _, ack_probe_id, seen_source, claimed_spoof, status = parts[:5]
+        if ack_probe_id != probe_id:
+            continue
+        return {
+            "peer": addr[0],
+            "seen_source": seen_source,
+            "claimed_spoof": claimed_spoof,
+            "status": status,
+        }
+    return None
+
+
+def spoof_capability_receiver_mode():
+    print_header("🕵️ Spoof Capability Receiver")
+    print_info("Run this on the server that should receive the spoofed packet.")
+    print_info("Then run sender mode on the remote server and repeat in reverse to validate both sides.")
+
+    listen_port = prompt_int("Receiver UDP port", SPOOF_TEST_DEFAULT_PORT)
+    while listen_port < 1 or listen_port > 65535:
+        print_error("Port must be between 1 and 65535.")
+        listen_port = prompt_int("Receiver UDP port", SPOOF_TEST_DEFAULT_PORT)
+
+    timeout_seconds = prompt_int("Listen timeout (seconds)", SPOOF_TEST_DEFAULT_TIMEOUT)
+    if timeout_seconds <= 0:
+        timeout_seconds = SPOOF_TEST_DEFAULT_TIMEOUT
+    max_probes = prompt_int("Stop after how many valid probes?", SPOOF_TEST_DEFAULT_COUNT)
+    if max_probes <= 0:
+        max_probes = SPOOF_TEST_DEFAULT_COUNT
+    expected_spoof_ip = prompt_ipv4_address(
+        "Expected spoofed source IPv4 (blank = accept any)",
+        "",
+        allow_empty=True,
+    )
+
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", int(listen_port)))
+    except OSError as exc:
+        if sock is not None:
+            sock.close()
+        print_error(f"Failed to start receiver: {exc}")
+        return False
+
+    print_success(f"Receiver listening on 0.0.0.0:{listen_port} for up to {timeout_seconds}s.")
+    if expected_spoof_ip:
+        print_info(f"Expected spoofed source IP: {expected_spoof_ip}")
+
+    seen = 0
+    acked = 0
+    deadline = time.time() + timeout_seconds
+
+    try:
+        while time.time() < deadline and seen < max_probes:
+            remaining = deadline - time.time()
+            sock.settimeout(min(1.0, max(0.1, remaining)))
+            try:
+                payload, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except KeyboardInterrupt:
+                raise
+            except OSError as exc:
+                print_error(f"Receiver socket error: {exc}")
+                return False
+
+            text = payload.decode("utf-8", errors="ignore").strip()
+            if not text.startswith(f"{SPOOF_TEST_MAGIC}|"):
+                continue
+
+            parts = text.split("|")
+            if len(parts) < 5:
+                print_warning("Ignored malformed spoof probe payload.")
+                continue
+
+            _, probe_id, ack_ip_raw, ack_port_raw, claimed_spoof_ip = parts[:5]
+            seen_source_ip = normalize_ipv4_address(addr[0]) or str(addr[0]).strip()
+            seen += 1
+
+            matches_claim = seen_source_ip == normalize_ipv4_address(claimed_spoof_ip)
+            matches_expected = not expected_spoof_ip or seen_source_ip == expected_spoof_ip
+            status = "ok" if matches_claim and matches_expected else "mismatch"
+
+            if status == "ok":
+                print_success(
+                    f"Probe #{seen}: saw spoofed source {seen_source_ip} from receiver view."
+                )
+            else:
+                print_warning(
+                    f"Probe #{seen}: saw source {seen_source_ip}, claimed {claimed_spoof_ip or '(empty)'}."
+                )
+
+            ack_ip = normalize_ipv4_address(ack_ip_raw)
+            try:
+                ack_port = int(ack_port_raw)
+            except (TypeError, ValueError):
+                ack_port = 0
+            if ack_ip and 1 <= ack_port <= 65535:
+                ack_payload = (
+                    f"{SPOOF_TEST_ACK_MAGIC}|{probe_id}|{seen_source_ip}|{claimed_spoof_ip}|{status}"
+                ).encode("utf-8")
+                try:
+                    sock.sendto(ack_payload, (ack_ip, ack_port))
+                    acked += 1
+                except OSError as exc:
+                    print_warning(f"Failed to send ACK to {ack_ip}:{ack_port}: {exc}")
+            else:
+                print_warning("Probe did not include a valid ACK target; sender confirmation is unavailable.")
+    except KeyboardInterrupt:
+        print_warning("Receiver interrupted by user.")
+    finally:
+        sock.close()
+
+    print_info(f"Receiver summary: valid probes={seen}, ACKs sent={acked}.")
+    if seen == 0:
+        print_warning("No spoof probe was observed before timeout.")
+    return seen > 0
+
+
+def spoof_capability_sender_mode(default_host=""):
+    print_header("🕵️ Spoof Capability Sender")
+    print_info("This sends a forged-source IPv4 UDP packet with a raw socket and waits for an ACK back to your real IP.")
+    print_info("If the remote receiver reports your spoofed source IP correctly, that direction is spoof-capable for UDP.")
+
+    host_seed = default_host or "1.2.3.4"
+    receiver_host = input_default("Remote receiver real host/IP", host_seed).strip()
+    while not receiver_host:
+        print_error("Remote receiver host/IP is required.")
+        receiver_host = input_default("Remote receiver real host/IP", host_seed).strip()
+    try:
+        receiver_ip = resolve_ipv4_host_for_spoof_test(receiver_host)
+    except ValueError as exc:
+        print_error(str(exc))
+        return False
+
+    receiver_port = prompt_int("Remote receiver UDP port", SPOOF_TEST_DEFAULT_PORT)
+    while receiver_port < 1 or receiver_port > 65535:
+        print_error("Port must be between 1 and 65535.")
+        receiver_port = prompt_int("Remote receiver UDP port", SPOOF_TEST_DEFAULT_PORT)
+
+    spoof_source_ip = prompt_ipv4_address("Spoofed source IPv4 to test", "")
+    ack_ip_default = normalize_ipv4_address(detect_public_ip_best_effort())
+    if not ack_ip_default:
+        ack_ip_default = detect_outbound_ipv4_for_target(receiver_ip, receiver_port)
+    ack_ip = prompt_ipv4_address("Your real/public IPv4 for ACK delivery", ack_ip_default)
+
+    probe_count = prompt_int("Probe count", SPOOF_TEST_DEFAULT_COUNT)
+    if probe_count <= 0:
+        probe_count = SPOOF_TEST_DEFAULT_COUNT
+    timeout_seconds = prompt_int("Total ACK wait timeout (seconds)", SPOOF_TEST_DEFAULT_TIMEOUT)
+    if timeout_seconds <= 0:
+        timeout_seconds = SPOOF_TEST_DEFAULT_TIMEOUT
+    spoof_source_port = prompt_int("Spoofed UDP source port", receiver_port)
+    while spoof_source_port < 1 or spoof_source_port > 65535:
+        print_error("Port must be between 1 and 65535.")
+        spoof_source_port = prompt_int("Spoofed UDP source port", receiver_port)
+
+    raw_sock = None
+    ack_sock = None
+    try:
+        ack_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ack_sock.bind(("", 0))
+        ack_port = int(ack_sock.getsockname()[1])
+
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+        raw_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    except PermissionError:
+        if raw_sock is not None:
+            raw_sock.close()
+        if ack_sock is not None:
+            ack_sock.close()
+        print_error("Raw socket access failed. Run the manager as root on Linux.")
+        return False
+    except OSError as exc:
+        if raw_sock is not None:
+            raw_sock.close()
+        if ack_sock is not None:
+            ack_sock.close()
+        print_error(f"Failed to initialize spoof probe sockets: {exc}")
+        return False
+
+    probe_id = uuid.uuid4().hex[:12]
+    deadline = time.time() + timeout_seconds
+    ack_result = None
+
+    try:
+        print_info(f"Receiver IPv4: {receiver_ip}:{receiver_port}")
+        print_info(f"ACK target: {ack_ip}:{ack_port}")
+        for attempt in range(probe_count):
+            payload = (
+                f"{SPOOF_TEST_MAGIC}|{probe_id}|{ack_ip}|{ack_port}|{spoof_source_ip}|{attempt + 1}"
+            ).encode("utf-8")
+            packet = build_spoof_test_udp_packet(
+                spoof_source_ip,
+                receiver_ip,
+                spoof_source_port,
+                receiver_port,
+                payload,
+            )
+            try:
+                raw_sock.sendto(packet, (receiver_ip, 0))
+            except OSError as exc:
+                print_error(f"Failed to send spoof probe: {exc}")
+                return False
+
+            print_info(
+                f"Sent spoof probe {attempt + 1}/{probe_count} with forged source {spoof_source_ip}:{spoof_source_port}."
+            )
+            ack_result = wait_for_spoof_test_ack(
+                ack_sock,
+                probe_id,
+                min(deadline, time.time() + 1.0),
+            )
+            if ack_result:
+                break
+            if attempt + 1 < probe_count and time.time() < deadline:
+                time.sleep(0.5)
+
+        if not ack_result:
+            ack_result = wait_for_spoof_test_ack(ack_sock, probe_id, deadline)
+    finally:
+        raw_sock.close()
+        ack_sock.close()
+
+    if not ack_result:
+        print_error("No ACK received from the remote receiver before timeout.")
+        print_warning("That usually means spoofed packets were filtered, the ACK IP/port was unreachable, or the receiver was not running.")
+        return False
+
+    if ack_result["status"] == "ok" and ack_result["seen_source"] == spoof_source_ip:
+        print_success(
+            f"Receiver {ack_result['peer']} observed spoofed source {ack_result['seen_source']} correctly."
+        )
+        print_info("Repeat the same test in the opposite direction to confirm both servers are spoof-capable.")
+        return True
+
+    print_warning(
+        f"Receiver replied, but saw {ack_result['seen_source']} instead of {spoof_source_ip} (status={ack_result['status']})."
+    )
+    return False
+
+
+def spoof_capability_test_menu(default_host=""):
+    while True:
+        print_menu(
+            "🕵️ Spoof Capability Test",
+            [
+                "1. Start receiver mode on this node",
+                "2. Send spoofed UDP probes to remote receiver",
+                "3. Show two-way test checklist",
+                "0. Back",
+            ],
+            color=Colors.CYAN,
+            min_width=62,
+        )
+        choice = input("Select option: ").strip()
+        if choice == "0":
+            return
+        if choice == "1":
+            spoof_capability_receiver_mode()
+            input("\nPress Enter to continue...")
+            continue
+        if choice == "2":
+            spoof_capability_sender_mode(default_host=default_host)
+            input("\nPress Enter to continue...")
+            continue
+        if choice == "3":
+            print_menu(
+                "Two-Way Spoof Check",
+                [
+                    "1. Start receiver mode on server A.",
+                    "2. Run sender mode on server B targeting server A's real IP.",
+                    "3. Confirm server A reports the forged source IP and server B gets an ACK.",
+                    "4. Repeat with roles reversed to validate the opposite direction.",
+                    "Passing this test confirms UDP-based IPv4 source spoofing on the path.",
+                    "If you plan to use outer_protocol=icmp or raw, provider filtering can still differ.",
+                ],
+                color=Colors.CYAN,
+                min_width=68,
+            )
+            input("\nPress Enter to continue...")
+            continue
+        print_error("Invalid choice.")
+
+
 def get_latest_release():
     url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest"
     try:
@@ -2772,6 +3164,7 @@ TRANSPORT_TYPE_OPTIONS = [
     ("12", "dns", "📡 DNS Tunnel (UDP/TCP/DoH, stealth)"),
     ("13", "tun", "🔧 TUN Mode (L3 tunnel, IPX encapsulation, BIP)"),
     ("14", "cdn", "🌐 CDN (HTTP/HTTPS through Cloudflare/CDN)"),
+    ("15", "spoof", "🕵️ Spoof (Mutual IPv4 spoof transport)"),
 ]
 TRANSPORT_TYPE_INDEX_TO_NAME = {idx: name for idx, name, _ in TRANSPORT_TYPE_OPTIONS}
 TRANSPORT_TYPE_NAME_TO_INDEX = {name: idx for idx, name, _ in TRANSPORT_TYPE_OPTIONS}
@@ -2803,7 +3196,7 @@ def endpoint_uses_tls(transport_type):
 
 def endpoint_needs_raw_cap(transport_type):
     """Returns True if the transport requires CAP_NET_RAW (AF_PACKET / pcap)."""
-    return normalize_endpoint_type(transport_type) in {"phantom", "antifilter", "tun"}
+    return normalize_endpoint_type(transport_type) in {"phantom", "antifilter", "tun", "spoof"}
 
 
 def endpoint_is_dnstunnel(transport_type):
@@ -3872,6 +4265,252 @@ def prompt_cdn_config(existing=None, role="server"):
     }
 
 
+def normalize_ipv4_address(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = ipaddress.ip_address(raw)
+    except ValueError:
+        return ""
+    if not isinstance(parsed, ipaddress.IPv4Address):
+        return ""
+    return str(parsed)
+
+
+def prompt_ipv4_address(label, default="", allow_empty=False):
+    seed = str(default or "").strip()
+    while True:
+        value = input_default(label, seed).strip()
+        if not value and allow_empty:
+            return ""
+        normalized = normalize_ipv4_address(value)
+        if normalized:
+            return normalized
+        print_error("Enter a valid IPv4 address.")
+
+
+SPOOF_OUTER_PROTOCOL_OPTIONS = [
+    ("1", "udp", "UDP carrier (recommended)"),
+    ("2", "icmp", "ICMP carrier"),
+    ("3", "raw", "Raw IPv4 protocol number"),
+]
+
+
+def normalize_spoof_outer_protocol(value, default="udp"):
+    raw = str(value or "").strip().lower()
+    if raw in {"", "udp"}:
+        return "udp"
+    if raw == "icmp":
+        return "icmp"
+    if raw == "raw":
+        return "raw"
+    return default
+
+
+def empty_spoof_transport_config():
+    return {
+        "interface": "eth0",
+        "source_ip": "",
+        "peer_spoof_ip": "",
+        "peer_real_ip": "",
+        "psk": "",
+        "outer_protocol": "udp",
+        "protocol_number": 253,
+        "mtu": 1400,
+        "window_size": 128,
+        "retransmit_timeout": "400ms",
+        "ack_interval": "40ms",
+        "connect_timeout": "10s",
+        "keepalive": "10s",
+        "max_retries": 8,
+        "read_buffer": 4 * 1024 * 1024,
+        "write_buffer": 4 * 1024 * 1024,
+    }
+
+
+def normalize_spoof_transport_config(value, fallback=None):
+    raw = value if isinstance(value, dict) else {}
+    base = fallback if isinstance(fallback, dict) else {}
+    merged = empty_spoof_transport_config()
+    merged.update(base)
+    merged.update(raw)
+
+    merged["interface"] = str(merged.get("interface", "eth0") or "eth0").strip() or "eth0"
+    merged["source_ip"] = normalize_ipv4_address(merged.get("source_ip", ""))
+    merged["peer_spoof_ip"] = normalize_ipv4_address(merged.get("peer_spoof_ip", ""))
+    merged["peer_real_ip"] = normalize_ipv4_address(merged.get("peer_real_ip", ""))
+    merged["psk"] = str(merged.get("psk", "")).strip()
+    merged["outer_protocol"] = normalize_spoof_outer_protocol(merged.get("outer_protocol", "udp"), "udp")
+
+    try:
+        merged["protocol_number"] = int(merged.get("protocol_number", 253) or 253)
+    except (TypeError, ValueError):
+        merged["protocol_number"] = 253
+    if merged["protocol_number"] < 1 or merged["protocol_number"] > 255:
+        merged["protocol_number"] = 253
+
+    for key, default in {
+        "mtu": 1400,
+        "window_size": 128,
+        "max_retries": 8,
+        "read_buffer": 4 * 1024 * 1024,
+        "write_buffer": 4 * 1024 * 1024,
+    }.items():
+        try:
+            merged[key] = int(merged.get(key, default) or default)
+        except (TypeError, ValueError):
+            merged[key] = default
+        if merged[key] <= 0:
+            merged[key] = default
+
+    for key, default in {
+        "retransmit_timeout": "400ms",
+        "ack_interval": "40ms",
+        "connect_timeout": "10s",
+        "keepalive": "10s",
+    }.items():
+        merged[key] = str(merged.get(key, default) or default).strip() or default
+
+    return merged
+
+
+def prompt_spoof_outer_protocol(default="udp"):
+    normalized_default = normalize_spoof_outer_protocol(default, "udp")
+    default_choice = next(
+        (idx for idx, name, _ in SPOOF_OUTER_PROTOCOL_OPTIONS if name == normalized_default),
+        "1",
+    )
+    print_menu(
+        "🕵️ Spoof Outer Protocol",
+        [f"{Colors.GREEN}[{idx}]{Colors.ENDC} {label}" for idx, _, label in SPOOF_OUTER_PROTOCOL_OPTIONS],
+        color=Colors.CYAN,
+        min_width=48,
+    )
+    while True:
+        choice = input_default("Carrier", default_choice).strip().lower()
+        for idx, name, _ in SPOOF_OUTER_PROTOCOL_OPTIONS:
+            if choice == idx or choice == name:
+                return name
+        print_error("Invalid choice.")
+
+
+def prompt_spoof_transport_config(existing=None, role="server", advanced=False, default_peer_real_ip=""):
+    current = normalize_spoof_transport_config(existing, {})
+    peer_real_default = normalize_ipv4_address(default_peer_real_ip) or current.get("peer_real_ip", "")
+
+    print_header("🕵️ Spoof Transport Configuration")
+    print_info("This transport requires Linux root/CAP_NET_RAW and a provider/path that allows IPv4 source spoofing.")
+    print_info("Run the spoof capability test from the manager before deploying it end-to-end.")
+
+    iface = prompt_interface_with_autodetect("Network interface", current.get("interface", "eth0"))
+    source_ip = prompt_ipv4_address("Spoofed source IPv4", current.get("source_ip", ""))
+    peer_spoof_ip = prompt_ipv4_address("Peer spoofed IPv4", current.get("peer_spoof_ip", ""))
+    if role == "server":
+        peer_real_ip = prompt_ipv4_address("Peer real/public IPv4", peer_real_default)
+    else:
+        peer_real_ip = prompt_ipv4_address(
+            "Peer real/public IPv4 override (blank = resolve from server address)",
+            peer_real_default,
+            allow_empty=True,
+        )
+
+    psk = input_default("Spoof transport PSK (empty = auto-generate)", current.get("psk", "")).strip()
+    if not psk:
+        psk = secrets.token_urlsafe(32)
+        print_info(f"Auto-generated PSK: {psk}")
+
+    outer_protocol = prompt_spoof_outer_protocol(current.get("outer_protocol", "udp"))
+    protocol_number = current.get("protocol_number", 253)
+    if outer_protocol == "raw":
+        protocol_number = prompt_int("IPv4 protocol number (1-255)", protocol_number)
+        if protocol_number < 1 or protocol_number > 255:
+            protocol_number = 253
+    mtu = prompt_int("Wire MTU", current.get("mtu", 1400))
+    if mtu <= 0:
+        mtu = 1400
+
+    spoof_cfg = {
+        "interface": iface,
+        "source_ip": source_ip,
+        "peer_spoof_ip": peer_spoof_ip,
+        "peer_real_ip": peer_real_ip,
+        "psk": psk,
+        "outer_protocol": outer_protocol,
+        "protocol_number": protocol_number,
+        "mtu": mtu,
+        "window_size": current.get("window_size", 128),
+        "retransmit_timeout": current.get("retransmit_timeout", "400ms"),
+        "ack_interval": current.get("ack_interval", "40ms"),
+        "connect_timeout": current.get("connect_timeout", "10s"),
+        "keepalive": current.get("keepalive", "10s"),
+        "max_retries": current.get("max_retries", 8),
+        "read_buffer": current.get("read_buffer", 4 * 1024 * 1024),
+        "write_buffer": current.get("write_buffer", 4 * 1024 * 1024),
+    }
+
+    if advanced:
+        spoof_cfg["window_size"] = prompt_int("Reliable window size", spoof_cfg["window_size"])
+        if spoof_cfg["window_size"] <= 0:
+            spoof_cfg["window_size"] = 128
+        spoof_cfg["retransmit_timeout"] = input_default(
+            "Retransmit timeout",
+            spoof_cfg["retransmit_timeout"],
+        ).strip() or spoof_cfg["retransmit_timeout"]
+        spoof_cfg["ack_interval"] = input_default(
+            "ACK interval",
+            spoof_cfg["ack_interval"],
+        ).strip() or spoof_cfg["ack_interval"]
+        spoof_cfg["connect_timeout"] = input_default(
+            "Connect timeout",
+            spoof_cfg["connect_timeout"],
+        ).strip() or spoof_cfg["connect_timeout"]
+        spoof_cfg["keepalive"] = input_default(
+            "Keepalive interval",
+            spoof_cfg["keepalive"],
+        ).strip() or spoof_cfg["keepalive"]
+        spoof_cfg["max_retries"] = prompt_int("Max retransmit retries", spoof_cfg["max_retries"])
+        if spoof_cfg["max_retries"] <= 0:
+            spoof_cfg["max_retries"] = 8
+        spoof_cfg["read_buffer"] = prompt_int("Raw socket read buffer", spoof_cfg["read_buffer"])
+        if spoof_cfg["read_buffer"] <= 0:
+            spoof_cfg["read_buffer"] = 4 * 1024 * 1024
+        spoof_cfg["write_buffer"] = prompt_int("Raw socket write buffer", spoof_cfg["write_buffer"])
+        if spoof_cfg["write_buffer"] <= 0:
+            spoof_cfg["write_buffer"] = 4 * 1024 * 1024
+
+    return normalize_spoof_transport_config(spoof_cfg, current)
+
+
+def transport_specific_endpoint_config(transport_type, source=None):
+    ep_type = normalize_endpoint_type(transport_type, "tcp")
+    src = source if isinstance(source, dict) else {}
+
+    if ep_type == "dns":
+        return {
+            "dns": normalize_dns_transport_config(
+                src.get("dns", {}),
+                {},
+            )
+        }
+    if ep_type == "spoof":
+        return {
+            "spoof": normalize_spoof_transport_config(
+                src.get("spoof", {}),
+                {},
+            )
+        }
+    if ep_type == "phantom" and isinstance(src.get("phantom"), dict):
+        return {"phantom": dict(src.get("phantom", {}))}
+    if ep_type == "antifilter" and isinstance(src.get("antifilter"), dict):
+        return {"antifilter": dict(src.get("antifilter", {}))}
+    if ep_type == "tun" and isinstance(src.get("tun"), dict):
+        return {"tun": dict(src.get("tun", {}))}
+    if ep_type == "cdn" and isinstance(src.get("cdn"), dict):
+        return {"cdn": dict(src.get("cdn", {}))}
+    return {}
+
+
 def empty_tls_config():
     return {
         "cert_file": "",
@@ -4254,7 +4893,7 @@ def normalize_transport_endpoint(
         ep.get("port_hopping", {}),
         fallback_port_hopping,
     )
-    return {
+    result = {
         "type": ep_type,
         "address": address,
         "url": url,
@@ -4264,6 +4903,8 @@ def normalize_transport_endpoint(
         "reality": reality_cfg,
         "port_hopping": port_hopping_cfg,
     }
+    result.update(transport_specific_endpoint_config(ep_type, ep))
+    return result
 
 
 def derive_client_address_from_endpoint(endpoint, fallback="127.0.0.1:8443"):
@@ -4390,6 +5031,7 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
 
         tls_cfg = empty_tls_config()
         dns_cfg = empty_dns_transport_config()
+        endpoint_extra_cfg = {}
         endpoint_url = ""
         if endpoint_uses_tls(ep_type):
             if role == "server":
@@ -4460,6 +5102,34 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
             )
             dns_cfg = dns_settings["dns"]
             endpoint_url = dns_settings["url"]
+            endpoint_extra_cfg["dns"] = dns_cfg
+
+        if ep_type == "phantom":
+            endpoint_extra_cfg["phantom"] = prompt_phantom_config(defaults.get("phantom", {}))
+
+        if ep_type == "antifilter":
+            ensure_antifilter_deps()
+            endpoint_extra_cfg["antifilter"] = prompt_antifilter_config(
+                defaults.get("antifilter", {})
+            )
+
+        if ep_type == "tun":
+            ensure_tun_deps()
+            endpoint_extra_cfg["tun"] = prompt_tun_transport_config(
+                defaults.get("tun", {}),
+                role=role,
+            )
+
+        if ep_type == "cdn":
+            endpoint_extra_cfg["cdn"] = prompt_cdn_config(defaults.get("cdn", {}), role=role)
+
+        if ep_type == "spoof":
+            endpoint_extra_cfg["spoof"] = prompt_spoof_transport_config(
+                defaults.get("spoof", {}),
+                role=role,
+                advanced=False,
+                default_peer_real_ip=parse_host_from_address(address, "") if role == "client" else "",
+            )
 
         reality_cfg = {}
         if ep_type == "reality":
@@ -4509,6 +5179,7 @@ def prompt_additional_transport_endpoints(role, protocol_config, existing=None):
                 "tls": tls_cfg,
                 "dns": dns_cfg,
                 "reality": reality_cfg,
+                **endpoint_extra_cfg,
             },
             role=role,
             fallback_type=ep_type,
@@ -5013,6 +5684,7 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
             "count": 0,
         },
         "dns": empty_dns_transport_config(),
+        "spoof": empty_spoof_transport_config(),
         "cert": "",
         "key": "",
         "psk": "",
@@ -5368,6 +6040,19 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         else:
             config["port"] = prompt_or_keep_port(80)
         config["path"] = cdn_cfg.get("path", "/cdn-tunnel")
+
+    elif choice == "15":
+        config["type"] = "spoof"
+        config["port"] = prompt_or_keep_port(8443)
+        print_warning(
+            "Spoof transport needs a nodelay build with spoof support, Linux root/CAP_NET_RAW, and a path that allows IPv4 source spoofing."
+        )
+        config["spoof"] = prompt_spoof_transport_config(
+            config.get("spoof", {}),
+            role=role,
+            advanced=advanced_mode,
+            default_peer_real_ip=normalize_ipv4_address(server_addr or config.get("server_addr", "")),
+        )
 
     if str(config.get("type", "")).strip().lower() != "httpmimicry":
         config["allow_plaintext_framing"] = False
@@ -5950,6 +6635,12 @@ def load_instance_runtime_settings(role, instance):
             "service_runtime_max_minutes": service_runtime_max_minutes,
             "profile": profile,
         }
+        protocol_cfg.update(
+            transport_specific_endpoint_config(
+                primary_listen.get("type", "tcp"),
+                primary_listen,
+            )
+        )
         mappings = (
             server_cfg.get("mappings", [])
             if isinstance(server_cfg, dict)
@@ -6084,6 +6775,12 @@ def load_instance_runtime_settings(role, instance):
             "service_runtime_max_minutes": service_runtime_max_minutes,
             "profile": profile,
         }
+        protocol_cfg.update(
+            transport_specific_endpoint_config(
+                primary_server.get("type", "tcp"),
+                primary_server,
+            )
+        )
         mappings = client.get("mappings", [])
         if not isinstance(mappings, list):
             mappings = []
@@ -6685,24 +7382,26 @@ def build_server_primary_endpoint(protocol_config):
     else:
         address = f":{protocol_config.get('port', 8443)}"
     port_hopping_cfg = normalize_port_hopping_cfg(protocol_config.get("port_hopping", {}), {})
-    result = normalize_transport_endpoint(
-        {
-            "type": endpoint_type,
-            "address": address,
-            "url": str(protocol_config.get("url", "")).strip() if endpoint_type == "dns" else "",
-            "path": path,
-            "port_hopping": port_hopping_cfg,
-            "tls": {
-                "cert_file": protocol_config.get("cert", ""),
-                "key_file": protocol_config.get("key", ""),
-                "ca_file": "",
-                "server_name": "",
-                "insecure_skip_verify": False,
-                "require_client_cert": False,
-            },
-            "dns": dns_cfg,
-            "reality": build_primary_endpoint_reality("server", protocol_config, endpoint_type),
+    endpoint_input = {
+        "type": endpoint_type,
+        "address": address,
+        "url": str(protocol_config.get("url", "")).strip() if endpoint_type == "dns" else "",
+        "path": path,
+        "port_hopping": port_hopping_cfg,
+        "tls": {
+            "cert_file": protocol_config.get("cert", ""),
+            "key_file": protocol_config.get("key", ""),
+            "ca_file": "",
+            "server_name": "",
+            "insecure_skip_verify": False,
+            "require_client_cert": False,
         },
+        "dns": dns_cfg,
+        "reality": build_primary_endpoint_reality("server", protocol_config, endpoint_type),
+    }
+    endpoint_input.update(transport_specific_endpoint_config(endpoint_type, protocol_config))
+    result = normalize_transport_endpoint(
+        endpoint_input,
         role="server",
         fallback_type=endpoint_type,
         fallback_address=address,
@@ -6711,11 +7410,6 @@ def build_server_primary_endpoint(protocol_config):
         fallback_port_hopping=port_hopping_cfg,
         fallback_dns=dns_cfg,
     )
-    # Inject transport-specific sub-configs that normalize_transport_endpoint does not preserve
-    for _ts_key in ("dns", "phantom", "antifilter", "tun", "cdn"):
-        _ts_val = protocol_config.get(_ts_key)
-        if isinstance(_ts_val, dict) and _ts_val:
-            result[_ts_key] = _ts_val
     return result
 
 
@@ -6734,24 +7428,26 @@ def build_client_primary_endpoint(protocol_config):
     elif endpoint_type == "dns":
         url = str(protocol_config.get("url", "")).strip()
     port_hopping_cfg = normalize_port_hopping_cfg(protocol_config.get("port_hopping", {}), {})
-    result = normalize_transport_endpoint(
-        {
-            "type": endpoint_type,
-            "address": address,
-            "url": url,
-            "path": path,
-            "port_hopping": port_hopping_cfg,
-            "tls": {
-                "cert_file": "",
-                "key_file": "",
-                "ca_file": "",
-                "server_name": protocol_config.get("sni", ""),
-                "insecure_skip_verify": bool(protocol_config.get("insecure_skip_verify", False)),
-                "require_client_cert": False,
-            },
-            "dns": dns_cfg,
-            "reality": build_primary_endpoint_reality("client", protocol_config, endpoint_type),
+    endpoint_input = {
+        "type": endpoint_type,
+        "address": address,
+        "url": url,
+        "path": path,
+        "port_hopping": port_hopping_cfg,
+        "tls": {
+            "cert_file": "",
+            "key_file": "",
+            "ca_file": "",
+            "server_name": protocol_config.get("sni", ""),
+            "insecure_skip_verify": bool(protocol_config.get("insecure_skip_verify", False)),
+            "require_client_cert": False,
         },
+        "dns": dns_cfg,
+        "reality": build_primary_endpoint_reality("client", protocol_config, endpoint_type),
+    }
+    endpoint_input.update(transport_specific_endpoint_config(endpoint_type, protocol_config))
+    result = normalize_transport_endpoint(
+        endpoint_input,
         role="client",
         fallback_type=endpoint_type,
         fallback_address=address,
@@ -6760,11 +7456,6 @@ def build_client_primary_endpoint(protocol_config):
         fallback_port_hopping=port_hopping_cfg,
         fallback_dns=dns_cfg,
     )
-    # Inject transport-specific sub-configs that normalize_transport_endpoint does not preserve
-    for _ts_key in ("dns", "phantom", "antifilter", "tun", "cdn"):
-        _ts_val = protocol_config.get(_ts_key)
-        if isinstance(_ts_val, dict) and _ts_val:
-            result[_ts_key] = _ts_val
     return result
 
 
@@ -6884,6 +7575,7 @@ def build_client_setup_lines_for_server_summary(cfg):
     server_address, all_eps = resolve_server_address_for_client_summary(cfg)
     ep_type = normalize_endpoint_type(cfg.get("type", "tcp"), "tcp")
     dns_cfg = normalize_dns_transport_config(cfg.get("dns", {}), {})
+    spoof_cfg = normalize_spoof_transport_config(cfg.get("spoof", {}), {})
     tunnel_mode = str(cfg.get("tunnel_mode", "reverse")).strip().lower() or "reverse"
     psk_text = str(cfg.get("psk", "")).strip() or "(disabled)"
     path_text = str(cfg.get("path", "")).strip() or "/tunnel"
@@ -6903,6 +7595,12 @@ def build_client_setup_lines_for_server_summary(cfg):
         lines.append(f"DNS Base Domain: {dns_cfg.get('base_domain', '') or '(missing)'}")
         lines.append(f"DNS Query Transport: {dns_cfg.get('query_transport', 'udp')}")
         lines.append(f"DNS Listen Network: {dns_cfg.get('listen_network', 'udp')}")
+
+    if ep_type == "spoof":
+        lines.append(f"Spoof Source IP: {spoof_cfg.get('source_ip', '') or '(missing)'}")
+        lines.append(f"Spoof Peer IP: {spoof_cfg.get('peer_spoof_ip', '') or '(missing)'}")
+        lines.append(f"Spoof Carrier: {spoof_cfg.get('outer_protocol', 'udp')}")
+        lines.append("Spoof check: repeat the manager's spoof capability test in both directions.")
 
     if ep_type in {"httpmimicry", "httpsmimicry"}:
         lines.append(f"Mimic Path: {path_text}")
@@ -6994,6 +7692,29 @@ def render_named_transport_endpoint_lines(
                 f"{indent}    poll_burst_count: {yaml_scalar(normalized_dns.get('poll_burst_count', 10))}",
             ]
         )
+    if ep_type == "spoof":
+        normalized_spoof = normalize_spoof_transport_config(endpoint.get("spoof", {}), {})
+        lines.extend(
+            [
+                f"{indent}  spoof:",
+                f"{indent}    interface: {yaml_scalar(normalized_spoof.get('interface', 'eth0'))}",
+                f"{indent}    source_ip: {yaml_scalar(normalized_spoof.get('source_ip', ''))}",
+                f"{indent}    peer_spoof_ip: {yaml_scalar(normalized_spoof.get('peer_spoof_ip', ''))}",
+                f"{indent}    peer_real_ip: {yaml_scalar(normalized_spoof.get('peer_real_ip', ''))}",
+                f"{indent}    psk: {yaml_scalar(normalized_spoof.get('psk', ''))}",
+                f"{indent}    outer_protocol: {yaml_scalar(normalized_spoof.get('outer_protocol', 'udp'))}",
+                f"{indent}    protocol_number: {yaml_scalar(normalized_spoof.get('protocol_number', 253))}",
+                f"{indent}    mtu: {yaml_scalar(normalized_spoof.get('mtu', 1400))}",
+                f"{indent}    window_size: {yaml_scalar(normalized_spoof.get('window_size', 128))}",
+                f"{indent}    retransmit_timeout: {yaml_scalar(normalized_spoof.get('retransmit_timeout', '400ms'))}",
+                f"{indent}    ack_interval: {yaml_scalar(normalized_spoof.get('ack_interval', '40ms'))}",
+                f"{indent}    connect_timeout: {yaml_scalar(normalized_spoof.get('connect_timeout', '10s'))}",
+                f"{indent}    keepalive: {yaml_scalar(normalized_spoof.get('keepalive', '10s'))}",
+                f"{indent}    max_retries: {yaml_scalar(normalized_spoof.get('max_retries', 8))}",
+                f"{indent}    read_buffer: {yaml_scalar(normalized_spoof.get('read_buffer', 4 * 1024 * 1024))}",
+                f"{indent}    write_buffer: {yaml_scalar(normalized_spoof.get('write_buffer', 4 * 1024 * 1024))}",
+            ]
+        )
     lines.extend(render_port_hopping_lines(f"{indent}  ", endpoint.get("port_hopping", {})))
     if include_tls:
         lines.extend(
@@ -7065,6 +7786,29 @@ def render_transport_endpoints_list_lines(
                     f"{indent}      poll_max_interval: {yaml_scalar(normalized_dns.get('poll_max_interval', '500ms'))}",
                     f"{indent}      poll_idle_threshold: {yaml_scalar(normalized_dns.get('poll_idle_threshold', '2s'))}",
                     f"{indent}      poll_burst_count: {yaml_scalar(normalized_dns.get('poll_burst_count', 10))}",
+                ]
+            )
+        if ep_type == "spoof":
+            normalized_spoof = normalize_spoof_transport_config(endpoint.get("spoof", {}), {})
+            lines.extend(
+                [
+                    f"{indent}    spoof:",
+                    f"{indent}      interface: {yaml_scalar(normalized_spoof.get('interface', 'eth0'))}",
+                    f"{indent}      source_ip: {yaml_scalar(normalized_spoof.get('source_ip', ''))}",
+                    f"{indent}      peer_spoof_ip: {yaml_scalar(normalized_spoof.get('peer_spoof_ip', ''))}",
+                    f"{indent}      peer_real_ip: {yaml_scalar(normalized_spoof.get('peer_real_ip', ''))}",
+                    f"{indent}      psk: {yaml_scalar(normalized_spoof.get('psk', ''))}",
+                    f"{indent}      outer_protocol: {yaml_scalar(normalized_spoof.get('outer_protocol', 'udp'))}",
+                    f"{indent}      protocol_number: {yaml_scalar(normalized_spoof.get('protocol_number', 253))}",
+                    f"{indent}      mtu: {yaml_scalar(normalized_spoof.get('mtu', 1400))}",
+                    f"{indent}      window_size: {yaml_scalar(normalized_spoof.get('window_size', 128))}",
+                    f"{indent}      retransmit_timeout: {yaml_scalar(normalized_spoof.get('retransmit_timeout', '400ms'))}",
+                    f"{indent}      ack_interval: {yaml_scalar(normalized_spoof.get('ack_interval', '40ms'))}",
+                    f"{indent}      connect_timeout: {yaml_scalar(normalized_spoof.get('connect_timeout', '10s'))}",
+                    f"{indent}      keepalive: {yaml_scalar(normalized_spoof.get('keepalive', '10s'))}",
+                    f"{indent}      max_retries: {yaml_scalar(normalized_spoof.get('max_retries', 8))}",
+                    f"{indent}      read_buffer: {yaml_scalar(normalized_spoof.get('read_buffer', 4 * 1024 * 1024))}",
+                    f"{indent}      write_buffer: {yaml_scalar(normalized_spoof.get('write_buffer', 4 * 1024 * 1024))}",
                 ]
             )
         lines.extend(render_port_hopping_lines(f"{indent}    ", endpoint.get("port_hopping", {})))
@@ -8272,6 +9016,11 @@ def install_server_flow(
     print(f"MUX:      {Colors.BOLD}{cfg.get('mux_type', 'smux')}{Colors.ENDC}")
     print(f"Profile:  {Colors.BOLD}{cfg['profile']}{Colors.ENDC}")
     print(f"Deploy:   {Colors.BOLD}{deployment_mode}{Colors.ENDC}")
+    if cfg["type"] == "spoof":
+        spoof_cfg = normalize_spoof_transport_config(cfg.get("spoof", {}), {})
+        print(f"SpoofSrc: {Colors.BOLD}{spoof_cfg.get('source_ip', '')}{Colors.ENDC}")
+        print(f"SpoofPeer:{Colors.BOLD}{spoof_cfg.get('peer_spoof_ip', '')}{Colors.ENDC}")
+        print(f"Carrier:  {Colors.BOLD}{spoof_cfg.get('outer_protocol', 'udp')}{Colors.ENDC}")
     if cfg["type"] == "reality":
         print(f"ShortID:  {Colors.BOLD}{cfg['short_id']}{Colors.ENDC}")
         print(f"Private:  {Colors.BOLD}{cfg['private_key']}{Colors.ENDC}")
@@ -8378,6 +9127,11 @@ def install_client_flow(
     print(f"Path MTU:   {Colors.BOLD}{cfg.get('network_mtu', 0)}{Colors.ENDC}")
     print(f"MUX:        {Colors.BOLD}{cfg.get('mux_type', 'smux')}{Colors.ENDC}")
     print(f"Deploy:     {Colors.BOLD}{deployment_mode}{Colors.ENDC}")
+    if cfg["type"] == "spoof":
+        spoof_cfg = normalize_spoof_transport_config(cfg.get("spoof", {}), {})
+        print(f"SpoofSrc:   {Colors.BOLD}{spoof_cfg.get('source_ip', '')}{Colors.ENDC}")
+        print(f"SpoofPeer:  {Colors.BOLD}{spoof_cfg.get('peer_spoof_ip', '')}{Colors.ENDC}")
+        print(f"Carrier:    {Colors.BOLD}{spoof_cfg.get('outer_protocol', 'udp')}{Colors.ENDC}")
     frag_info = cfg.get("frag", {})
     if isinstance(frag_info, dict) and frag_info.get("mtu_enabled"):
         frag_size = frag_info.get("fragment_size", 200)
@@ -8495,7 +9249,8 @@ def main_menu():
                 f"{Colors.CYAN}[8]{Colors.ENDC} 🧷 Install nodelay-manager alias",
                 f"{Colors.CYAN}[9]{Colors.ENDC} ⬆️ Update nodelay-manager script",
                 f"{Colors.CYAN}[10]{Colors.ENDC} 🌌 Find best REALITY SNI (Run on Tunnel Client)",
-                f"{Colors.CYAN}[11]{Colors.ENDC} 🗑️  Uninstall",
+                f"{Colors.CYAN}[11]{Colors.ENDC} 🕵️ Spoof Capability Test",
+                f"{Colors.CYAN}[12]{Colors.ENDC} 🗑️  Uninstall",
                 f"{Colors.WARNING}[0]{Colors.ENDC} 🚪 Exit",
             ],
             color=Colors.CYAN,
@@ -8554,6 +9309,10 @@ def main_menu():
             input("\nPress Enter to continue...")
 
         elif choice == "11":
+            check_root()
+            spoof_capability_test_menu()
+
+        elif choice == "12":
             uninstall_everything()
             input("\nPress Enter to continue...")
 
