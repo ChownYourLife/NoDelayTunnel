@@ -85,6 +85,7 @@ IPERF_POOR_MBPS = 100.0
 SPOOF_TEST_DEFAULT_PORT = 47890
 SPOOF_TEST_DEFAULT_TIMEOUT = 20
 SPOOF_TEST_DEFAULT_COUNT = 3
+SPOOF_TEST_BGP_PORT = 179
 SPOOF_TEST_MAGIC = "NODELAY-SPOOF-TEST"
 SPOOF_TEST_ACK_MAGIC = "NODELAY-SPOOF-ACK"
 PORT_HOPPING_MAX_PORTS = 256
@@ -1596,13 +1597,10 @@ def ipv4_checksum(data):
     return (~total) & 0xFFFF
 
 
-def build_spoof_test_udp_packet(source_ip, dest_ip, source_port, dest_port, payload, ttl=64):
-    if isinstance(payload, str):
-        payload = payload.encode("utf-8")
+def build_spoof_test_ipv4_header(source_ip, dest_ip, protocol_number, payload_length, ttl=64):
     source_raw = socket.inet_aton(source_ip)
     dest_raw = socket.inet_aton(dest_ip)
-    udp_length = 8 + len(payload)
-    total_length = 20 + udp_length
+    total_length = 20 + int(payload_length)
     ident = random.randint(0, 65535)
     ip_header = struct.pack(
         "!BBHHHBBH4s4s",
@@ -1612,12 +1610,12 @@ def build_spoof_test_udp_packet(source_ip, dest_ip, source_port, dest_port, payl
         ident,
         0,
         ttl,
-        socket.IPPROTO_UDP,
+        int(protocol_number),
         0,
         source_raw,
         dest_raw,
     )
-    ip_header = struct.pack(
+    return struct.pack(
         "!BBHHHBBH4s4s",
         0x45,
         0,
@@ -1625,14 +1623,187 @@ def build_spoof_test_udp_packet(source_ip, dest_ip, source_port, dest_port, payl
         ident,
         0,
         ttl,
-        socket.IPPROTO_UDP,
+        int(protocol_number),
         ipv4_checksum(ip_header),
         source_raw,
         dest_raw,
     )
+
+
+def build_spoof_test_udp_packet(source_ip, dest_ip, source_port, dest_port, payload, ttl=64):
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    udp_length = 8 + len(payload)
+    ip_header = build_spoof_test_ipv4_header(
+        source_ip,
+        dest_ip,
+        socket.IPPROTO_UDP,
+        udp_length,
+        ttl=ttl,
+    )
     udp_header = struct.pack("!HHHH", int(source_port), int(dest_port), udp_length, 0)
     return ip_header + udp_header + payload
 
+
+def build_spoof_test_icmp_packet(source_ip, dest_ip, payload, ttl=64):
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    identifier = random.randint(1, 65535)
+    sequence = random.randint(1, 65535)
+    icmp_header = struct.pack("!BBHHH", 8, 0, 0, identifier, sequence)
+    icmp_checksum = ipv4_checksum(icmp_header + payload)
+    icmp_header = struct.pack("!BBHHH", 8, 0, icmp_checksum, identifier, sequence)
+    icmp_packet = icmp_header + payload
+    ip_header = build_spoof_test_ipv4_header(
+        source_ip,
+        dest_ip,
+        socket.IPPROTO_ICMP,
+        len(icmp_packet),
+        ttl=ttl,
+    )
+    return ip_header + icmp_packet
+
+
+def build_spoof_test_bgp_packet(source_ip, dest_ip, source_port, dest_port, payload, ttl=64):
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    seq = random.randint(0, 0xFFFFFFFF)
+    ack = 0
+    flags = 0x18
+    window = 65535
+    data_offset = 5
+    offset_and_flags = (data_offset << 12) | flags
+    tcp_length = 20 + len(payload)
+    pseudo_header = (
+        socket.inet_aton(source_ip)
+        + socket.inet_aton(dest_ip)
+        + struct.pack("!BBH", 0, socket.IPPROTO_TCP, tcp_length)
+    )
+    tcp_header = struct.pack(
+        "!HHIIHHHH",
+        int(source_port),
+        int(dest_port),
+        seq,
+        ack,
+        offset_and_flags,
+        window,
+        0,
+        0,
+    )
+    checksum = ipv4_checksum(pseudo_header + tcp_header + payload)
+    tcp_header = struct.pack(
+        "!HHIIHHHH",
+        int(source_port),
+        int(dest_port),
+        seq,
+        ack,
+        offset_and_flags,
+        window,
+        checksum,
+        0,
+    )
+    ip_header = build_spoof_test_ipv4_header(
+        source_ip,
+        dest_ip,
+        socket.IPPROTO_TCP,
+        len(tcp_header) + len(payload),
+        ttl=ttl,
+    )
+    return ip_header + tcp_header + payload
+
+def build_spoof_test_packet(
+    carrier,
+    source_ip,
+    dest_ip,
+    *,
+    payload,
+    source_port=0,
+    dest_port=0,
+    bgp_dest_port=SPOOF_TEST_BGP_PORT,
+):
+    selected = str(carrier or "udp").strip().lower()
+    if selected == "icmp":
+        return build_spoof_test_icmp_packet(source_ip, dest_ip, payload)
+    if selected == "raw":
+        return build_spoof_test_bgp_packet(
+            source_ip,
+            dest_ip,
+            source_port or random.randint(20000, 65000),
+            bgp_dest_port,
+            payload,
+        )
+    return build_spoof_test_udp_packet(
+        source_ip,
+        dest_ip,
+        source_port,
+        dest_port,
+        payload,
+    )
+
+def parse_ipv4_packet(packet):
+    if len(packet) < 20:
+        return None
+    version = packet[0] >> 4
+    ihl = (packet[0] & 0x0F) * 4
+    if version != 4 or ihl < 20 or len(packet) < ihl:
+        return None
+    total_length = struct.unpack("!H", packet[2:4])[0]
+    if total_length >= ihl and total_length <= len(packet):
+        packet = packet[:total_length]
+    return {
+        "protocol": packet[9],
+        "source_ip": socket.inet_ntoa(packet[12:16]),
+        "dest_ip": socket.inet_ntoa(packet[16:20]),
+        "payload": packet[ihl:],
+    }
+
+
+def parse_spoof_test_probe(packet, carrier, expected_udp_port=0, bgp_dest_port=SPOOF_TEST_BGP_PORT):
+    ip_packet = parse_ipv4_packet(packet)
+    if not ip_packet:
+        return None
+
+    selected = str(carrier or "udp").strip().lower()
+    payload = ip_packet["payload"]
+
+    if selected == "udp":
+        if ip_packet["protocol"] != socket.IPPROTO_UDP or len(payload) < 8:
+            return None
+        _, dest_port, _, _ = struct.unpack("!HHHH", payload[:8])
+        if expected_udp_port and dest_port != int(expected_udp_port):
+            return None
+        payload = payload[8:]
+    elif selected == "icmp":
+        if ip_packet["protocol"] != socket.IPPROTO_ICMP or len(payload) < 8:
+            return None
+        icmp_type, icmp_code = struct.unpack("!BB", payload[:2])
+        if icmp_type != 8 or icmp_code != 0:
+            return None
+        payload = payload[8:]
+    else:
+        if ip_packet["protocol"] != socket.IPPROTO_TCP or len(payload) < 20:
+            return None
+        _, dest_port = struct.unpack("!HH", payload[:4])
+        tcp_header_length = ((payload[12] >> 4) & 0x0F) * 4
+        if tcp_header_length < 20 or len(payload) < tcp_header_length:
+            return None
+        if int(dest_port) != int(bgp_dest_port):
+            return None
+        payload = payload[tcp_header_length:]
+
+    text_payload = payload.decode("utf-8", errors="ignore").strip()
+    if not text_payload.startswith(f"{SPOOF_TEST_MAGIC}|"):
+        return None
+    parts = text_payload.split("|")
+    if len(parts) < 5:
+        return None
+    return {
+        "probe_id": parts[1],
+        "ack_ip_raw": parts[2],
+        "ack_port_raw": parts[3],
+        "claimed_spoof_ip": parts[4],
+        "seen_source_ip": ip_packet["source_ip"],
+    }
 
 def wait_for_spoof_test_ack(ack_sock, probe_id, deadline):
     while time.time() < deadline:
@@ -1667,12 +1838,15 @@ def wait_for_spoof_test_ack(ack_sock, probe_id, deadline):
 def spoof_capability_receiver_mode():
     print_header("🕵️ Spoof Capability Receiver")
     print_info("Run this on the server that should receive the spoofed packet.")
-    print_info("Then run sender mode on the remote server and repeat in reverse to validate both sides.")
+    print_info("The receiver captures the selected carrier with a raw socket and sends ACKs back over UDP.")
 
-    listen_port = prompt_int("Receiver UDP port", SPOOF_TEST_DEFAULT_PORT)
-    while listen_port < 1 or listen_port > 65535:
-        print_error("Port must be between 1 and 65535.")
+    carrier = prompt_spoof_outer_protocol("udp")
+    listen_port = 0
+    if carrier == "udp":
         listen_port = prompt_int("Receiver UDP port", SPOOF_TEST_DEFAULT_PORT)
+        while listen_port < 1 or listen_port > 65535:
+            print_error("Port must be between 1 and 65535.")
+            listen_port = prompt_int("Receiver UDP port", SPOOF_TEST_DEFAULT_PORT)
 
     timeout_seconds = prompt_int("Listen timeout (seconds)", SPOOF_TEST_DEFAULT_TIMEOUT)
     if timeout_seconds <= 0:
@@ -1686,18 +1860,44 @@ def spoof_capability_receiver_mode():
         allow_empty=True,
     )
 
-    sock = None
+    capture_proto = (
+        socket.IPPROTO_UDP
+        if carrier == "udp"
+        else socket.IPPROTO_ICMP
+        if carrier == "icmp"
+        else socket.IPPROTO_TCP
+    )
+    capture_sock = None
+    ack_sock = None
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("0.0.0.0", int(listen_port)))
+        capture_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, capture_proto)
+        ack_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ack_sock.bind(("", 0))
+    except PermissionError:
+        if capture_sock is not None:
+            capture_sock.close()
+        if ack_sock is not None:
+            ack_sock.close()
+        print_error("Raw socket access failed. Run the manager as root on Linux.")
+        return False
     except OSError as exc:
-        if sock is not None:
-            sock.close()
+        if capture_sock is not None:
+            capture_sock.close()
+        if ack_sock is not None:
+            ack_sock.close()
         print_error(f"Failed to start receiver: {exc}")
         return False
 
-    print_success(f"Receiver listening on 0.0.0.0:{listen_port} for up to {timeout_seconds}s.")
+    if carrier == "udp":
+        print_success(
+            f"Receiver listening for spoofed UDP traffic to port {listen_port} for up to {timeout_seconds}s."
+        )
+    elif carrier == "icmp":
+        print_success(f"Receiver listening for spoofed ICMP echo requests for up to {timeout_seconds}s.")
+    else:
+        print_success(
+            f"Receiver listening for spoofed BGP-style TCP traffic to destination port {SPOOF_TEST_BGP_PORT} for up to {timeout_seconds}s."
+        )
     if expected_spoof_ip:
         print_info(f"Expected spoofed source IP: {expected_spoof_ip}")
 
@@ -1708,9 +1908,9 @@ def spoof_capability_receiver_mode():
     try:
         while time.time() < deadline and seen < max_probes:
             remaining = deadline - time.time()
-            sock.settimeout(min(1.0, max(0.1, remaining)))
+            capture_sock.settimeout(min(1.0, max(0.1, remaining)))
             try:
-                payload, addr = sock.recvfrom(4096)
+                packet, _ = capture_sock.recvfrom(65535)
             except socket.timeout:
                 continue
             except KeyboardInterrupt:
@@ -1719,17 +1919,22 @@ def spoof_capability_receiver_mode():
                 print_error(f"Receiver socket error: {exc}")
                 return False
 
-            text = payload.decode("utf-8", errors="ignore").strip()
-            if not text.startswith(f"{SPOOF_TEST_MAGIC}|"):
+            probe = parse_spoof_test_probe(
+                packet,
+                carrier,
+                expected_udp_port=listen_port,
+                bgp_dest_port=SPOOF_TEST_BGP_PORT,
+            )
+            if not probe:
                 continue
 
-            parts = text.split("|")
-            if len(parts) < 5:
-                print_warning("Ignored malformed spoof probe payload.")
-                continue
-
-            _, probe_id, ack_ip_raw, ack_port_raw, claimed_spoof_ip = parts[:5]
-            seen_source_ip = normalize_ipv4_address(addr[0]) or str(addr[0]).strip()
+            probe_id = probe["probe_id"]
+            ack_ip_raw = probe["ack_ip_raw"]
+            ack_port_raw = probe["ack_port_raw"]
+            claimed_spoof_ip = probe["claimed_spoof_ip"]
+            seen_source_ip = normalize_ipv4_address(probe["seen_source_ip"]) or str(
+                probe["seen_source_ip"]
+            ).strip()
             seen += 1
 
             matches_claim = seen_source_ip == normalize_ipv4_address(claimed_spoof_ip)
@@ -1755,7 +1960,7 @@ def spoof_capability_receiver_mode():
                     f"{SPOOF_TEST_ACK_MAGIC}|{probe_id}|{seen_source_ip}|{claimed_spoof_ip}|{status}"
                 ).encode("utf-8")
                 try:
-                    sock.sendto(ack_payload, (ack_ip, ack_port))
+                    ack_sock.sendto(ack_payload, (ack_ip, ack_port))
                     acked += 1
                 except OSError as exc:
                     print_warning(f"Failed to send ACK to {ack_ip}:{ack_port}: {exc}")
@@ -1764,18 +1969,18 @@ def spoof_capability_receiver_mode():
     except KeyboardInterrupt:
         print_warning("Receiver interrupted by user.")
     finally:
-        sock.close()
+        capture_sock.close()
+        ack_sock.close()
 
     print_info(f"Receiver summary: valid probes={seen}, ACKs sent={acked}.")
     if seen == 0:
         print_warning("No spoof probe was observed before timeout.")
     return seen > 0
 
-
 def spoof_capability_sender_mode(default_host=""):
     print_header("🕵️ Spoof Capability Sender")
-    print_info("This sends a forged-source IPv4 UDP packet with a raw socket and waits for an ACK back to your real IP.")
-    print_info("If the remote receiver reports your spoofed source IP correctly, that direction is spoof-capable for UDP.")
+    print_info("This sends a forged-source IPv4 packet with the selected carrier and waits for an ACK back to your real IP.")
+    print_info("If the remote receiver reports your spoofed source IP correctly, that direction is spoof-capable for the selected carrier.")
 
     host_seed = default_host or "1.2.3.4"
     receiver_host = input_default("Remote receiver real host/IP", host_seed).strip()
@@ -1788,15 +1993,31 @@ def spoof_capability_sender_mode(default_host=""):
         print_error(str(exc))
         return False
 
-    receiver_port = prompt_int("Remote receiver UDP port", SPOOF_TEST_DEFAULT_PORT)
-    while receiver_port < 1 or receiver_port > 65535:
-        print_error("Port must be between 1 and 65535.")
+    carrier = prompt_spoof_outer_protocol("udp")
+    receiver_port = 0
+    spoof_source_port = 0
+    if carrier == "udp":
         receiver_port = prompt_int("Remote receiver UDP port", SPOOF_TEST_DEFAULT_PORT)
+        while receiver_port < 1 or receiver_port > 65535:
+            print_error("Port must be between 1 and 65535.")
+            receiver_port = prompt_int("Remote receiver UDP port", SPOOF_TEST_DEFAULT_PORT)
+        spoof_source_port = prompt_int("Spoofed UDP source port", receiver_port)
+        while spoof_source_port < 1 or spoof_source_port > 65535:
+            print_error("Port must be between 1 and 65535.")
+            spoof_source_port = prompt_int("Spoofed UDP source port", receiver_port)
+    elif carrier == "raw":
+        spoof_source_port = prompt_int("Spoofed TCP source port", 50000)
+        while spoof_source_port < 1 or spoof_source_port > 65535:
+            print_error("Port must be between 1 and 65535.")
+            spoof_source_port = prompt_int("Spoofed TCP source port", 50000)
 
     spoof_source_ip = prompt_ipv4_address("Spoofed source IPv4 to test", "")
     ack_ip_default = normalize_ipv4_address(detect_public_ip_best_effort())
     if not ack_ip_default:
-        ack_ip_default = detect_outbound_ipv4_for_target(receiver_ip, receiver_port)
+        ack_ip_default = detect_outbound_ipv4_for_target(
+            receiver_ip,
+            receiver_port if receiver_port else SPOOF_TEST_BGP_PORT if carrier == "raw" else 53,
+        )
     ack_ip = prompt_ipv4_address("Your real/public IPv4 for ACK delivery", ack_ip_default)
 
     probe_count = prompt_int("Probe count", SPOOF_TEST_DEFAULT_COUNT)
@@ -1805,10 +2026,6 @@ def spoof_capability_sender_mode(default_host=""):
     timeout_seconds = prompt_int("Total ACK wait timeout (seconds)", SPOOF_TEST_DEFAULT_TIMEOUT)
     if timeout_seconds <= 0:
         timeout_seconds = SPOOF_TEST_DEFAULT_TIMEOUT
-    spoof_source_port = prompt_int("Spoofed UDP source port", receiver_port)
-    while spoof_source_port < 1 or spoof_source_port > 65535:
-        print_error("Port must be between 1 and 65535.")
-        spoof_source_port = prompt_int("Spoofed UDP source port", receiver_port)
 
     raw_sock = None
     ack_sock = None
@@ -1839,18 +2056,27 @@ def spoof_capability_sender_mode(default_host=""):
     ack_result = None
 
     try:
-        print_info(f"Receiver IPv4: {receiver_ip}:{receiver_port}")
+        if carrier == "udp":
+            print_info(f"Receiver IPv4: {receiver_ip}:{receiver_port} over UDP")
+        elif carrier == "icmp":
+            print_info(f"Receiver IPv4: {receiver_ip} over ICMP")
+        else:
+            print_info(
+                f"Receiver IPv4: {receiver_ip} over BGP-style TCP destination port {SPOOF_TEST_BGP_PORT}"
+            )
         print_info(f"ACK target: {ack_ip}:{ack_port}")
         for attempt in range(probe_count):
             payload = (
-                f"{SPOOF_TEST_MAGIC}|{probe_id}|{ack_ip}|{ack_port}|{spoof_source_ip}|{attempt + 1}"
+                f"{SPOOF_TEST_MAGIC}|{probe_id}|{ack_ip}|{ack_port}|{spoof_source_ip}|{carrier}|{attempt + 1}"
             ).encode("utf-8")
-            packet = build_spoof_test_udp_packet(
+            packet = build_spoof_test_packet(
+                carrier,
                 spoof_source_ip,
                 receiver_ip,
-                spoof_source_port,
-                receiver_port,
-                payload,
+                payload=payload,
+                source_port=spoof_source_port,
+                dest_port=receiver_port,
+                bgp_dest_port=SPOOF_TEST_BGP_PORT,
             )
             try:
                 raw_sock.sendto(packet, (receiver_ip, 0))
@@ -1859,7 +2085,9 @@ def spoof_capability_sender_mode(default_host=""):
                 return False
 
             print_info(
-                f"Sent spoof probe {attempt + 1}/{probe_count} with forged source {spoof_source_ip}:{spoof_source_port}."
+                f"Sent {carrier} spoof probe {attempt + 1}/{probe_count} with forged source {spoof_source_ip}"
+                + (f":{spoof_source_port}" if carrier in ("udp", "raw") else "")
+                + "."
             )
             ack_result = wait_for_spoof_test_ack(
                 ack_sock,
@@ -1884,7 +2112,7 @@ def spoof_capability_sender_mode(default_host=""):
 
     if ack_result["status"] == "ok" and ack_result["seen_source"] == spoof_source_ip:
         print_success(
-            f"Receiver {ack_result['peer']} observed spoofed source {ack_result['seen_source']} correctly."
+            f"Receiver {ack_result['peer']} observed spoofed source {ack_result['seen_source']} correctly over {carrier}."
         )
         print_info("Repeat the same test in the opposite direction to confirm both servers are spoof-capable.")
         return True
@@ -1894,14 +2122,14 @@ def spoof_capability_sender_mode(default_host=""):
     )
     return False
 
-
 def spoof_capability_test_menu(default_host=""):
+
     while True:
         print_menu(
             "🕵️ Spoof Capability Test",
             [
                 "1. Start receiver mode on this node",
-                "2. Send spoofed UDP probes to remote receiver",
+                "2. Send spoofed probes to remote receiver",
                 "3. Show two-way test checklist",
                 "0. Back",
             ],
@@ -1927,8 +2155,8 @@ def spoof_capability_test_menu(default_host=""):
                     "2. Run sender mode on server B targeting server A's real IP.",
                     "3. Confirm server A reports the forged source IP and server B gets an ACK.",
                     "4. Repeat with roles reversed to validate the opposite direction.",
-                    "Passing this test confirms UDP-based IPv4 source spoofing on the path.",
-                    "If you plan to use outer_protocol=icmp or raw, provider filtering can still differ.",
+                    "You can test udp, icmp, or raw where raw uses a BGP-style TCP/179 probe.",
+                    "Passing a carrier here confirms that carrier works on the path in that direction.",
                 ],
                 color=Colors.CYAN,
                 min_width=68,
