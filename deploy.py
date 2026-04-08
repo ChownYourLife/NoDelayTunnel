@@ -4546,6 +4546,7 @@ def empty_spoof_transport_config():
         "psk": "",
         "outer_protocol": "udp",
         "protocol_number": 253,
+        "encapsulation_profile": "ipx",
         "mtu": 1400,
         "window_size": 128,
         "retransmit_timeout": "400ms",
@@ -4571,6 +4572,11 @@ def normalize_spoof_transport_config(value, fallback=None):
     merged["peer_real_ip"] = normalize_ipv4_address(merged.get("peer_real_ip", ""))
     merged["psk"] = str(merged.get("psk", "")).strip()
     merged["outer_protocol"] = normalize_spoof_outer_protocol(merged.get("outer_protocol", "udp"), "udp")
+    
+    encap = str(merged.get("encapsulation_profile", "ipx")).strip().lower()
+    if encap not in {"ipx", "tcp_like", ""}:
+        encap = "ipx"
+    merged["encapsulation_profile"] = encap
 
     try:
         merged["protocol_number"] = int(merged.get("protocol_number", 253) or 253)
@@ -4655,6 +4661,10 @@ def prompt_spoof_transport_config(existing=None, role="server", advanced=False, 
         protocol_number = prompt_int("IPv4 protocol number (1-255)", protocol_number)
         if protocol_number < 1 or protocol_number > 255:
             protocol_number = 253
+            
+    encapsulation_profile = current.get("encapsulation_profile", "ipx")
+    encapsulation_profile = prompt_encapsulation_profile(encapsulation_profile)
+
     mtu = prompt_int("Wire MTU", current.get("mtu", 1400))
     if mtu <= 0:
         mtu = 1400
@@ -4667,6 +4677,7 @@ def prompt_spoof_transport_config(existing=None, role="server", advanced=False, 
         "psk": psk,
         "outer_protocol": outer_protocol,
         "protocol_number": protocol_number,
+        "encapsulation_profile": encapsulation_profile,
         "mtu": mtu,
         "window_size": current.get("window_size", 128),
         "retransmit_timeout": current.get("retransmit_timeout", "400ms"),
