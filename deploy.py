@@ -4662,8 +4662,10 @@ def prompt_spoof_transport_config(existing=None, role="server", advanced=False, 
         if protocol_number < 1 or protocol_number > 255:
             protocol_number = 253
             
-    encapsulation_profile = current.get("encapsulation_profile", "ipx")
-    encapsulation_profile = prompt_encapsulation_profile(encapsulation_profile)
+    encaps_default_value = current.get("encapsulation_profile", "ipx") or "ipx"
+    encaps_default = "2" if encaps_default_value == "tcp_like" else "1"
+    encaps_choice = input_default("Encapsulation profile [1=ipx / 2=tcp_like]", encaps_default).strip()
+    encapsulation_profile = "tcp_like" if encaps_choice == "2" else "ipx"
 
     mtu = prompt_int("Wire MTU", current.get("mtu", 1400))
     if mtu <= 0:
@@ -7944,6 +7946,7 @@ def render_named_transport_endpoint_lines(
                 f"{indent}    psk: {yaml_scalar(normalized_spoof.get('psk', ''))}",
                 f"{indent}    outer_protocol: {yaml_scalar(normalized_spoof.get('outer_protocol', 'udp'))}",
                 f"{indent}    protocol_number: {yaml_scalar(normalized_spoof.get('protocol_number', 253))}",
+                f"{indent}    encapsulation_profile: {yaml_scalar(normalized_spoof.get('encapsulation_profile', 'ipx'))}",
                 f"{indent}    mtu: {yaml_scalar(normalized_spoof.get('mtu', 1400))}",
                 f"{indent}    window_size: {yaml_scalar(normalized_spoof.get('window_size', 128))}",
                 f"{indent}    retransmit_timeout: {yaml_scalar(normalized_spoof.get('retransmit_timeout', '400ms'))}",
@@ -8040,6 +8043,7 @@ def render_transport_endpoints_list_lines(
                     f"{indent}      psk: {yaml_scalar(normalized_spoof.get('psk', ''))}",
                     f"{indent}      outer_protocol: {yaml_scalar(normalized_spoof.get('outer_protocol', 'udp'))}",
                     f"{indent}      protocol_number: {yaml_scalar(normalized_spoof.get('protocol_number', 253))}",
+                    f"{indent}      encapsulation_profile: {yaml_scalar(normalized_spoof.get('encapsulation_profile', 'ipx'))}",
                     f"{indent}      mtu: {yaml_scalar(normalized_spoof.get('mtu', 1400))}",
                     f"{indent}      window_size: {yaml_scalar(normalized_spoof.get('window_size', 128))}",
                     f"{indent}      retransmit_timeout: {yaml_scalar(normalized_spoof.get('retransmit_timeout', '400ms'))}",
