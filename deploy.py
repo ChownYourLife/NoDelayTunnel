@@ -4540,6 +4540,7 @@ def normalize_spoof_outer_protocol(value, default="udp"):
 def empty_spoof_transport_config():
     return {
         "interface": "eth0",
+        "mode": "raw",
         "source_ip": "",
         "peer_spoof_ip": "",
         "peer_real_ip": "",
@@ -4556,6 +4557,7 @@ def empty_spoof_transport_config():
         "max_retries": 8,
         "read_buffer": 4 * 1024 * 1024,
         "write_buffer": 4 * 1024 * 1024,
+        "channel_size": 10000,
     }
 
 
@@ -4567,9 +4569,22 @@ def normalize_spoof_transport_config(value, fallback=None):
     merged.update(raw)
 
     merged["interface"] = str(merged.get("interface", "eth0") or "eth0").strip() or "eth0"
+    
+    mode = str(merged.get("mode", "raw")).strip().lower()
+    if mode not in {"raw", "tun"}:
+        mode = "raw"
+    merged["mode"] = mode
+
     merged["source_ip"] = normalize_ipv4_address(merged.get("source_ip", ""))
     merged["peer_spoof_ip"] = normalize_ipv4_address(merged.get("peer_spoof_ip", ""))
     merged["peer_real_ip"] = normalize_ipv4_address(merged.get("peer_real_ip", ""))
+    merged["tun_name"] = str(merged.get("tun_name", "")).strip()
+    merged["local_ip"] = str(merged.get("local_ip", "")).strip()
+    merged["peer_ip"] = str(merged.get("peer_ip", "")).strip()
+    try:
+        merged["tun_id"] = int(merged.get("tun_id", 15))
+    except (TypeError, ValueError):
+        pass
     merged["psk"] = str(merged.get("psk", "")).strip()
     merged["outer_protocol"] = normalize_spoof_outer_protocol(merged.get("outer_protocol", "udp"), "udp")
     
@@ -4591,6 +4606,7 @@ def normalize_spoof_transport_config(value, fallback=None):
         "max_retries": 8,
         "read_buffer": 4 * 1024 * 1024,
         "write_buffer": 4 * 1024 * 1024,
+        "channel_size": 10000,
     }.items():
         try:
             merged[key] = int(merged.get(key, default) or default)
@@ -4598,6 +4614,8 @@ def normalize_spoof_transport_config(value, fallback=None):
             merged[key] = default
         if merged[key] <= 0:
             merged[key] = default
+    if merged["channel_size"] < 10000:
+        merged["channel_size"] = 10000
 
     for key, default in {
         "retransmit_timeout": "400ms",
@@ -4639,6 +4657,25 @@ def prompt_spoof_transport_config(existing=None, role="server", advanced=False, 
     print_info("Run the spoof capability test from the manager before deploying it end-to-end.")
 
     iface = prompt_interface_with_autodetect("Network interface", current.get("interface", "eth0"))
+    
+    mode_default_value = current.get("mode", "raw")
+    mode_default = "2" if mode_default_value == "tun" else "1"
+    mode_choice = input_default("Mode [1=raw (AF_PACKET) / 2=tun (TUN device + raw socket RX)]", mode_default).strip()
+    mode = "tun" if mode_choice == "2" else "raw"
+
+    tun_id = 0
+    local_ip = ""
+    peer_ip = ""
+    tun_name = ""
+    if mode == "tun":
+        tun_id = prompt_int("TUN Interface ID (e.g. 15 → 10.10.15.1/10.10.15.2)", current.get("tun_id", 15))
+        local_ip = f"10.10.{tun_id}.1" if role == "server" else f"10.10.{tun_id}.2"
+        peer_ip = f"10.10.{tun_id}.2" if role == "server" else f"10.10.{tun_id}.1"
+        tun_name = f"ntun{tun_id}"
+        print_info(f"TUN device: {tun_name}  local={local_ip}  peer={peer_ip}")
+
+    encapsulation_profile = "ipx"
+
     source_ip = prompt_ipv4_address("Spoofed source IPv4", current.get("source_ip", ""))
     peer_spoof_ip = prompt_ipv4_address("Peer spoofed IPv4", current.get("peer_spoof_ip", ""))
     if role == "server":
@@ -4661,11 +4698,6 @@ def prompt_spoof_transport_config(existing=None, role="server", advanced=False, 
         protocol_number = prompt_int("IPv4 protocol number (1-255)", protocol_number)
         if protocol_number < 1 or protocol_number > 255:
             protocol_number = 253
-            
-    encaps_default_value = current.get("encapsulation_profile", "ipx") or "ipx"
-    encaps_default = "2" if encaps_default_value == "tcp_like" else "1"
-    encaps_choice = input_default("Encapsulation profile [1=ipx / 2=tcp_like]", encaps_default).strip()
-    encapsulation_profile = "tcp_like" if encaps_choice == "2" else "ipx"
 
     mtu = prompt_int("Wire MTU", current.get("mtu", 1400))
     if mtu <= 0:
@@ -4673,6 +4705,11 @@ def prompt_spoof_transport_config(existing=None, role="server", advanced=False, 
 
     spoof_cfg = {
         "interface": iface,
+        "tun_id": tun_id,
+        "tun_name": tun_name,
+        "local_ip": local_ip,
+        "peer_ip": peer_ip,
+        "mode": mode,
         "source_ip": source_ip,
         "peer_spoof_ip": peer_spoof_ip,
         "peer_real_ip": peer_real_ip,
@@ -4689,6 +4726,7 @@ def prompt_spoof_transport_config(existing=None, role="server", advanced=False, 
         "max_retries": current.get("max_retries", 8),
         "read_buffer": current.get("read_buffer", 4 * 1024 * 1024),
         "write_buffer": current.get("write_buffer", 4 * 1024 * 1024),
+        "channel_size": current.get("channel_size", 10000),
     }
 
     if advanced:
@@ -4720,6 +4758,9 @@ def prompt_spoof_transport_config(existing=None, role="server", advanced=False, 
         spoof_cfg["write_buffer"] = prompt_int("Raw socket write buffer", spoof_cfg["write_buffer"])
         if spoof_cfg["write_buffer"] <= 0:
             spoof_cfg["write_buffer"] = 4 * 1024 * 1024
+        spoof_cfg["channel_size"] = prompt_int("Packet queue channel size (min 10000)", spoof_cfg["channel_size"])
+        if spoof_cfg["channel_size"] < 10000:
+            spoof_cfg["channel_size"] = 10000
 
     return normalize_spoof_transport_config(spoof_cfg, current)
 
@@ -6289,12 +6330,15 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
         print_warning(
             "Spoof transport needs a nodelay build with spoof support, Linux root/CAP_NET_RAW, and a path that allows IPv4 source spoofing."
         )
-        config["spoof"] = prompt_spoof_transport_config(
+        spoof_cfg = prompt_spoof_transport_config(
             config.get("spoof", {}),
             role=role,
             advanced=advanced_mode,
             default_peer_real_ip=normalize_ipv4_address(server_addr or config.get("server_addr", "")),
         )
+        if spoof_cfg.get("mode") == "tun":
+            ensure_tun_deps()
+        config["spoof"] = spoof_cfg
 
     if str(config.get("type", "")).strip().lower() != "httpmimicry":
         config["allow_plaintext_framing"] = False
@@ -6362,17 +6406,30 @@ def menu_protocol(role, server_addr="", defaults=None, prompt_port=True, deploym
             config.get("network_dns", {}),
             {"mode": "system"},
         )
-    config["utls_strict_profile_match"] = parse_bool(
-        input_default("Force uTLS/HTTP profile coherence? (Y/n)", "y" if config.get("utls_strict_profile_match", True) else "n"),
-        True,
-    )
-    config["ping_keepalive"] = prompt_ping_keepalive_settings(
-        role,
-        config.get("ping_keepalive", {}),
-    )
+    if str(config.get("type", "")).strip().lower() == "spoof":
+        config["utls_strict_profile_match"] = True
+        config["ping_keepalive"] = normalize_ping_keepalive_config(config.get("ping_keepalive", {}), role)
+        config["frag"] = {
+            "enabled": False,
+            "split_pos": 0,
+            "fake_ttl": 0,
+            "reverse_order": False,
+            "mtu_enabled": False,
+            "fragment_size": 0,
+            "fragment_delay": "",
+        }
+    else:
+        config["utls_strict_profile_match"] = parse_bool(
+            input_default("Force uTLS/HTTP profile coherence? (Y/n)", "y" if config.get("utls_strict_profile_match", True) else "n"),
+            True,
+        )
+        config["ping_keepalive"] = prompt_ping_keepalive_settings(
+            role,
+            config.get("ping_keepalive", {}),
+        )
 
-    # Anti-DPI / MTU fragmentation — both client and server
-    config["frag"] = prompt_frag_config(config.get("frag", {}), role=role)
+        # Anti-DPI / MTU fragmentation — both client and server
+        config["frag"] = prompt_frag_config(config.get("frag", {}), role=role)
 
     return config
 
@@ -7841,7 +7898,12 @@ def build_client_setup_lines_for_server_summary(cfg):
     if ep_type == "spoof":
         lines.append(f"Spoof Source IP: {spoof_cfg.get('source_ip', '') or '(missing)'}")
         lines.append(f"Spoof Peer IP: {spoof_cfg.get('peer_spoof_ip', '') or '(missing)'}")
+        lines.append(f"Spoof Mode: {spoof_cfg.get('mode', 'raw')}")
         lines.append(f"Spoof Carrier: {spoof_cfg.get('outer_protocol', 'udp')}")
+        if spoof_cfg.get("mode") == "tun":
+            lines.append(
+                f"Spoof TUN: {spoof_cfg.get('tun_name', '') or '(missing)'} {spoof_cfg.get('local_ip', '') or '(missing)'} -> {spoof_cfg.get('peer_ip', '') or '(missing)'}"
+            )
         lines.append("Spoof check: repeat the manager's spoof capability test in both directions.")
 
     if ep_type in {"httpmimicry", "httpsmimicry"}:
@@ -7940,6 +8002,10 @@ def render_named_transport_endpoint_lines(
             [
                 f"{indent}  spoof:",
                 f"{indent}    interface: {yaml_scalar(normalized_spoof.get('interface', 'eth0'))}",
+                f"{indent}    mode: {yaml_scalar(normalized_spoof.get('mode', 'raw'))}",
+                f"{indent}    tun_name: {yaml_scalar(normalized_spoof.get('tun_name', ''))}",
+                f"{indent}    local_ip: {yaml_scalar(normalized_spoof.get('local_ip', ''))}",
+                f"{indent}    peer_ip: {yaml_scalar(normalized_spoof.get('peer_ip', ''))}",
                 f"{indent}    source_ip: {yaml_scalar(normalized_spoof.get('source_ip', ''))}",
                 f"{indent}    peer_spoof_ip: {yaml_scalar(normalized_spoof.get('peer_spoof_ip', ''))}",
                 f"{indent}    peer_real_ip: {yaml_scalar(normalized_spoof.get('peer_real_ip', ''))}",
@@ -7956,6 +8022,7 @@ def render_named_transport_endpoint_lines(
                 f"{indent}    max_retries: {yaml_scalar(normalized_spoof.get('max_retries', 8))}",
                 f"{indent}    read_buffer: {yaml_scalar(normalized_spoof.get('read_buffer', 4 * 1024 * 1024))}",
                 f"{indent}    write_buffer: {yaml_scalar(normalized_spoof.get('write_buffer', 4 * 1024 * 1024))}",
+                f"{indent}    channel_size: {yaml_scalar(normalized_spoof.get('channel_size', 10000))}",
             ]
         )
     lines.extend(render_port_hopping_lines(f"{indent}  ", endpoint.get("port_hopping", {})))
@@ -8037,6 +8104,10 @@ def render_transport_endpoints_list_lines(
                 [
                     f"{indent}    spoof:",
                     f"{indent}      interface: {yaml_scalar(normalized_spoof.get('interface', 'eth0'))}",
+                    f"{indent}      mode: {yaml_scalar(normalized_spoof.get('mode', 'raw'))}",
+                    f"{indent}      tun_name: {yaml_scalar(normalized_spoof.get('tun_name', ''))}",
+                    f"{indent}      local_ip: {yaml_scalar(normalized_spoof.get('local_ip', ''))}",
+                    f"{indent}      peer_ip: {yaml_scalar(normalized_spoof.get('peer_ip', ''))}",
                     f"{indent}      source_ip: {yaml_scalar(normalized_spoof.get('source_ip', ''))}",
                     f"{indent}      peer_spoof_ip: {yaml_scalar(normalized_spoof.get('peer_spoof_ip', ''))}",
                     f"{indent}      peer_real_ip: {yaml_scalar(normalized_spoof.get('peer_real_ip', ''))}",
@@ -8053,6 +8124,7 @@ def render_transport_endpoints_list_lines(
                     f"{indent}      max_retries: {yaml_scalar(normalized_spoof.get('max_retries', 8))}",
                     f"{indent}      read_buffer: {yaml_scalar(normalized_spoof.get('read_buffer', 4 * 1024 * 1024))}",
                     f"{indent}      write_buffer: {yaml_scalar(normalized_spoof.get('write_buffer', 4 * 1024 * 1024))}",
+                    f"{indent}      channel_size: {yaml_scalar(normalized_spoof.get('channel_size', 10000))}",
                 ]
             )
         lines.extend(render_port_hopping_lines(f"{indent}    ", endpoint.get("port_hopping", {})))
@@ -9262,9 +9334,14 @@ def install_server_flow(
     print(f"Deploy:   {Colors.BOLD}{deployment_mode}{Colors.ENDC}")
     if cfg["type"] == "spoof":
         spoof_cfg = normalize_spoof_transport_config(cfg.get("spoof", {}), {})
+        print(f"SpoofMode:{Colors.BOLD}{spoof_cfg.get('mode', 'raw')}{Colors.ENDC}")
         print(f"SpoofSrc: {Colors.BOLD}{spoof_cfg.get('source_ip', '')}{Colors.ENDC}")
         print(f"SpoofPeer:{Colors.BOLD}{spoof_cfg.get('peer_spoof_ip', '')}{Colors.ENDC}")
         print(f"Carrier:  {Colors.BOLD}{spoof_cfg.get('outer_protocol', 'udp')}{Colors.ENDC}")
+        if spoof_cfg.get("mode") == "tun":
+            print(
+                f"TUN:      {Colors.BOLD}{spoof_cfg.get('tun_name', '')} {spoof_cfg.get('local_ip', '')} -> {spoof_cfg.get('peer_ip', '')}{Colors.ENDC}"
+            )
     if cfg["type"] == "reality":
         print(f"ShortID:  {Colors.BOLD}{cfg['short_id']}{Colors.ENDC}")
         print(f"Private:  {Colors.BOLD}{cfg['private_key']}{Colors.ENDC}")
@@ -9373,9 +9450,14 @@ def install_client_flow(
     print(f"Deploy:     {Colors.BOLD}{deployment_mode}{Colors.ENDC}")
     if cfg["type"] == "spoof":
         spoof_cfg = normalize_spoof_transport_config(cfg.get("spoof", {}), {})
+        print(f"SpoofMode:  {Colors.BOLD}{spoof_cfg.get('mode', 'raw')}{Colors.ENDC}")
         print(f"SpoofSrc:   {Colors.BOLD}{spoof_cfg.get('source_ip', '')}{Colors.ENDC}")
         print(f"SpoofPeer:  {Colors.BOLD}{spoof_cfg.get('peer_spoof_ip', '')}{Colors.ENDC}")
         print(f"Carrier:    {Colors.BOLD}{spoof_cfg.get('outer_protocol', 'udp')}{Colors.ENDC}")
+        if spoof_cfg.get("mode") == "tun":
+            print(
+                f"TUN:        {Colors.BOLD}{spoof_cfg.get('tun_name', '')} {spoof_cfg.get('local_ip', '')} -> {spoof_cfg.get('peer_ip', '')}{Colors.ENDC}"
+            )
     frag_info = cfg.get("frag", {})
     if isinstance(frag_info, dict) and frag_info.get("mtu_enabled"):
         frag_size = frag_info.get("fragment_size", 200)
@@ -9598,3 +9680,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nExiting...")
         sys.exit(0)
+
